@@ -17,10 +17,10 @@
 #define VIRTIO_MEDIA_LAST_QUEUE (V4L2_BUF_TYPE_META_OUTPUT)
 
 /**
- * Size of our virtio shadow and event buffers. 16K should definitely be enough
- * to contain anything we need.
+ * Size of our virtio shadow buffer. 64K: a fragmented 4K frame sent as a
+ * USERPTR SG list needs about 3100 16-byte entries (VPU_DESIGN.md 5.2).
  */
-#define VIRTIO_SHADOW_BUF_SIZE 0x4000
+#define VIRTIO_SHADOW_BUF_SIZE 0x10000
 
 struct virtio_media_sg_entry {
 	u64 start;
@@ -28,17 +28,22 @@ struct virtio_media_sg_entry {
 	u32 __padding;
 };
 
+struct vmedia_dbuf;
+
 /**
  * struct virtio_media_buffer - Current state of a given buffer.
  *
  * @buffer: struct v4l2_buffer with current information about the buffer.
  * @planes: backing planes array for @buffer.
  * @list: link into the list of buffers pending dequeue.
+ * @dbuf: driver-owned backing of each plane (VPU_DESIGN.md 5.2), NULL for
+ *	host-owned MMAP buffers and real USERPTR buffers.
  */
 struct virtio_media_buffer {
 	struct v4l2_buffer buffer;
 	struct v4l2_plane planes[VIDEO_MAX_PLANES];
 	struct list_head list;
+	struct vmedia_dbuf *dbuf[VIDEO_MAX_PLANES];
 };
 
 /**
@@ -51,6 +56,8 @@ struct virtio_media_buffer {
  * @buffers: Buffer state array of size @allocated_bufs.
  * @queued_bufs: How many buffers are currently queued at the host.
  * @pending_dqbufs: Buffers that are available for being dequeued.
+ * @driver_owned: the buffers user-space requested as MMAP are allocated by
+ *	the driver and presented to the host as USERPTR (VPU_DESIGN.md 2.1).
  */
 struct virtio_media_queue_state {
 	bool streaming;
@@ -60,6 +67,7 @@ struct virtio_media_queue_state {
 	struct virtio_media_buffer *buffers;
 	size_t queued_bufs;
 	struct list_head pending_dqbufs;
+	bool driver_owned;
 };
 
 /**
@@ -78,6 +86,7 @@ struct virtio_media_queue_state {
  * @dqbufs_lock: protects pending_dqbufs of virtio_media_queue_state.
  * @dqbufs_wait: waitqueue for dequeued buffers, if VIDIOC_DQBUF needs to block or when polling.
  * @dead: the host reported an error event for this session; it is unusable.
+ * @next_dbuf_cookie: mmap offset handed to the next driver-owned buffer.
  * @list: link into the list of sessions for the device.
  */
 struct virtio_media_session {
@@ -113,6 +122,8 @@ struct virtio_media_session {
 	 * until user-space closes the file (VPU_DESIGN.md 5.4).
 	 */
 	bool dead;
+
+	u64 next_dbuf_cookie;
 
 	struct list_head list;
 };

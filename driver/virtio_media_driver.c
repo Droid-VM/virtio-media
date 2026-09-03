@@ -36,6 +36,7 @@
 #include "protocol.h"
 #include "session.h"
 #include "virtio_media.h"
+#include "virtio_media_alloc.h"
 
 #define VIRTIO_MEDIA_NUM_EVENT_BUFS 16
 
@@ -85,6 +86,7 @@ virtio_media_session_alloc(struct virtio_media *vv, u32 id,
 	session->id = id;
 	session->nonblocking_dequeue = nonblocking_dequeue;
 	session->file = file;
+	session->next_dbuf_cookie = VMEDIA_DBUF_COOKIE_BASE;
 
 	INIT_LIST_HEAD(&session->list);
 	v4l2_fh_init(&session->fh, &vv->video_dev);
@@ -136,9 +138,16 @@ static void virtio_media_session_close(struct virtio_media *vv,
 
 	sg_free_table(&session->command_sgs);
 
+	/*
+	 * The host has processed CMD_CLOSE by now (the command completed),
+	 * so its mappings of driver-owned buffers are gone and the memory
+	 * can go back to the pool (VPU_DESIGN.md 2.5).
+	 */
 	for (i = 0; i <= VIRTIO_MEDIA_LAST_QUEUE; i++)
-		if (session->queues[i].buffers)
+		if (session->queues[i].buffers) {
+			vmedia_queue_put_dbufs(&session->queues[i]);
 			vfree(session->queues[i].buffers);
+		}
 
 	kfree(session->shadow_buf);
 	kfree(session);

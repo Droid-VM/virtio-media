@@ -66,6 +66,7 @@ struct virtio_media_queue_state {
  * struct virtio_media_session - A session on a virtio_media device, created whenever the device is opened.
  *
  * @fh: file handler for the session.
+ * @file: the struct file @fh is attached to (v4l2_fh_add/del need it since 6.17).
  * @id: session ID used to communicate with the device.
  * @nonblocking_dequeue: whether dequeue should block or not (nonblocking if file opened with O_NONBLOCK).
  * @uses_mplane: whether the queues for this session use the MPLANE API or not.
@@ -80,6 +81,7 @@ struct virtio_media_queue_state {
  */
 struct virtio_media_session {
 	struct v4l2_fh fh;
+	struct file *file;
 	u32 id;
 	bool nonblocking_dequeue;
 	bool uses_mplane;

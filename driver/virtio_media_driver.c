@@ -426,9 +426,18 @@ void virtio_media_process_events(struct virtio_media *vv)
 			}
 			error_evt = (struct virtio_media_event_error *)evt;
 			v4l2_err(&vv->v4l2_dev,
-				 "received error %d for session %d",
+				 "received error %d for session %d, marking it dead\n",
 				 error_evt->errno, error_evt->hdr.session_id);
-			/* TODO close session! */
+			/*
+			 * The host considers the session corrupted and closed
+			 * (protocol.h). Fail every further ioctl with -ENODEV,
+			 * make poll report EPOLLERR and release anyone blocked
+			 * in DQBUF, so a camera or codec reclaimed on the host
+			 * gives the guest process a clean exit instead of a
+			 * hang.
+			 */
+			WRITE_ONCE(session->dead, true);
+			wake_up(&session->dqbufs_wait);
 			break;
 
 		/*
@@ -584,6 +593,9 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 	__poll_t req_events = poll_requested_events(wait);
 	__poll_t rc = 0;
 
+	if (READ_ONCE(session->dead))
+		return EPOLLERR;
+
 	poll_wait(file, &session->dqbufs_wait, wait);
 	poll_wait(file, &session->fh.wait, wait);
 
@@ -612,12 +624,34 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 }
 
 /**
- * Inform the host that a previously created MMAP mapping is no longer needed
- * and can be removed.
+ * struct virtio_media_hostmap - One host MMAP mapping and the VMAs using it.
+ *
+ * @vv: device the mapping belongs to.
+ * @driver_addr: offset the host returned in VIRTIO_MEDIA_CMD_MMAP, i.e. what
+ *	VIRTIO_MEDIA_CMD_MUNMAP must be sent with.
+ * @vmas: number of VMAs currently referencing this mapping.
+ *
+ * Upstream kept no state per mapping and derived the MUNMAP offset from
+ * vm_pgoff in the sole .close callback. A fork() duplicates the VMA and a
+ * partial munmap() splits it, so the host then received one MUNMAP per
+ * resulting VMA -- and the tail of a split computed a wrong offset because
+ * the split shifts vm_pgoff. Keeping the host offset here and counting the
+ * VMAs through .open/.close sends exactly one MUNMAP, once the last VMA is
+ * gone (VPU_DESIGN.md 2.5, 5.4).
  */
-static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
+struct virtio_media_hostmap {
+	struct virtio_media *vv;
+	u64 driver_addr;
+	refcount_t vmas;
+};
+
+/**
+ * Inform the host that a previously created MMAP mapping is no longer needed
+ * and can be removed. Called with vv->vlock held.
+ */
+static void virtio_media_host_munmap_locked(struct virtio_media *vv,
+					    u64 driver_addr)
 {
-	struct virtio_media *vv = vma->vm_private_data;
 	struct virtio_media_cmd_munmap *cmd_munmap = &vv->cmd.munmap;
 	struct virtio_media_resp_munmap *resp_munmap = &vv->resp.munmap;
 	struct scatterlist cmd_sg = {}, resp_sg = {};
@@ -632,8 +666,7 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 
 	mutex_lock(&vv->bufs_lock);
 	cmd_munmap->hdr.cmd = VIRTIO_MEDIA_CMD_MUNMAP;
-	cmd_munmap->driver_addr =
-		(vma->vm_pgoff << PAGE_SHIFT) - vv->mmap_region.addr;
+	cmd_munmap->driver_addr = driver_addr;
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_munmap),
 					NULL);
 	mutex_unlock(&vv->bufs_lock);
@@ -643,16 +676,29 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 	}
 }
 
-static void virtio_media_vma_close(struct vm_area_struct *vma)
+static void virtio_media_vma_open(struct vm_area_struct *vma)
 {
-	struct virtio_media *vv = vma->vm_private_data;
+	struct virtio_media_hostmap *map = vma->vm_private_data;
 
-	mutex_lock(&vv->vlock);
-	virtio_media_vma_close_locked(vma);
-	mutex_unlock(&vv->vlock);
+	refcount_inc(&map->vmas);
 }
 
-static struct vm_operations_struct virtio_media_vm_ops = {
+static void virtio_media_vma_close(struct vm_area_struct *vma)
+{
+	struct virtio_media_hostmap *map = vma->vm_private_data;
+	struct virtio_media *vv = map->vv;
+
+	if (!refcount_dec_and_test(&map->vmas))
+		return;
+
+	mutex_lock(&vv->vlock);
+	virtio_media_host_munmap_locked(vv, map->driver_addr);
+	mutex_unlock(&vv->vlock);
+	kfree(map);
+}
+
+static const struct vm_operations_struct virtio_media_vm_ops = {
+	.open = virtio_media_vma_open,
 	.close = virtio_media_vma_close,
 };
 
@@ -673,12 +719,17 @@ static int virtio_media_device_mmap(struct file *file,
 	struct virtio_media_resp_mmap *resp_mmap = &session->resp.mmap;
 	struct scatterlist cmd_sg = {}, resp_sg = {};
 	struct scatterlist *sgs[2] = { &cmd_sg, &resp_sg };
+	struct virtio_media_hostmap *map;
+	u64 driver_addr;
+	u64 len;
 	int ret;
 
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EINVAL;
 	if (!(vma->vm_flags & (VM_READ | VM_WRITE)))
 		return -EINVAL;
+	if (READ_ONCE(session->dead))
+		return -ENODEV;
 
 	mutex_lock(&vv->vlock);
 
@@ -704,28 +755,44 @@ static int virtio_media_device_mmap(struct file *file,
 	if (ret < 0)
 		goto end;
 
-	vma->vm_private_data = vv;
-	/*
-	 * Keep the guest address at which the buffer is mapped since we will
-	 * use that to unmap.
-	 */
-	vma->vm_pgoff = (resp_mmap->driver_addr + vv->mmap_region.addr) >>
-			PAGE_SHIFT;
+	driver_addr = resp_mmap->driver_addr;
+	len = resp_mmap->len;
 
-	if (vma->vm_end - vma->vm_start > PAGE_ALIGN(resp_mmap->len)) {
-		virtio_media_vma_close_locked(vma);
+	if (vma->vm_end - vma->vm_start > PAGE_ALIGN(len)) {
 		ret = -EINVAL;
-		goto end;
+		goto unmap;
 	}
+
+	map = kzalloc(sizeof(*map), GFP_KERNEL);
+	if (!map) {
+		ret = -ENOMEM;
+		goto unmap;
+	}
+	map->vv = vv;
+	map->driver_addr = driver_addr;
+	refcount_set(&map->vmas, 1);
+
+	/* Guest PFN of the mapping: host offset relative to the MMAP region. */
+	vma->vm_pgoff = (driver_addr + vv->mmap_region.addr) >> PAGE_SHIFT;
 
 	ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 				 vma->vm_end - vma->vm_start,
 				 vma->vm_page_prot);
-	if (ret)
-		goto end;
+	if (ret) {
+		kfree(map);
+		goto unmap;
+	}
 
+	/*
+	 * Only now: on a failure after this point the core would call
+	 * .close, which would send a second MUNMAP.
+	 */
+	vma->vm_private_data = map;
 	vma->vm_ops = &virtio_media_vm_ops;
+	goto end;
 
+unmap:
+	virtio_media_host_munmap_locked(vv, driver_addr);
 end:
 	mutex_unlock(&vv->vlock);
 	return ret;
@@ -822,7 +889,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	if (vd->device_caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE))
 		vd->vfl_dir = VFL_DIR_M2M;
 	else if (vd->device_caps &
-		 (V4L2_CAP_VIDEO_OUTPUT | V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE))
+		 (V4L2_CAP_VIDEO_OUTPUT | V4L2_CAP_VIDEO_OUTPUT_MPLANE))
 		vd->vfl_dir = VFL_DIR_TX;
 	else
 		vd->vfl_dir = VFL_DIR_RX;

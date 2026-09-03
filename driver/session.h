@@ -77,6 +77,7 @@ struct virtio_media_queue_state {
  * @queues: state of all the queues for this session.
  * @dqbufs_lock: protects pending_dqbufs of virtio_media_queue_state.
  * @dqbufs_wait: waitqueue for dequeued buffers, if VIDIOC_DQBUF needs to block or when polling.
+ * @dead: the host reported an error event for this session; it is unusable.
  * @list: link into the list of sessions for the device.
  */
 struct virtio_media_session {
@@ -104,6 +105,14 @@ struct virtio_media_session {
 	struct virtio_media_queue_state queues[VIRTIO_MEDIA_LAST_QUEUE + 1];
 	struct mutex dqbufs_lock;
 	wait_queue_head_t dqbufs_wait;
+
+	/*
+	 * Set once the device sent VIRTIO_MEDIA_EVT_ERROR for this session. The
+	 * protocol says the session is then corrupted and closed on the host,
+	 * so every further ioctl fails with -ENODEV and poll reports EPOLLERR
+	 * until user-space closes the file (VPU_DESIGN.md 5.4).
+	 */
+	bool dead;
 
 	struct list_head list;
 };

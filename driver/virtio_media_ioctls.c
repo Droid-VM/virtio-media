@@ -924,10 +924,13 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	} else {
 		mutex_unlock(&vv->vlock);
 		ret = wait_event_interruptible(session->dqbufs_wait,
-					       !list_empty(buffer_queue));
+					       !list_empty(buffer_queue) ||
+						       READ_ONCE(session->dead));
 		mutex_lock(&vv->vlock);
 		if (ret)
 			return -EINTR;
+		if (READ_ONCE(session->dead))
+			return -ENODEV;
 	}
 
 	mutex_lock(&session->dqbufs_lock);
@@ -1238,6 +1241,10 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 
 	if (test_bit(V4L2_FL_USES_V4L2_FH, &video_dev->flags))
 		vfh = file->private_data;
+
+	/* The host closed this session after an error: nothing can go through. */
+	if (vfh && READ_ONCE(fh_to_session(vfh)->dead))
+		return -ENODEV;
 
 	mutex_lock(&vv->vlock);
 

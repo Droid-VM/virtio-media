@@ -691,6 +691,21 @@ static int virtio_media_streamoff(struct file *file, void *fh,
  * Buffer creation/queuing functions deal with the local driver state.
  */
 
+/**
+ * Whether host-owned MMAP buffers can be mapped into the guest at all: only
+ * with a media_host pool or a virtio shm region (VPU_DESIGN.md 2.4). Without
+ * either, fail the request that would allocate them rather than let mmap map
+ * physical page 0 later.
+ */
+static bool virtio_media_host_mmap_available(struct virtio_media *vv)
+{
+	if (vv->mmap_region.len > 0)
+		return true;
+
+	pr_warn_once("virtio-media: host-owned MMAP buffers requested but there is neither a media_host pool nor a virtio shm region, failing with -ENOMEM\n");
+	return false;
+}
+
 static int virtio_media_reqbufs(struct file *file, void *fh,
 				struct v4l2_requestbuffers *b)
 {
@@ -702,6 +717,10 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
+
+	if (b->memory == V4L2_MEMORY_MMAP && b->count > 0 &&
+	    !virtio_media_host_mmap_available(vv))
+		return -ENOMEM;
 
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_REQBUFS, b, sizeof(*b),
 					 sizeof(*b));
@@ -771,6 +790,8 @@ static int virtio_media_querybuf(struct file *file, void *fh,
 static int virtio_media_create_bufs(struct file *file, void *fh,
 				    struct v4l2_create_buffers *b)
 {
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_session *session = fh_to_session(fh);
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffers;
@@ -781,6 +802,10 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 		return -EINVAL;
 
 	queue = &session->queues[type];
+
+	if (b->memory == V4L2_MEMORY_MMAP && b->count > 0 &&
+	    !virtio_media_host_mmap_available(vv))
+		return -ENOMEM;
 
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_CREATE_BUFS, b, sizeof(*b),
 					 sizeof(*b));

@@ -9,10 +9,12 @@
 #ifndef __VIRTIO_MEDIA_H
 #define __VIRTIO_MEDIA_H
 
+#include <linux/mutex.h>
 #include <linux/virtio_config.h>
 #include <media/v4l2-device.h>
 
 #include "protocol.h"
+#include "virtio_media_buddy.h"
 
 #define DESC_CHAIN_MAX_LEN SG_MAX_SINGLE_ALLOC
 
@@ -32,8 +34,33 @@ struct virtio_media {
 	struct virtqueue *eventq;
 	struct work_struct eventq_work;
 
-	/* Region into which MMAP buffers are mapped by the host. */
+	/*
+	 * Region into which MMAP buffers are mapped by the host: the media_host
+	 * pool from /reserved-memory when the VMM built one, else virtio shm
+	 * region 0. len == 0 means neither exists and host-owned MMAP buffers
+	 * cannot be mapped at all (VPU_DESIGN.md 2.4, 5.1).
+	 */
 	struct virtio_shm_region mmap_region;
+
+	/*
+	 * Device driver-owned buffers are DMA-allocated for when there is no
+	 * media_guest pool: the transport's parent, which is what the
+	 * virtqueues DMA through as well (the virtio_device itself carries no
+	 * DMA mask).
+	 */
+	struct device *dma_dev;
+
+	/*
+	 * media_guest pool: guest-physical range the host SHARE'd for buffers
+	 * the guest fills (OUTPUT queues by default), carved with drm_buddy.
+	 * guest_pool_ready is cleared under guest_pool_lock at remove so a
+	 * late munmap sees the closed gate instead of a dead allocator.
+	 */
+	bool guest_pool_ready;
+	phys_addr_t guest_pool_base;
+	u64 guest_pool_size;
+	struct drm_buddy guest_pool_mm;
+	struct mutex guest_pool_lock;
 
 	/* Buffer for event descriptors. */
 	void *event_buffer;

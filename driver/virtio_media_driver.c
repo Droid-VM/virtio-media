@@ -8,8 +8,11 @@
 
 #include <linux/delay.h>
 #include <linux/device.h>
+#include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/scatterlist.h>
 #include <linux/types.h>
 #include <linux/videodev2.h>
@@ -763,6 +766,19 @@ static int virtio_media_device_mmap(struct file *file,
 		goto unmap;
 	}
 
+	/*
+	 * The host offset must stay inside the region we map from; with no
+	 * region at all (len 0) this would otherwise map physical page 0.
+	 */
+	if (driver_addr > vv->mmap_region.len ||
+	    PAGE_ALIGN(len) > vv->mmap_region.len - driver_addr) {
+		v4l2_err(&vv->v4l2_dev,
+			 "host MMAP offset %#llx len %llu exceeds the MMAP region (len %llu)\n",
+			 driver_addr, len, vv->mmap_region.len);
+		ret = -EINVAL;
+		goto unmap;
+	}
+
 	map = kzalloc(sizeof(*map), GFP_KERNEL);
 	if (!map) {
 		ret = -ENOMEM;
@@ -796,6 +812,146 @@ unmap:
 end:
 	mutex_unlock(&vv->vlock);
 	return ret;
+}
+
+/**
+ * vmedia_find_pool - Look up a DroidVM pool node under /reserved-memory.
+ * @prefix: node name before the unit address, e.g. "media_host" for
+ *	media_host@<gpa>.
+ * @base: on success, the guest-physical base of the pool.
+ * @len: on success, the length of the node's reg property.
+ *
+ * Same walk as virtio_gpu_find_pool_base_named() in droidvm-guest-additions
+ * (virtio_gpu/virtgpu_kms.c), except that the length is returned too, so the
+ * mmap path can bounds-check the offsets the host hands out (VPU_DESIGN.md
+ * 5.1).
+ *
+ * Returns true when the node exists and carries a usable reg.
+ */
+static bool vmedia_find_pool(const char *prefix, phys_addr_t *base, u64 *len)
+{
+	struct device_node *rmem, *child;
+	bool found = false;
+
+	rmem = of_find_node_by_path("/reserved-memory");
+	if (!rmem)
+		return false;
+	for_each_child_of_node(rmem, child) {
+		struct resource res;
+
+		if (!of_node_name_prefix(child, prefix))
+			continue;
+		if (of_address_to_resource(child, 0, &res) == 0) {
+			*base = res.start;
+			*len = resource_size(&res);
+			found = true;
+			of_node_put(child);
+			break;
+		}
+	}
+	of_node_put(rmem);
+	return found;
+}
+
+/**
+ * Decide where host-owned MMAP buffers get mapped from (VPU_DESIGN.md 2.4):
+ * the media_host pool if the VMM built one, else virtio shm region 0, else
+ * nowhere -- in which case REQBUFS(MMAP) on a host-owned queue fails.
+ */
+static void virtio_media_setup_host_pool(struct virtio_media *vv)
+{
+	struct virtio_device *virtio_dev = vv->virtio_dev;
+	phys_addr_t base;
+	u64 len;
+
+	if (vmedia_find_pool("media_host", &base, &len)) {
+		vv->mmap_region.addr = base;
+		vv->mmap_region.len = len;
+		pr_info("virtio-media: media_host pool base %pa len %llu\n",
+			&base, len);
+		return;
+	}
+
+	if (virtio_get_shm_region(virtio_dev, &vv->mmap_region,
+				  VIRTIO_MEDIA_SHM_MMAP) &&
+	    vv->mmap_region.len > 0) {
+		pr_info("virtio-media: no media_host pool, host MMAP buffers use virtio shm region %d base %#llx len %llu\n",
+			VIRTIO_MEDIA_SHM_MMAP, vv->mmap_region.addr,
+			vv->mmap_region.len);
+		return;
+	}
+
+	vv->mmap_region.addr = 0;
+	vv->mmap_region.len = 0;
+	pr_info("virtio-media: no media_host pool and no virtio shm region, host-owned MMAP buffers are unavailable\n");
+}
+
+/**
+ * Set up the media_guest pool (VPU_DESIGN.md 5.1): drm_buddy over the range
+ * the host SHARE'd, or nothing, in which case driver-owned buffers come from
+ * dma_alloc_pages() on the transport's DMA device.
+ */
+static void virtio_media_setup_guest_pool(struct virtio_media *vv)
+{
+	phys_addr_t base;
+	u64 len, size;
+	int ret;
+
+	mutex_init(&vv->guest_pool_lock);
+
+	if (!vmedia_find_pool("media_guest", &base, &len)) {
+		/*
+		 * A restricted-dma-pool is the fingerprint of a VM whose RAM
+		 * is lent rather than shared: dma_alloc_pages() then lands in
+		 * that bounce pool, which is the only system memory the host
+		 * can read, so say where the buffers will go.
+		 */
+		struct device_node *rdma = of_find_compatible_node(
+			NULL, NULL, "restricted-dma-pool");
+
+		if (rdma) {
+			pr_info("virtio-media: no media_guest pool, driver-owned buffers come from dma_alloc_pages (restricted-dma-pool present: they land in the bounce pool)\n");
+			of_node_put(rdma);
+		} else {
+			pr_info("virtio-media: no media_guest pool, driver-owned buffers come from dma_alloc_pages\n");
+		}
+		return;
+	}
+
+	/* drm_buddy wants a chunk-aligned size; trim, the tail is not ours. */
+	size = ALIGN_DOWN(len, PAGE_SIZE);
+	if (!size) {
+		pr_warn("virtio-media: media_guest pool at %pa is smaller than a page (%llu), ignoring it\n",
+			&base, len);
+		return;
+	}
+
+	ret = drm_buddy_init(&vv->guest_pool_mm, size, PAGE_SIZE);
+	if (ret) {
+		pr_warn("virtio-media: media_guest pool init failed: %d, driver-owned buffers come from dma_alloc_pages\n",
+			ret);
+		return;
+	}
+
+	vv->guest_pool_base = base;
+	vv->guest_pool_size = size;
+	vv->guest_pool_ready = true;
+	pr_info("virtio-media: media_guest pool base %pa size %llu MiB (drm_buddy)\n",
+		&base, size >> 20);
+}
+
+static void virtio_media_guest_pool_fini(struct virtio_media *vv)
+{
+	if (!vv->guest_pool_ready)
+		return;
+
+	mutex_lock(&vv->guest_pool_lock);
+	vv->guest_pool_ready = false;
+	if (vv->guest_pool_mm.avail != vv->guest_pool_mm.size)
+		pr_warn("virtio-media: media_guest pool still has %llu bytes allocated at remove\n",
+			vv->guest_pool_mm.size - vv->guest_pool_mm.avail);
+	drm_buddy_fini(&vv->guest_pool_mm);
+	mutex_unlock(&vv->guest_pool_lock);
 }
 
 static const struct v4l2_file_operations virtio_media_fops = {
@@ -854,6 +1010,8 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 
 	vv->virtio_dev = virtio_dev;
 	virtio_dev->priv = vv;
+	vv->dma_dev = virtio_dev->dev.parent ? virtio_dev->dev.parent :
+					       &virtio_dev->dev;
 
 	init_waitqueue_head(&vv->wq);
 
@@ -873,9 +1031,9 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	vv->eventq = vqs[1];
 	INIT_WORK(&vv->eventq_work, virtio_media_event_work);
 
-	/* Get MMAP buffer mapping SHM region */
-	virtio_get_shm_region(virtio_dev, &vv->mmap_region,
-			      VIRTIO_MEDIA_SHM_MMAP);
+	/* Where host-owned MMAP buffers come from, and where guest-owned go. */
+	virtio_media_setup_host_pool(vv);
+	virtio_media_setup_guest_pool(vv);
 
 	virtio_device_ready(virtio_dev);
 
@@ -903,7 +1061,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 
 	ret = video_register_device(vd, virtio_cread32(virtio_dev, 4), 0);
 	if (ret)
-		return ret;
+		goto err_register;
 
 	for (i = 0; i < VIRTIO_MEDIA_NUM_EVENT_BUFS; i++) {
 		ret = virtio_media_send_event_buffer(
@@ -917,6 +1075,8 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 
 send_event_buffer:
 	video_unregister_device(&vv->video_dev);
+err_register:
+	virtio_media_guest_pool_fini(vv);
 	virtio_dev->config->del_vqs(virtio_dev);
 err_find_vqs:
 	v4l2_device_unregister(&vv->v4l2_dev);
@@ -942,6 +1102,8 @@ static void virtio_media_remove(struct virtio_device *virtio_dev)
 
 		virtio_media_session_close(vv, s);
 	}
+
+	virtio_media_guest_pool_fini(vv);
 }
 
 static struct virtio_device_id id_table[] = {

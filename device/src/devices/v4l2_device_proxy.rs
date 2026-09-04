@@ -61,7 +61,6 @@ use v4l2r::ioctl::DqBufIoctlError;
 use v4l2r::ioctl::DqEventError;
 use v4l2r::ioctl::EventType as V4l2EventType;
 use v4l2r::ioctl::ExpbufFlags;
-use v4l2r::ioctl::ExtControlError;
 use v4l2r::ioctl::IntoErrno;
 use v4l2r::ioctl::QueryCapError;
 use v4l2r::ioctl::QueryCtrlFlags;
@@ -179,21 +178,26 @@ fn perform_ext_ctrls_ioctl<M: VirtioMediaGuestMemoryMapper>(
         &mut Vec<v4l2_ext_control>,
         Vec<Vec<SgEntry>>,
     ),
-) -> Result<(), ExtControlError> {
+) -> IoctlResult<()> {
     let (ctrls, ctrl_array, mem_regions) = ctrls;
     // TODO only backup the addresses of controls which size of > 0 for efficiency? Also keep track
     // of the control index so we don't make a mistake if the host changes the control size.
     let ctrl_array_backup = ctrl_array.clone();
 
-    // Read the payloads for all the controls with one.
+    // Read the payloads for all the controls with one. The addresses are the guest's, so a list
+    // that cannot be mapped is the guest's mistake and goes back to it as an errno (EFAULT for
+    // memory the host may not touch, EINVAL for a malformed list) -- this used to `unwrap()`,
+    // which on a VMM built with `panic = 'abort'` means the guest can end the VM.
     let mut payloads = ctrl_array
         .iter()
         .filter(|ctrl| ctrl.size > 0)
         .zip(mem_regions)
         .map(|(_, sgs)| mem.new_mapping(sgs))
-        // TODO remove unwrap
         .collect::<anyhow::Result<Vec<_>>>()
-        .unwrap();
+        .map_err(|e| {
+            log::error!("failed to map an ext_ctrls payload: {:#}", e);
+            guest_mapping_errno(&e)
+        })?;
 
     // Patch the pointers to the payloads.
     for (ctrl, payload) in ctrl_array
@@ -219,11 +223,10 @@ fn perform_ext_ctrls_ioctl<M: VirtioMediaGuestMemoryMapper>(
         ctrl.__bindgen_anon_1.ptr = unsafe { ctrl_backup.__bindgen_anon_1.ptr };
     }
 
-    if let Err(e) = &res {
+    res.map_err(|e| {
         ctrls.error_idx = e.error_idx;
-    }
-
-    res
+        e.into_errno()
+    })
 }
 
 /// Information about a given USERPTR memory plane.
@@ -958,7 +961,6 @@ where
             which,
             (ctrls, ctrl_array, user_regions),
         )
-        .map_err(|e| e.into_errno())
     }
 
     fn s_ext_ctrls(
@@ -976,7 +978,6 @@ where
             which,
             (ctrls, ctrl_array, user_regions),
         )
-        .map_err(|e| e.into_errno())
     }
 
     fn try_ext_ctrls(
@@ -994,7 +995,6 @@ where
             which,
             (ctrls, ctrl_array, user_regions),
         )
-        .map_err(|e| e.into_errno())
     }
 
     fn enum_framesizes(

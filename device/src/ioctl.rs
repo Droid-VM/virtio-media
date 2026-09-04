@@ -64,7 +64,19 @@ use crate::protocol::RespHeader;
 use crate::protocol::SgEntry;
 use crate::protocol::V4l2Ioctl;
 
+/// Most entries a single SG list may carry.
+///
+/// The guest chooses the entry count, and every entry it sends is another `read_obj` and, later,
+/// another host mapping. 4096 entries of 4 KiB pages is 16 MiB, more than a 4K frame, and four
+/// times what the guest driver's own shadow buffer can hold at 16 bytes per entry (64 KiB, see
+/// `VPU_DESIGN.md` §5.2), so nothing that is expected to work is refused.
+pub const MAX_SG_ENTRIES: usize = 4096;
+
 /// Reads a SG list of guest physical addresses passed from the driver and returns it.
+///
+/// The list is bounded by `MAX_SG_ENTRIES`, and an entry of length 0 is refused: it would never
+/// advance `bytes_taken`, so a guest could keep this loop reading entries for as long as the
+/// descriptor chain holds out (`VPU_DESIGN.md` §4.3).
 fn get_userptr_regions<R: ReadFromDescriptorChain>(
     r: &mut R,
     size: usize,
@@ -73,7 +85,17 @@ fn get_userptr_regions<R: ReadFromDescriptorChain>(
     let mut res = Vec::new();
 
     while bytes_taken < size {
+        if res.len() >= MAX_SG_ENTRIES {
+            anyhow::bail!(
+                "SG list exceeds the {} entry limit before covering {} bytes",
+                MAX_SG_ENTRIES,
+                size
+            );
+        }
         let sg_entry = r.read_obj::<SgEntry>()?;
+        if sg_entry.len == 0 {
+            anyhow::bail!("SG entry of length 0 at guest address {:#x}", sg_entry.start);
+        }
         bytes_taken += sg_entry.len as usize;
         res.push(sg_entry);
     }
@@ -1106,8 +1128,11 @@ where
         VIDIOC_DQEVENT => invalid_ioctl(ioctl, writer),
         VIDIOC_SUBSCRIBE_EVENT => {
             w_ioctl(ioctl, reader, writer, |input: v4l2_event_subscription| {
-                let event = V4l2EventType::try_from(&input).unwrap();
-                let flags = SubscribeEventFlags::from_bits(input.flags).unwrap();
+                // Both come straight from the guest: an event type v4l2r does not know, or a
+                // flag bit it does not define, is the guest's mistake and gets `EINVAL`, not a
+                // panic of the device thread (`VPU_DESIGN.md` §1.10).
+                let event = V4l2EventType::try_from(&input).map_err(|_| libc::EINVAL)?;
+                let flags = SubscribeEventFlags::from_bits(input.flags).ok_or(libc::EINVAL)?;
 
                 handler.subscribe_event(session, event, flags)
             })?;
@@ -1191,5 +1216,53 @@ where
             let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(ctrl.id);
             handler.query_ext_ctrl(session, id, flags)
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::VmediaType;
+
+    /// Serialize SG entries the way the guest puts them on the descriptor chain.
+    fn sg_bytes(entries: &[(u64, u32)]) -> Vec<u8> {
+        use zerocopy::AsBytes;
+        let mut out = Vec::new();
+        for &(start, len) in entries {
+            out.extend_from_slice(SgEntry::new(start, len).to_le().as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn userptr_regions_are_read_up_to_size() {
+        let bytes = sg_bytes(&[(0x1000, 0x1000), (0x3000, 0x800)]);
+        let regions = get_userptr_regions(&mut &bytes[..], 0x1800).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!((regions[0].start, regions[0].len), (0x1000, 0x1000));
+        assert_eq!((regions[1].start, regions[1].len), (0x3000, 0x800));
+    }
+
+    #[test]
+    fn zero_length_sg_entry_is_refused_instead_of_spinning() {
+        let bytes = sg_bytes(&[(0x1000, 0)]);
+        assert!(get_userptr_regions(&mut &bytes[..], 0x1000).is_err());
+    }
+
+    #[test]
+    fn sg_list_is_capped() {
+        let entries: Vec<(u64, u32)> = (0..(MAX_SG_ENTRIES as u64 + 1))
+            .map(|i| (i * 0x1000, 0x1000))
+            .collect();
+        let bytes = sg_bytes(&entries);
+        let too_much = (MAX_SG_ENTRIES + 1) * 0x1000;
+        assert!(get_userptr_regions(&mut &bytes[..], too_much).is_err());
+        let just_enough = MAX_SG_ENTRIES * 0x1000;
+        assert_eq!(
+            get_userptr_regions(&mut &bytes[..], just_enough)
+                .unwrap()
+                .len(),
+            MAX_SG_ENTRIES
+        );
     }
 }

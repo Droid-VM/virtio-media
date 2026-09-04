@@ -133,6 +133,17 @@ pub struct SgEntry {
     __padding: u32,
 }
 
+impl SgEntry {
+    /// An entry covering `len` bytes starting at guest-physical address `start`.
+    pub fn new(start: u64, len: u32) -> Self {
+        Self {
+            start,
+            len,
+            __padding: 0,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, FromZeroes, FromBytes)]
 pub struct CmdHeader {
@@ -290,6 +301,11 @@ impl DequeueBufferEvent {
             hdr: EventHeader::new(VIRTIO_MEDIA_EVENT_DQBUF, session_id),
             v4l2_buffer,
         }
+    }
+
+    /// The buffer being returned to the guest.
+    pub fn v4l2_buffer(&self) -> &V4l2Buffer {
+        &self.v4l2_buffer
     }
 }
 

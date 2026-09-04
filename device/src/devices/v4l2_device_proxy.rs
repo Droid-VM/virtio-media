@@ -120,7 +120,7 @@ fn guest_v4l2_buffer_to_host<M: VirtioMediaGuestMemoryMapper>(
         for (mut host_plane, mem_regions) in
             host_planes.filter(|p| *p.length > 0).zip(guest_regions)
         {
-            let mut mapping = m.new_mapping(mem_regions)?;
+            let mut mapping = m.new_mapping_for(mem_regions, writable)?;
 
             host_plane.set_userptr(if writable {
                 mapping.as_mut_ptr()

@@ -657,7 +657,9 @@ where
             if length != BUFFER_SIZE || covered < BUFFER_SIZE as u64 {
                 return Err(libc::EINVAL);
             }
-            let mapping = self.mem.new_mapping(sgs).map_err(|e| {
+            // The queue is `VIDEO_CAPTURE`: the device fills the guest's pages, so the mapping
+            // has to be writable.
+            let mapping = self.mem.new_mapping_for(sgs, true).map_err(|e| {
                 log::error!("failed to map USERPTR buffer: {:#}", e);
                 guest_mapping_errno(&e)
             })?;

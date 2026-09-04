@@ -835,7 +835,10 @@ where
                     return Err(libc::EINVAL);
                 }
                 let sgs = guest_regions.into_iter().next().ok_or(libc::EINVAL)?;
-                let mapping = self.mem.new_mapping(sgs).map_err(|e| {
+                // CAPTURE is the only direction this device writes; an OUTPUT buffer is mapped
+                // read-only so a bug here cannot reach into the guest's pages.
+                let writable = direction == QueueDirection::Capture;
+                let mapping = self.mem.new_mapping_for(sgs, writable).map_err(|e| {
                     log::error!("failed to map USERPTR buffer: {:#}", e);
                     guest_mapping_errno(&e)
                 })?;
@@ -953,6 +956,8 @@ mod tests {
     struct FakeGuest {
         memory: Rc<RefCell<Vec<u8>>>,
         live_mappings: Rc<RefCell<usize>>,
+        /// `writable` of every mapping the device asked for, in order.
+        directions: Rc<RefCell<Vec<bool>>>,
     }
 
     struct FakeMapping {
@@ -982,12 +987,17 @@ mod tests {
         type GuestMemoryMapping = FakeMapping;
 
         fn new_mapping(&self, sgs: Vec<SgEntry>) -> anyhow::Result<FakeMapping> {
+            self.new_mapping_for(sgs, true)
+        }
+
+        fn new_mapping_for(&self, sgs: Vec<SgEntry>, writable: bool) -> anyhow::Result<FakeMapping> {
             // Only contiguous lists, which is all these tests send.
             let start = sgs.first().map(|sg| sg.start).unwrap_or(0) as usize;
             let total: usize = sgs.iter().map(|sg| sg.len as usize).sum();
             if total == 0 || start + total > self.memory.borrow().len() {
                 anyhow::bail!("bad SG list");
             }
+            self.directions.borrow_mut().push(writable);
             *self.live_mappings.borrow_mut() += 1;
             Ok(FakeMapping {
                 guest: self.clone(),
@@ -1044,6 +1054,7 @@ mod tests {
         let guest = FakeGuest {
             memory: Rc::new(RefCell::new(vec![0u8; GUEST_MEMORY])),
             live_mappings: Rc::new(RefCell::new(0)),
+            directions: Rc::new(RefCell::new(Vec::new())),
         };
         let released = Rc::new(RefCell::new(0));
         let device = LoopbackDevice::new(
@@ -1285,6 +1296,9 @@ mod tests {
 
         // The guest mapping was let go before the event was sent.
         assert_eq!(*r.guest.live_mappings.borrow(), 0);
+        // ... and it was asked for read-only: this is an OUTPUT buffer, which the device only
+        // reads (review bug 6 / design §3.4).
+        assert_eq!(*r.guest.directions.borrow(), vec![false]);
 
         // And the CAPTURE buffer holds the bytes.
         let Backing::Host { buffer, .. } = &s.capture.buffers[0].backing else {
@@ -1360,6 +1374,8 @@ mod tests {
         let gpa = 8 * 0x1000u64;
         let (cap, sgs) = userptr_buffer(QueueType::VideoCaptureMplane, 0, gpa, size - 100);
         r.device.qbuf(&mut s, cap, sgs).unwrap();
+        // A CAPTURE buffer is the one direction the device writes, so it is mapped writable.
+        assert_eq!(*r.guest.directions.borrow(), vec![true]);
 
         let events = dequeued(&r.events.borrow());
         assert_eq!(events.len(), 2);

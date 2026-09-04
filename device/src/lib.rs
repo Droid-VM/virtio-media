@@ -116,7 +116,27 @@ pub trait VirtioMediaGuestMemoryMapper {
     /// memory the host is not allowed to touch) wrap a [`GuestMappingError`] in the returned
     /// error; devices recover it with [`guest_mapping_errno`]. Any other error is reported as
     /// `EINVAL`.
+    ///
+    /// This maps read-write. Devices should call [`Self::new_mapping_for`] instead, which says
+    /// which way the memory will be accessed.
     fn new_mapping(&self, sgs: Vec<SgEntry>) -> anyhow::Result<Self::GuestMemoryMapping>;
+
+    /// Maps `sgs` for the access the device is about to make: `writable` is set for a `CAPTURE`
+    /// buffer, which the device fills, and clear for an `OUTPUT` buffer, which it only reads.
+    ///
+    /// An implementation that can enforce the direction should, so that a bug in a device cannot
+    /// scribble into a guest buffer the guest still owns -- on a protected VM those pages are
+    /// memory the guest deliberately shared with the host and goes on trusting
+    /// (`VPU_DESIGN.md` §3.4). The default ignores `writable` and maps read-write, which is what
+    /// implementations that cannot express a direction get.
+    fn new_mapping_for(
+        &self,
+        sgs: Vec<SgEntry>,
+        writable: bool,
+    ) -> anyhow::Result<Self::GuestMemoryMapping> {
+        let _ = writable;
+        self.new_mapping(sgs)
+    }
 }
 
 /// Error a [`VirtioMediaGuestMemoryMapper`] can return to name the errno the guest should get.

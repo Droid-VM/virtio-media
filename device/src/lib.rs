@@ -257,19 +257,36 @@ impl HostBuffer {
         self.ptr.as_ptr()
     }
 
-    /// The buffer's bytes.
+    /// The buffer's bytes as a slice.
     ///
-    /// The pages may be mapped by the guest at the same time, so their content is untrusted and
-    /// can change underneath; treat what is read as data, never as an invariant.
-    pub fn as_slice(&self) -> &[u8] {
+    /// # Safety
+    ///
+    /// **The guest maps these pages too.** A `&[u8]`/`&mut [u8]` asserts to the compiler that
+    /// nothing else touches the bytes for the life of the borrow, and that is false for every
+    /// buffer the guest has `mmap`ed: the guest can write to them from another CPU at any moment,
+    /// which is a data race and undefined behaviour, and it can change what a "checked" value
+    /// reads as between the check and the use. This is why crosvm hands out `VolatileSlice`
+    /// rather than `&[u8]` for guest-visible memory.
+    ///
+    /// Device code must therefore go through [`Self::as_ptr`] / [`Self::as_mut_ptr`] and raw
+    /// (`ptr::copy*`, `read_volatile`, `write_volatile`) accesses instead. These accessors remain
+    /// for tests and for callers that can prove no guest mapping of the buffer exists -- a buffer
+    /// that has never been given a `mem_offset`, or one whose mappings the device has already
+    /// taken back.
+    pub unsafe fn as_slice(&self) -> &[u8] {
         // SAFETY: `ptr` is valid for `len` bytes for the life of `self` (constructor contract),
-        // and the returned borrow cannot outlive `self`.
+        // and the returned borrow cannot outlive `self`. The caller promises there is no
+        // concurrent guest mapping.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 
-    /// The buffer's bytes, writable. Same caveat as [`Self::as_slice`], and a buffer created with
+    /// The buffer's bytes as a mutable slice.
+    ///
+    /// # Safety
+    ///
+    /// Same aliasing hazard as [`Self::as_slice`], which see; additionally a buffer created with
     /// `map_fd(.., rw = false)` must not be written through this.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: as `as_slice`, and `&mut self` makes this the only borrow of the bytes on the
         // host side.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }

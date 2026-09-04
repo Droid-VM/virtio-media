@@ -244,8 +244,11 @@ mod tests {
 
         // The mapping is the memfd: what is written through the slice is what a second mapping
         // of the descriptor reads back.
-        buffer.as_mut_slice().fill(0x5a);
-        buffer.as_mut_slice()[0x17ff] = 0xa5;
+        // SAFETY: this buffer has never been handed to a guest, so nothing else maps it.
+        unsafe {
+            buffer.as_mut_slice().fill(0x5a);
+            buffer.as_mut_slice()[0x17ff] = 0xa5;
+        }
         let second = HostBuffer::map_fd(
             buffer.fd.try_clone().unwrap(),
             0,
@@ -253,8 +256,11 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(second.as_slice()[0], 0x5a);
-        assert_eq!(second.as_slice()[0x17ff], 0xa5);
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(second.as_slice()[0], 0x5a);
+            assert_eq!(second.as_slice()[0x17ff], 0xa5);
+        }
         drop(second);
 
         allocator.release(buffer);

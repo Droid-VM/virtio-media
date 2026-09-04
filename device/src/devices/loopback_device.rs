@@ -1291,7 +1291,11 @@ mod tests {
             panic!("CAPTURE buffer is not host-owned");
         };
         let expected: Vec<u8> = (0..payload as usize).map(|i| (i * 7 % 251) as u8).collect();
-        assert_eq!(&buffer.as_slice()[..payload as usize], &expected[..]);
+        // SAFETY: no guest mapping of this buffer was ever made (no MMAP command was sent).
+        assert_eq!(
+            &unsafe { buffer.as_slice() }[..payload as usize],
+            &expected[..]
+        );
 
         // Requeueing a dequeued buffer works, requeueing a queued one does not.
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
@@ -1336,7 +1340,8 @@ mod tests {
 
         // Fill the host OUTPUT buffer the way the guest would through its mapping.
         let offset = if let Backing::Host { buffer, offset } = &mut s.output.buffers[0].backing {
-            buffer.as_mut_slice().fill(0xab);
+            // SAFETY: as above, this buffer is not mapped by any guest.
+            unsafe { buffer.as_mut_slice().fill(0xab) };
             *offset
         } else {
             panic!("OUTPUT buffer is not host-owned");

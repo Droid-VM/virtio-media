@@ -161,17 +161,32 @@ impl<GM: GuestMemoryRange> SimpleCaptureDeviceSession<GM> {
                 0x55u8 * (sequence as u8 % 3),
                 0x10u8 * (sequence as u8 % 16),
             ];
-            let frame: &mut [u8] = match &mut buffer.backing {
-                Backing::Host { buffer, .. } => &mut buffer.as_mut_slice()[..BUFFER_SIZE as usize],
-                // SAFETY: the mapping covers at least `BUFFER_SIZE` bytes (checked at QBUF) and
-                // lives until we drop it below, after writing.
-                Backing::Guest(Some(mapping)) => unsafe {
-                    std::slice::from_raw_parts_mut(mapping.as_mut_ptr(), BUFFER_SIZE as usize)
-                },
+            // The frame is written through a raw pointer, never a `&mut [u8]`: the guest maps
+            // these bytes at the same time (a host-owned buffer it has `mmap`ed, or its own
+            // pages behind a `USERPTR` mapping), and a Rust slice would claim exclusive access
+            // to memory another CPU can be writing. One page-sized run of the pattern is built
+            // on the stack and copied out, so the guest-visible memory is only ever a
+            // destination.
+            let frame: *mut u8 = match &mut buffer.backing {
+                Backing::Host { buffer, .. } => buffer.as_mut_ptr(),
+                Backing::Guest(Some(mapping)) => mapping.as_mut_ptr(),
                 Backing::Guest(None) => return Err(libc::EIO),
             };
-            for pixel in frame.chunks_exact_mut(3) {
+            // A multiple of 3, so a run starts on a pixel boundary wherever it lands.
+            const RUN: usize = 3 * 1365;
+            let mut run = [0u8; RUN];
+            for pixel in run.chunks_exact_mut(3) {
                 pixel.copy_from_slice(&color);
+            }
+            let mut written = 0usize;
+            while written < BUFFER_SIZE as usize {
+                let len = RUN.min(BUFFER_SIZE as usize - written);
+                // SAFETY: `frame` is valid for `BUFFER_SIZE` writes -- a host buffer is that
+                // long, and a guest mapping was checked to cover it at QBUF -- it lives until
+                // the mapping is dropped below, and `run` is a separate stack object, so the
+                // two ranges cannot overlap.
+                unsafe { std::ptr::copy_nonoverlapping(run.as_ptr(), frame.add(written), len) };
+                written += len;
             }
             // A shadowed guest mapping is only written back when it goes away, and the guest
             // must see the frame before it is told the buffer is done.

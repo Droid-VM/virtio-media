@@ -21,6 +21,7 @@
 #define VIRTIO_MEDIA_DEFAULT_DRIVER_NAME "virtio_media"
 
 extern char *driver_name;
+extern char *driver_owned_queues;
 
 /**
  * Virtio-media device.

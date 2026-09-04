@@ -82,6 +82,32 @@ struct vmedia_dbuf {
 };
 
 /**
+ * vmedia_dbuf_type_supported - Whether buffers of a queue type can be
+ * driver-owned, i.e. whether the type's format tells their size.
+ */
+bool vmedia_dbuf_type_supported(u32 type);
+
+/**
+ * vmedia_dbuf_buffer_to_host - Rewrite @b for the host: memory USERPTR,
+ * m.userptr the cookie (opaque, echoed back) and length the buffer size, per
+ * plane for multiplanar buffers. Planes without a dbuf are left untouched.
+ */
+void vmedia_dbuf_buffer_to_host(struct v4l2_buffer *b,
+				struct vmedia_dbuf *const *dbufs);
+
+/**
+ * vmedia_dbuf_buffer_from_host - Rewrite @b for user-space: memory MMAP,
+ * m.offset the cookie and length the buffer size, per plane for multiplanar
+ * buffers.
+ * @planes: the plane array to patch (b->m.planes may be a dangling pointer in
+ *	the buffer state kept for DQBUF, so it is passed explicitly).
+ * @max_planes: number of entries in @planes.
+ */
+void vmedia_dbuf_buffer_from_host(struct v4l2_buffer *b,
+				  struct v4l2_plane *planes, u32 max_planes,
+				  struct vmedia_dbuf *const *dbufs);
+
+/**
  * vmedia_dbuf_plane_sizes - Plane sizes a queue's current format implies.
  * @f: the format.
  * @sizes: filled with the size of each plane.

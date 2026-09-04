@@ -57,6 +57,18 @@
 char *driver_name = NULL;
 module_param(driver_name, charp, 0660);
 
+/*
+ * Which queues get driver-owned buffers when user-space asks for MMAP
+ * (VPU_DESIGN.md 2.1): "output" (default) = the queues the guest fills, i.e.
+ * V4L2_TYPE_IS_OUTPUT; "all" = every queue, so no media_host pool is needed;
+ * "none" = every MMAP buffer is host-owned, the upstream behaviour, for A/B
+ * comparison. Evaluated at REQBUFS/CREATE_BUFS time.
+ */
+char *driver_owned_queues = "output";
+module_param(driver_owned_queues, charp, 0660);
+MODULE_PARM_DESC(driver_owned_queues,
+		 "queues whose MMAP buffers the driver allocates: output (default), all, none");
+
 /**
  * Allocate a new session. The id and list fields must still be set by the
  * caller.
@@ -389,6 +401,15 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 		}
 	}
 
+	/*
+	 * A driver-owned buffer went to the host as USERPTR: give user-space
+	 * back the MMAP memory type, its cookie and its length
+	 * (VPU_DESIGN.md 5.3 item 5).
+	 */
+	if (dqbuf->dbuf[0])
+		vmedia_dbuf_buffer_from_host(&dqbuf->buffer, dqbuf->planes,
+					     VIDEO_MAX_PLANES, dqbuf->dbuf);
+
 	/* Set the DONE flag as the buffer is waiting for being dequeued. */
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;
 
@@ -717,8 +738,10 @@ static const struct vm_operations_struct virtio_media_vm_ops = {
 /**
  * Perform a mmap request from the guest.
  *
- * This requests the host to map a MMAP buffer for us, so we can make that
- * mapping visible into the user-space address space.
+ * For a driver-owned buffer (cookie >= VMEDIA_DBUF_COOKIE_BASE) the pages are
+ * ours and get mapped directly; the host is not involved. Otherwise this
+ * requests the host to map a MMAP buffer for us, so we can make that mapping
+ * visible into the user-space address space.
  */
 static int virtio_media_device_mmap(struct file *file,
 				    struct vm_area_struct *vma)
@@ -732,6 +755,7 @@ static int virtio_media_device_mmap(struct file *file,
 	struct scatterlist cmd_sg = {}, resp_sg = {};
 	struct scatterlist *sgs[2] = { &cmd_sg, &resp_sg };
 	struct virtio_media_hostmap *map;
+	const u64 cookie = (u64)vma->vm_pgoff << PAGE_SHIFT;
 	u64 driver_addr;
 	u64 len;
 	int ret;
@@ -744,6 +768,13 @@ static int virtio_media_device_mmap(struct file *file,
 		return -ENODEV;
 
 	mutex_lock(&vv->vlock);
+
+	if (cookie >= VMEDIA_DBUF_COOKIE_BASE) {
+		struct vmedia_dbuf *dbuf = vmedia_dbuf_lookup(session, cookie);
+
+		ret = dbuf ? vmedia_dbuf_mmap(dbuf, vma) : -EINVAL;
+		goto end;
+	}
 
 	cmd_mmap->hdr.cmd = VIRTIO_MEDIA_CMD_MMAP;
 	cmd_mmap->session_id = session->id;

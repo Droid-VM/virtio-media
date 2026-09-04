@@ -12,6 +12,7 @@
 
 #include "scatterlist_filler.h"
 #include "session.h"
+#include "virtio_media_alloc.h"
 
 /**
  * If set to `true`, then the driver will always copy the data passed to the
@@ -395,6 +396,40 @@ int scatterlist_filler_add_buffer_userptr(struct scatterlist_filler *filler,
 	} else if (b->length > 0) {
 		ret = scatterlist_filler_add_userptr(filler, b->m.userptr,
 						     b->length);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int scatterlist_filler_add_dbuf(struct scatterlist_filler *filler,
+				       struct vmedia_dbuf *dbuf)
+{
+	return scatterlist_filler_add_data(filler, dbuf->sg,
+					   sizeof(*dbuf->sg) * dbuf->nents);
+}
+
+int scatterlist_filler_add_buffer_dbuf(struct scatterlist_filler *filler,
+				       struct v4l2_buffer *b,
+				       struct vmedia_dbuf *const *dbufs)
+{
+	int i;
+	int ret;
+
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		for (i = 0; i < b->length && i < VIDEO_MAX_PLANES; i++) {
+			struct v4l2_plane *plane = &b->m.planes[i];
+
+			if (dbufs[i] && plane->length > 0) {
+				ret = scatterlist_filler_add_dbuf(filler,
+								  dbufs[i]);
+				if (ret)
+					return ret;
+			}
+		}
+	} else if (dbufs[0] && b->length > 0) {
+		ret = scatterlist_filler_add_dbuf(filler, dbufs[0]);
 		if (ret)
 			return ret;
 	}

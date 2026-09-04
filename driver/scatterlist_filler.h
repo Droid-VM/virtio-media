@@ -13,6 +13,8 @@
 
 #include "session.h"
 
+struct vmedia_dbuf;
+
 /**
  * struct scatterlist_filler - helper to fill a scatterlist from data.
  *
@@ -84,6 +86,20 @@ int scatterlist_filler_add_buffer(struct scatterlist_filler *filler,
  */
 int scatterlist_filler_add_buffer_userptr(struct scatterlist_filler *filler,
 					  struct v4l2_buffer *b);
+
+/**
+ * scatterlist_filler_add_buffer_dbuf - Add a driver-owned buffer's SG lists to the list.
+ *
+ * The counterpart of scatterlist_filler_add_buffer_userptr() for buffers the
+ * driver allocated itself (VPU_DESIGN.md 5.3 item 4): the guest-physical SG
+ * list was computed at allocation time, so no page pinning or sg_table walk
+ * happens here, and the shadow buffer is not used.
+ *
+ * @dbufs: the buffer's per-plane backing; planes without one are skipped.
+ */
+int scatterlist_filler_add_buffer_dbuf(struct scatterlist_filler *filler,
+				       struct v4l2_buffer *b,
+				       struct vmedia_dbuf *const *dbufs);
 
 /**
  * scatterlist_filler_add_ext_ctrls - Add a v4l2_ext_controls and its controls to the list.

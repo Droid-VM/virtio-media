@@ -53,6 +53,64 @@ MODULE_PARM_DESC(pool_debug,
  */
 #define VMEDIA_DBUF_MAX_ENTS 4096
 
+bool vmedia_dbuf_type_supported(u32 type)
+{
+	switch (type) {
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+	case V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE:
+	case V4L2_BUF_TYPE_SDR_CAPTURE:
+	case V4L2_BUF_TYPE_SDR_OUTPUT:
+	case V4L2_BUF_TYPE_META_CAPTURE:
+	case V4L2_BUF_TYPE_META_OUTPUT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void vmedia_dbuf_buffer_to_host(struct v4l2_buffer *b,
+				struct vmedia_dbuf *const *dbufs)
+{
+	u32 i;
+
+	b->memory = V4L2_MEMORY_USERPTR;
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		for (i = 0; i < b->length && i < VIDEO_MAX_PLANES; i++) {
+			if (!dbufs[i])
+				continue;
+			b->m.planes[i].m.userptr = dbufs[i]->cookie;
+			b->m.planes[i].length = dbufs[i]->len;
+		}
+	} else if (dbufs[0]) {
+		b->m.userptr = dbufs[0]->cookie;
+		b->length = dbufs[0]->len;
+	}
+}
+
+void vmedia_dbuf_buffer_from_host(struct v4l2_buffer *b,
+				  struct v4l2_plane *planes, u32 max_planes,
+				  struct vmedia_dbuf *const *dbufs)
+{
+	u32 i;
+
+	b->memory = V4L2_MEMORY_MMAP;
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		for (i = 0; i < b->length && i < max_planes &&
+			    i < VIDEO_MAX_PLANES;
+		     i++) {
+			if (!dbufs[i])
+				continue;
+			planes[i].m.mem_offset = dbufs[i]->cookie;
+			planes[i].length = dbufs[i]->len;
+		}
+	} else if (dbufs[0]) {
+		b->m.offset = dbufs[0]->cookie;
+		b->length = dbufs[0]->len;
+	}
+}
+
 int vmedia_dbuf_plane_sizes(const struct v4l2_format *f,
 			    size_t sizes[VIDEO_MAX_PLANES], u32 *num_planes)
 {

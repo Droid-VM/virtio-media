@@ -932,12 +932,12 @@ where
         }
         // The queue's *current* format is a second floor, and the one `v4l2-compliance` tests
         // (D9): `testMmap` halves the height and the `sizeimage` together
-        // (`v4l2-test-buffers.cpp:1653-1663`) and requires `EINVAL` both with buffers allocated
-        // and with none. Checking only `wanted` misses it, because `adjust_format` re-derives
-        // `wanted` from the *requested* dimensions on the OUTPUT queue, so a halved `sizeimage`
-        // is exactly what a halved height asks for. A buffer set smaller than the format the
-        // queue would stream with is of no use to anyone, so it is refused whatever the request
-        // says.
+        // (`v4l2-test-buffers.cpp:1648-1654`, v4l-utils-1.32.0) and requires `EINVAL` both with
+        // buffers allocated and with none. Checking only `wanted` misses it, because
+        // `adjust_format` re-derives `wanted` from the *requested* dimensions on the OUTPUT
+        // queue, so a halved `sizeimage` is exactly what a halved height asks for. A buffer set
+        // smaller than the format the queue would stream with is of no use to anyone, so it is
+        // refused whatever the request says.
         let current = session.queue(queue_type)?.format;
         if asked < current.sizeimage() {
             return Err(libc::EINVAL);
@@ -2099,10 +2099,10 @@ mod tests {
     /// D9 -- `CREATE_BUFS` for a format halved in both height and `sizeimage` is refused on
     /// either queue, with buffers allocated and without.
     ///
-    /// `v4l2-compliance`'s `testMmap` (`v4l2-test-buffers.cpp:1653-1663`) takes `G_FMT`, halves
-    /// the height and every plane's `sizeimage`, and requires `EINVAL` twice: once with the
-    /// queue's buffers allocated and once after `REQBUFS(0)`. Halving the height halves the
-    /// `sizeimage` the *requested* format needs, so only the queue's own format catches it.
+    /// `v4l2-compliance`'s `testMmap` (`v4l2-test-buffers.cpp:1648-1654`, v4l-utils-1.32.0) takes
+    /// `G_FMT`, halves the height and every plane's `sizeimage`, and requires `EINVAL` twice: once
+    /// with the queue's buffers allocated and once after `REQBUFS(0)`. Halving the height halves
+    /// the `sizeimage` the *requested* format needs, so only the queue's own format catches it.
     #[test]
     fn create_bufs_refuses_a_format_halved_in_height_and_size() {
         for queue in [QueueType::VideoOutputMplane, QueueType::VideoCaptureMplane] {

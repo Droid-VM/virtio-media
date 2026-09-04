@@ -28,6 +28,10 @@
 //! queues into the next available CAPTURE buffer. It exercises both buffer ownerships at once --
 //! guest-owned `USERPTR` and host-owned `MMAP`, on either queue -- which is what a guest driver
 //! with its own buffer pool needs to be tested against (`VPU_DESIGN.md` §4.2).
+//!
+//! [camera] is a capture device over a host camera reached through the `CameraBackend` trait,
+//! so the V4L2 side is VMM- and platform-independent and the VMM supplies the camera
+//! (`VPU_DESIGN.md` §7.1).
 
 #[cfg(feature = "simple-device")]
 pub mod simple_device;
@@ -38,6 +42,11 @@ pub use simple_device::SimpleCaptureDevice;
 pub mod loopback_device;
 #[cfg(feature = "loopback-device")]
 pub use loopback_device::LoopbackDevice;
+
+#[cfg(feature = "camera-device")]
+pub mod camera;
+#[cfg(feature = "camera-device")]
+pub use camera::CameraDevice;
 
 pub mod v4l2_device_proxy;
 pub use v4l2_device_proxy::V4l2ProxyDevice;

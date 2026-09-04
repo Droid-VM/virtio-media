@@ -33,11 +33,14 @@ use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::mmap::MmapMappingManager;
+use crate::mmap::RetiredBuffers;
 use crate::DequeueBufferEvent;
+use crate::HostBuffer;
 use crate::SessionEvent;
 use crate::SgEntry;
 use crate::V4l2Event;
 use crate::V4l2Ioctl;
+use crate::VirtioMediaBufferAllocator;
 use crate::VirtioMediaDevice;
 use crate::VirtioMediaDeviceSession;
 use crate::VirtioMediaEventQueue;
@@ -45,12 +48,26 @@ use crate::VirtioMediaHostMemoryMapper;
 use crate::VIRTIO_MEDIA_MMAP_FLAG_RW;
 
 /// Backing MMAP memory for `VirtioVideoMediaDecoderBuffer`.
+///
+/// The planes' memory comes from the device's [`VirtioMediaBufferAllocator`] (so that on a host
+/// with a pre-shared buffer pool, CAPTURE frames are decoded straight into it), and goes back to
+/// it through [`Self::into_host_buffers`] when the buffer is freed.
 pub trait VideoDecoderBufferBacking {
-    fn new(queue: QueueType, index: u32, sizes: &[usize]) -> IoctlResult<Self>
+    fn new(
+        queue: QueueType,
+        index: u32,
+        sizes: &[usize],
+        allocator: &mut dyn VirtioMediaBufferAllocator,
+    ) -> IoctlResult<Self>
     where
         Self: Sized;
 
-    fn fd_for_plane(&self, plane_idx: usize) -> Option<BorrowedFd>;
+    /// The host buffer backing plane `plane_idx`, if there is one.
+    fn buffer_for_plane(&self, plane_idx: usize) -> Option<&HostBuffer>;
+
+    /// Hand every plane's host buffer back, in plane order, so the device can return them to
+    /// the allocator.
+    fn into_host_buffers(self) -> Vec<HostBuffer>;
 }
 
 pub struct VideoDecoderBuffer<S: VideoDecoderBufferBacking> {
@@ -67,8 +84,9 @@ impl<S: VideoDecoderBufferBacking> VideoDecoderBuffer<S> {
         sizes: &[usize],
         // TODO: need as many offsets as there are planes.
         mmap_offset: u32,
+        allocator: &mut dyn VirtioMediaBufferAllocator,
     ) -> IoctlResult<Self> {
-        let backing = S::new(queue, index, sizes)?;
+        let backing = S::new(queue, index, sizes, allocator)?;
 
         let mut v4l2_buffer = V4l2Buffer::new(queue, index, MemoryType::Mmap);
         if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
@@ -506,23 +524,56 @@ pub struct VideoDecoder<
     D: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
     HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
 > {
     backend: D,
     event_queue: Q,
     host_mapper: MmapMappingManager<HM>,
+    /// Where the planes of `MMAP` buffers come from.
+    allocator: A,
+    /// Freed `MMAP` buffers the guest still maps.
+    retired: RetiredBuffers,
 }
 
-impl<B, Q, HM> VideoDecoder<B, Q, HM>
+impl<B, Q, HM, A> VideoDecoder<B, Q, HM, A>
 where
     B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
     HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
 {
-    pub fn new(backend: B, event_queue: Q, host_mapper: HM) -> Self {
+    pub fn new(backend: B, event_queue: Q, host_mapper: HM, allocator: A) -> Self {
         Self {
             backend,
             event_queue,
             host_mapper: MmapMappingManager::from(host_mapper),
+            allocator,
+            retired: RetiredBuffers::new(),
+        }
+    }
+
+    /// Free `buffer`: unregister its MMAP offsets and return its planes to the allocator (or
+    /// hold them until the guest unmaps them).
+    fn free_buffer(&mut self, buffer: VideoDecoderBuffer<<B::Session as VideoDecoderBackendSession>::BufferStorage>) {
+        let offsets: Vec<u32> = if let V4l2PlanesWithBacking::Mmap(planes) =
+            buffer.v4l2_buffer.planes_with_backing_iter()
+        {
+            planes.map(|p| p.mem_offset()).collect()
+        } else {
+            Vec::new()
+        };
+        let host_buffers = buffer.backing.into_host_buffers();
+        for (i, host_buffer) in host_buffers.into_iter().enumerate() {
+            match offsets.get(i) {
+                Some(&offset) => self.retired.retire(
+                    &mut self.host_mapper,
+                    &mut self.allocator,
+                    offset,
+                    host_buffer,
+                ),
+                // A plane that was never given an offset cannot be mapped by the guest.
+                None => self.allocator.release(host_buffer),
+            }
         }
     }
 
@@ -572,11 +623,12 @@ where
     }
 }
 
-impl<B, Q, HM, Reader, Writer> VirtioMediaDevice<Reader, Writer> for VideoDecoder<B, Q, HM>
+impl<B, Q, HM, A, Reader, Writer> VirtioMediaDevice<Reader, Writer> for VideoDecoder<B, Q, HM, A>
 where
     B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
     HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
     Reader: ReadFromDescriptorChain,
     Writer: WriteToDescriptorChain,
 {
@@ -601,19 +653,13 @@ where
     }
 
     fn close_session(&mut self, session: Self::Session) {
-        // Unregister all MMAP buffers.
+        // Unregister all MMAP buffers and return their memory.
         for buffer in session
             .input_buffers
-            .iter()
-            .chain(session.output_buffers.iter())
+            .into_iter()
+            .chain(session.output_buffers.into_iter())
         {
-            if let V4l2PlanesWithBacking::Mmap(planes) =
-                buffer.v4l2_buffer.planes_with_backing_iter()
-            {
-                for plane in planes {
-                    self.host_mapper.unregister_buffer(plane.mem_offset());
-                }
-            }
+            self.free_buffer(buffer);
         }
     }
 
@@ -654,10 +700,13 @@ where
             .ok_or(libc::EINVAL)?;
         let rw = (flags & VIRTIO_MEDIA_MMAP_FLAG_RW) != 0;
 
-        let fd = buffer.backing.fd_for_plane(plane_idx).unwrap();
+        let host_buffer = buffer
+            .backing
+            .buffer_for_plane(plane_idx)
+            .ok_or(libc::EINVAL)?;
 
         self.host_mapper
-            .create_mapping(offset, fd, rw)
+            .create_mapping(offset, host_buffer, rw)
             .map_err(|e| {
                 log::error!(
                     "failed to map MMAP buffer at offset 0x{:x}: {:#}",
@@ -669,10 +718,13 @@ where
     }
 
     fn do_munmap(&mut self, guest_addr: u64) -> Result<(), i32> {
-        self.host_mapper
+        let res = self
+            .host_mapper
             .remove_mapping(guest_addr)
             .map(|_| ())
-            .map_err(|_| libc::EINVAL)
+            .map_err(|_| libc::EINVAL);
+        self.retired.reap(&self.host_mapper, &mut self.allocator);
+        res
     }
 
     fn process_events(&mut self, session: &mut Self::Session) -> Result<(), i32> {
@@ -770,11 +822,12 @@ where
     }
 }
 
-impl<B, Q, HM> VirtioMediaIoctlHandler for VideoDecoder<B, Q, HM>
+impl<B, Q, HM, A> VirtioMediaIoctlHandler for VideoDecoder<B, Q, HM, A>
 where
     B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
     HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
 {
     type Session = VideoDecoderSession<B::Session>;
 
@@ -898,16 +951,10 @@ where
         };
 
         if (count as usize) < buffers.len() {
-            for buffer in &buffers[count as usize..] {
-                if let V4l2PlanesWithBacking::Mmap(planes) =
-                    buffer.v4l2_buffer.planes_with_backing_iter()
-                {
-                    for plane in planes {
-                        self.host_mapper.unregister_buffer(plane.mem_offset());
-                    }
-                }
+            let freed: Vec<_> = buffers.drain(count as usize..).collect();
+            for buffer in freed {
+                self.free_buffer(buffer);
             }
-            buffers.truncate(count as usize);
         } else {
             let sizeimage = session
                 .backend_session
@@ -929,6 +976,7 @@ where
                         // TODO: only single-planar formats supported.
                         &[sizeimage as usize],
                         mmap_offset,
+                        &mut self.allocator,
                     )
                     .inspect_err(|_| {
                         // TODO: no, we need to unregister all the buffers and restore the

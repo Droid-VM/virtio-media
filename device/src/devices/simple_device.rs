@@ -6,17 +6,18 @@
 //!
 //! This module illustrates how to write a device for virtio-media. It exposes a capture device
 //! that generates a RGB pattern on the buffers queued by the guest.
+//!
+//! Buffers can be host-owned (`MMAP`, allocated from the device's
+//! [`VirtioMediaBufferAllocator`]) or guest-owned (`USERPTR`, in which case the pattern is
+//! written through the [`VirtioMediaGuestMemoryMapper`] into the guest's own pages). The latter
+//! is what a guest driver that owns its buffers exercises (`VPU_DESIGN.md` §4.2).
 
 use std::collections::VecDeque;
-use std::io::BufWriter;
 use std::io::Result as IoResult;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::io::Write;
-use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
 
 use v4l2r::bindings;
+use v4l2r::bindings::v4l2_event_subscription;
 use v4l2r::bindings::v4l2_fmtdesc;
 use v4l2r::bindings::v4l2_format;
 use v4l2r::bindings::v4l2_pix_format;
@@ -24,26 +25,33 @@ use v4l2r::bindings::v4l2_requestbuffers;
 use v4l2r::ioctl::BufferCapabilities;
 use v4l2r::ioctl::BufferField;
 use v4l2r::ioctl::BufferFlags;
+use v4l2r::ioctl::EventType;
+use v4l2r::ioctl::SubscribeEventFlags;
 use v4l2r::ioctl::V4l2Buffer;
 use v4l2r::ioctl::V4l2PlanesWithBackingMut;
 use v4l2r::memory::MemoryType;
 use v4l2r::PixelFormat;
 use v4l2r::QueueType;
 
+use crate::guest_mapping_errno;
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
 use crate::ioctl::VirtioMediaIoctlHandler;
-use crate::memfd::MemFdBuffer;
 use crate::mmap::MmapMappingManager;
+use crate::mmap::RetiredBuffers;
 use crate::protocol::DequeueBufferEvent;
 use crate::protocol::SgEntry;
 use crate::protocol::V4l2Event;
 use crate::protocol::V4l2Ioctl;
 use crate::protocol::VIRTIO_MEDIA_MMAP_FLAG_RW;
+use crate::GuestMemoryRange;
+use crate::HostBuffer;
 use crate::ReadFromDescriptorChain;
+use crate::VirtioMediaBufferAllocator;
 use crate::VirtioMediaDevice;
 use crate::VirtioMediaDeviceSession;
 use crate::VirtioMediaEventQueue;
+use crate::VirtioMediaGuestMemoryMapper;
 use crate::VirtioMediaHostMemoryMapper;
 use crate::WriteToDescriptorChain;
 
@@ -61,21 +69,25 @@ enum BufferState {
     },
 }
 
+/// Where a buffer's bytes live.
+enum Backing<GM> {
+    /// Host-owned, from the allocator; mappable by the guest at `offset`.
+    Host { buffer: HostBuffer, offset: u32 },
+    /// Guest-owned; mapped from the guest's `USERPTR` SG list while the buffer is queued.
+    Guest(Option<GM>),
+}
+
 /// Information about a single buffer.
-struct Buffer {
+struct Buffer<GM> {
     /// Current state of the buffer.
     state: BufferState,
     /// V4L2 representation of this buffer to be sent to the guest when requested.
     v4l2_buffer: V4l2Buffer,
     /// Backing storage for the buffer.
-    fd: MemFdBuffer,
-    /// Offset that can be used to map the buffer.
-    ///
-    /// Cached from `v4l2_buffer` to avoid doing a match.
-    offset: u32,
+    backing: Backing<GM>,
 }
 
-impl Buffer {
+impl<GM> Buffer<GM> {
     /// Update the state of the buffer as well as its V4L2 representation.
     fn set_state(&mut self, state: BufferState) {
         let mut flags = self.v4l2_buffer.flags();
@@ -102,29 +114,38 @@ impl Buffer {
         self.v4l2_buffer.set_flags(flags);
         self.state = state;
     }
+
+    /// Let go of the guest mapping, if this is a guest-owned buffer with one.
+    fn drop_guest_mapping(&mut self) {
+        if let Backing::Guest(mapping) = &mut self.backing {
+            *mapping = None;
+        }
+    }
 }
 
 /// Session data of [`SimpleCaptureDevice`].
-pub struct SimpleCaptureDeviceSession {
+pub struct SimpleCaptureDeviceSession<GM> {
     /// Id of the session.
     id: u32,
     /// Current iteration of the pattern generation cycle.
     iteration: u64,
+    /// Memory type the buffers were requested with, if any.
+    memory: Option<MemoryType>,
     /// Buffers currently allocated for this session.
-    buffers: Vec<Buffer>,
+    buffers: Vec<Buffer<GM>>,
     /// FIFO of queued buffers awaiting processing.
     queued_buffers: VecDeque<usize>,
     /// Is the session currently streaming?
     streaming: bool,
 }
 
-impl VirtioMediaDeviceSession for SimpleCaptureDeviceSession {
+impl<GM> VirtioMediaDeviceSession for SimpleCaptureDeviceSession<GM> {
     fn poll_fd(&self) -> Option<BorrowedFd> {
         None
     }
 }
 
-impl SimpleCaptureDeviceSession {
+impl<GM: GuestMemoryRange> SimpleCaptureDeviceSession<GM> {
     /// Generate the data pattern on all queued buffers and send the corresponding
     /// [`DequeueBufferEvent`] to the driver.
     fn process_queued_buffers<Q: VirtioMediaEventQueue>(
@@ -135,23 +156,27 @@ impl SimpleCaptureDeviceSession {
             let buffer = self.buffers.get_mut(buf_id).ok_or(libc::EIO)?;
             let sequence = self.iteration as u32;
 
-            buffer
-                .fd
-                .as_file()
-                .seek(SeekFrom::Start(0))
-                .map_err(|_| libc::EIO)?;
-            let mut writer = BufWriter::new(buffer.fd.as_file());
             let color = [
                 0xffu8 * (sequence as u8 % 2),
                 0x55u8 * (sequence as u8 % 3),
                 0x10u8 * (sequence as u8 % 16),
             ];
-            for _ in 0..(WIDTH * HEIGHT) {
-                let _ = writer.write(&color).map_err(|_| libc::EIO)?;
+            let frame: &mut [u8] = match &mut buffer.backing {
+                Backing::Host { buffer, .. } => &mut buffer.as_mut_slice()[..BUFFER_SIZE as usize],
+                // SAFETY: the mapping covers at least `BUFFER_SIZE` bytes (checked at QBUF) and
+                // lives until we drop it below, after writing.
+                Backing::Guest(Some(mapping)) => unsafe {
+                    std::slice::from_raw_parts_mut(mapping.as_mut_ptr(), BUFFER_SIZE as usize)
+                },
+                Backing::Guest(None) => return Err(libc::EIO),
+            };
+            for pixel in frame.chunks_exact_mut(3) {
+                pixel.copy_from_slice(&color);
             }
-            drop(writer);
+            // A shadowed guest mapping is only written back when it goes away, and the guest
+            // must see the frame before it is told the buffer is done.
+            buffer.drop_guest_mapping();
 
-            *buffer.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
             buffer.set_state(BufferState::Outgoing { sequence });
             // TODO: should we set the DONE flag here?
             self.iteration += 1;
@@ -172,12 +197,24 @@ impl SimpleCaptureDeviceSession {
 /// testing VMMs and guests without dedicated hardware support.
 ///
 /// This device supports a single pixel format (`RGB3`) and a single resolution, and generates
-/// frames of varying uniform color. The only buffer type supported is `MMAP`
-pub struct SimpleCaptureDevice<Q: VirtioMediaEventQueue, HM: VirtioMediaHostMemoryMapper> {
+/// frames of varying uniform color. Buffers can be `MMAP` (host-owned) or `USERPTR`
+/// (guest-owned).
+pub struct SimpleCaptureDevice<
+    Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
+    HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
+> {
     /// Queue used to send events to the guest.
     evt_queue: Q,
+    /// Guest memory mapper, for `USERPTR` buffers.
+    mem: M,
     /// Host MMAP mapping manager.
     mmap_manager: MmapMappingManager<HM>,
+    /// Where `MMAP` buffers come from.
+    allocator: A,
+    /// Freed `MMAP` buffers the guest still maps.
+    retired: RetiredBuffers,
     /// ID of the session with allocated buffers, if any.
     ///
     /// v4l2-compliance checks that only a single session can have allocated buffers at a given
@@ -187,47 +224,70 @@ pub struct SimpleCaptureDevice<Q: VirtioMediaEventQueue, HM: VirtioMediaHostMemo
     active_session: Option<u32>,
 }
 
-impl<Q, HM> SimpleCaptureDevice<Q, HM>
+impl<Q, M, HM, A> SimpleCaptureDevice<Q, M, HM, A>
 where
     Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
 {
-    pub fn new(evt_queue: Q, mapper: HM) -> Self {
+    pub fn new(evt_queue: Q, mem: M, mapper: HM, allocator: A) -> Self {
         Self {
             evt_queue,
+            mem,
             mmap_manager: MmapMappingManager::from(mapper),
+            allocator,
+            retired: RetiredBuffers::new(),
             active_session: None,
+        }
+    }
+
+    /// Drop every buffer of `session`, returning host buffers to the allocator (or holding them
+    /// until the guest unmaps them) and releasing guest mappings.
+    fn free_buffers(&mut self, session: &mut SimpleCaptureDeviceSession<M::GuestMemoryMapping>) {
+        session.queued_buffers.clear();
+        for buffer in session.buffers.drain(..) {
+            if let Backing::Host { buffer, offset } = buffer.backing {
+                self.retired.retire(
+                    &mut self.mmap_manager,
+                    &mut self.allocator,
+                    offset,
+                    buffer,
+                );
+            }
         }
     }
 }
 
-impl<Q, HM, Reader, Writer> VirtioMediaDevice<Reader, Writer> for SimpleCaptureDevice<Q, HM>
+impl<Q, M, HM, A, Reader, Writer> VirtioMediaDevice<Reader, Writer>
+    for SimpleCaptureDevice<Q, M, HM, A>
 where
     Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
     Reader: ReadFromDescriptorChain,
     Writer: WriteToDescriptorChain,
 {
-    type Session = SimpleCaptureDeviceSession;
+    type Session = SimpleCaptureDeviceSession<M::GuestMemoryMapping>;
 
     fn new_session(&mut self, session_id: u32) -> Result<Self::Session, i32> {
         Ok(SimpleCaptureDeviceSession {
             id: session_id,
             iteration: 0,
+            memory: None,
             buffers: Default::default(),
             queued_buffers: Default::default(),
             streaming: false,
         })
     }
 
-    fn close_session(&mut self, session: Self::Session) {
+    fn close_session(&mut self, mut session: Self::Session) {
         if self.active_session == Some(session.id) {
             self.active_session = None;
         }
 
-        for buffer in &session.buffers {
-            self.mmap_manager.unregister_buffer(buffer.offset);
-        }
+        self.free_buffers(&mut session);
     }
 
     fn do_ioctl(
@@ -246,16 +306,18 @@ where
         flags: u32,
         offset: u32,
     ) -> Result<(u64, u64), i32> {
-        let buffer = session
+        let host_buffer = session
             .buffers
-            .iter_mut()
-            .find(|b| b.offset == offset)
+            .iter()
+            .find_map(|b| match &b.backing {
+                Backing::Host { buffer, offset: o } if *o == offset => Some(buffer),
+                _ => None,
+            })
             .ok_or(libc::EINVAL)?;
         let rw = (flags & VIRTIO_MEDIA_MMAP_FLAG_RW) != 0;
-        let fd = buffer.fd.as_file().as_fd();
         let (guest_addr, size) = self
             .mmap_manager
-            .create_mapping(offset, fd, rw)
+            .create_mapping(offset, host_buffer, rw)
             .map_err(|_| libc::EINVAL)?;
 
         // TODO: would be nice to enable this, but how do we find the buffer again during munmap?
@@ -267,10 +329,18 @@ where
     }
 
     fn do_munmap(&mut self, guest_addr: u64) -> Result<(), i32> {
-        self.mmap_manager
+        let res = self
+            .mmap_manager
             .remove_mapping(guest_addr)
             .map(|_| ())
-            .map_err(|_| libc::EINVAL)
+            .map_err(|_| libc::EINVAL);
+        self.retired.reap(&self.mmap_manager, &mut self.allocator);
+        res
+    }
+
+    /// Nothing is asynchronous in this device: frames are produced inside `QBUF`/`STREAMON`.
+    fn process_events(&mut self, _session: &mut Self::Session) -> Result<(), i32> {
+        Ok(())
     }
 }
 
@@ -315,12 +385,14 @@ fn default_fmt(queue: QueueType) -> v4l2_format {
 }
 
 /// Implementations of the ioctls required by a CAPTURE device.
-impl<Q, HM> VirtioMediaIoctlHandler for SimpleCaptureDevice<Q, HM>
+impl<Q, M, HM, A> VirtioMediaIoctlHandler for SimpleCaptureDevice<Q, M, HM, A>
 where
     Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
+    A: VirtioMediaBufferAllocator,
 {
-    type Session = SimpleCaptureDeviceSession;
+    type Session = SimpleCaptureDeviceSession<M::GuestMemoryMapping>;
 
     fn enum_fmt(
         &mut self,
@@ -382,7 +454,7 @@ where
         if queue != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }
-        if memory != MemoryType::Mmap {
+        if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
         }
         if session.streaming {
@@ -400,65 +472,89 @@ where
             self.active_session = None;
             self.streamoff(session, queue)?;
         } else {
-            // TODO factorize with streamoff.
-            session.queued_buffers.clear();
-            for buffer in session.buffers.iter_mut() {
-                buffer.set_state(BufferState::New);
-            }
             self.active_session = Some(session.id);
         }
 
         let count = std::cmp::min(count, 32);
 
-        for buffer in &session.buffers {
-            self.mmap_manager.unregister_buffer(buffer.offset);
-        }
+        // Every mapping the guest holds on the old buffers is released (or parked until the
+        // guest unmaps) before we answer, so a stale mapping never sees a new buffer.
+        self.free_buffers(session);
+        session.memory = if count > 0 { Some(memory) } else { None };
 
-        session.buffers = (0..count)
-            .map(|i| {
-                MemFdBuffer::new(BUFFER_SIZE as u64)
-                    .map_err(|e| {
-                        log::error!("failed to allocate MMAP buffers: {:#}", e);
-                        libc::ENOMEM
-                    })
-                    .and_then(|fd| {
-                        let offset = self
-                            .mmap_manager
-                            .register_buffer(None, BUFFER_SIZE)
-                            .map_err(|_| libc::EINVAL)?;
-
-                        let mut v4l2_buffer =
-                            V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::Mmap);
-                        if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
-                            v4l2_buffer.planes_with_backing_iter_mut()
-                        {
-                            // SAFETY: every buffer has at least one plane.
-                            let mut plane = planes.next().unwrap();
-                            plane.set_mem_offset(offset);
-                            *plane.length = BUFFER_SIZE;
-                        } else {
-                            // SAFETY: we have just set the buffer type to MMAP. Reaching this point means a bug in
-                            // the code.
-                            panic!()
+        let mut buffers: Vec<Buffer<M::GuestMemoryMapping>> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let buffer = match memory {
+                MemoryType::Mmap => {
+                    let host_buffer = self.allocator.allocate(BUFFER_SIZE as u64)?;
+                    let offset = match self.mmap_manager.register_buffer(None, BUFFER_SIZE) {
+                        Ok(offset) => offset,
+                        Err(e) => {
+                            log::error!("failed to register MMAP buffer: {:#}", e);
+                            self.allocator.release(host_buffer);
+                            for buffer in buffers {
+                                if let Backing::Host { buffer, offset } = buffer.backing {
+                                    self.mmap_manager.unregister_buffer(offset);
+                                    self.allocator.release(buffer);
+                                }
+                            }
+                            return Err(libc::EINVAL);
                         }
-                        v4l2_buffer.set_field(BufferField::None);
-                        v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
+                    };
 
-                        Ok(Buffer {
-                            state: BufferState::New,
-                            v4l2_buffer,
-                            fd,
+                    let mut v4l2_buffer =
+                        V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::Mmap);
+                    if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
+                        v4l2_buffer.planes_with_backing_iter_mut()
+                    {
+                        // SAFETY: every buffer has at least one plane.
+                        let mut plane = planes.next().unwrap();
+                        plane.set_mem_offset(offset);
+                        *plane.length = BUFFER_SIZE;
+                    } else {
+                        // SAFETY: we have just set the buffer type to MMAP. Reaching this point means a bug in
+                        // the code.
+                        panic!()
+                    }
+                    v4l2_buffer.set_field(BufferField::None);
+                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
+
+                    Buffer {
+                        state: BufferState::New,
+                        v4l2_buffer,
+                        backing: Backing::Host {
+                            buffer: host_buffer,
                             offset,
-                        })
-                    })
-            })
-            .collect::<Result<_, _>>()?;
+                        },
+                    }
+                }
+                MemoryType::UserPtr => {
+                    // The guest brings the memory at QBUF time; until then the buffer is only
+                    // a slot.
+                    let mut v4l2_buffer =
+                        V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::UserPtr);
+                    *v4l2_buffer.get_first_plane_mut().length = BUFFER_SIZE;
+                    v4l2_buffer.set_field(BufferField::None);
+                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
+
+                    Buffer {
+                        state: BufferState::New,
+                        v4l2_buffer,
+                        backing: Backing::Guest(None),
+                    }
+                }
+                _ => unreachable!("memory type checked above"),
+            };
+            buffers.push(buffer);
+        }
+        session.buffers = buffers;
 
         Ok(v4l2_requestbuffers {
             count,
             type_: queue as u32,
             memory: memory as u32,
             capabilities: (BufferCapabilities::SUPPORTS_MMAP
+                | BufferCapabilities::SUPPORTS_USERPTR
                 | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
                 .bits(),
             ..Default::default()
@@ -483,15 +579,43 @@ where
         &mut self,
         session: &mut Self::Session,
         buffer: v4l2r::ioctl::V4l2Buffer,
-        _guest_regions: Vec<Vec<SgEntry>>,
+        guest_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<v4l2r::ioctl::V4l2Buffer> {
+        if buffer.queue() != QueueType::VideoCapture {
+            return Err(libc::EINVAL);
+        }
         let host_buffer = session
             .buffers
             .get_mut(buffer.index() as usize)
             .ok_or(libc::EINVAL)?;
+        // The memory type is fixed by REQBUFS.
+        if Some(buffer.memory()) != session.memory {
+            return Err(libc::EINVAL);
+        }
         // Attempt to queue already queued buffer.
         if matches!(host_buffer.state, BufferState::Incoming) {
             return Err(libc::EINVAL);
+        }
+
+        if let Backing::Guest(slot) = &mut host_buffer.backing {
+            // A guest-owned buffer: the guest's pages must hold a whole frame.
+            let length = *buffer.get_first_plane().length;
+            let sgs = guest_regions.into_iter().next().ok_or(libc::EINVAL)?;
+            let covered: u64 = sgs.iter().map(|sg| sg.len as u64).sum();
+            if length < BUFFER_SIZE || covered < BUFFER_SIZE as u64 {
+                return Err(libc::EINVAL);
+            }
+            let mapping = self.mem.new_mapping(sgs).map_err(|e| {
+                log::error!("failed to map USERPTR buffer: {:#}", e);
+                guest_mapping_errno(&e)
+            })?;
+            *slot = Some(mapping);
+            // Keep the guest's view of the buffer (its userptr and length): it is what must be
+            // echoed back in the dequeue event.
+            let mut v4l2_buffer = buffer.clone();
+            v4l2_buffer.set_field(BufferField::None);
+            v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
+            host_buffer.v4l2_buffer = v4l2_buffer;
         }
 
         host_buffer.set_state(BufferState::Incoming);
@@ -524,6 +648,9 @@ where
         session.streaming = false;
         session.queued_buffers.clear();
         for buffer in session.buffers.iter_mut() {
+            // Guest mappings go before we answer: the guest gives the pages back once it
+            // hears from us.
+            buffer.drop_guest_mapping();
             buffer.set_state(BufferState::New);
         }
 
@@ -550,6 +677,34 @@ where
         match INPUTS.get(index as usize) {
             Some(&input) => Ok(input),
             None => Err(libc::EINVAL),
+        }
+    }
+
+    /// This device never emits `EOS` or `SOURCE_CHANGE`, but subscribing to them is harmless,
+    /// and a guest that asks (v4l2-compliance, GStreamer) must not be refused for it.
+    fn subscribe_event(
+        &mut self,
+        _session: &mut Self::Session,
+        event: EventType,
+        _flags: SubscribeEventFlags,
+    ) -> IoctlResult<()> {
+        match event {
+            EventType::Eos | EventType::SourceChange(0) => Ok(()),
+            _ => Err(libc::EINVAL),
+        }
+    }
+
+    fn unsubscribe_event(
+        &mut self,
+        _session: &mut Self::Session,
+        event: v4l2_event_subscription,
+    ) -> IoctlResult<()> {
+        if event.type_ == bindings::V4L2_EVENT_ALL {
+            return Ok(());
+        }
+        match EventType::try_from(&event) {
+            Ok(EventType::Eos) | Ok(EventType::SourceChange(0)) => Ok(()),
+            _ => Err(libc::EINVAL),
         }
     }
 }

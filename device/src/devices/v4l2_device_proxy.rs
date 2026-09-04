@@ -91,7 +91,9 @@ use crate::protocol::SgEntry;
 use crate::protocol::V4l2Event;
 use crate::protocol::V4l2Ioctl;
 use crate::protocol::VIRTIO_MEDIA_MMAP_FLAG_RW;
+use crate::guest_mapping_errno;
 use crate::GuestMemoryRange;
+use crate::HostBuffer;
 use crate::ReadFromDescriptorChain;
 use crate::VirtioMediaDevice;
 use crate::VirtioMediaDeviceSession;
@@ -729,7 +731,7 @@ where
 
         let (host_buffer, guest_resources) =
             guest_v4l2_buffer_to_host(&guest_buffer, guest_regions, &self.mem)
-                .map_err(|_| libc::EINVAL)?;
+                .map_err(|e| guest_mapping_errno(&e))?;
         session.register_userptr_addresses(&host_buffer, &guest_buffer, guest_resources);
         let queue = host_buffer.queue();
         let out_buffer = v4l2r::ioctl::qbuf(&session.device, host_buffer)
@@ -1118,7 +1120,7 @@ where
     ) -> IoctlResult<V4l2Buffer> {
         let (host_buffer, guest_resources) =
             guest_v4l2_buffer_to_host(&guest_buffer, guest_regions, &self.mem)
-                .map_err(|_| libc::EINVAL)?;
+                .map_err(|e| guest_mapping_errno(&e))?;
         session.register_userptr_addresses(&host_buffer, &guest_buffer, guest_resources);
         v4l2r::ioctl::prepare_buf(&session.device, host_buffer)
             .map_err(|e| e.into_errno())
@@ -1256,9 +1258,19 @@ where
         )
         .map_err(|e| e.into_errno())?;
 
+        // The host mapper wants a `HostBuffer`, i.e. a descriptor plus a host mapping of it.
+        // The mapping is transient: it lives for this call only, the VMM keeps its own dup of
+        // the descriptor for the guest mapping, and the buffer's memory belongs to the host
+        // V4L2 device, not to any allocator (so nothing is `release`d).
+        let size = self.mmap_manager.buffer_size(offset).ok_or(libc::EINVAL)?;
+        let host_buffer = HostBuffer::map_fd(exported_fd, 0, size as u64, rw).map_err(|e| {
+            error!("failed to map exported buffer at offset {:#x}: errno {}", offset, e);
+            e
+        })?;
+
         let (mapping_addr, mapping_size) = self
             .mmap_manager
-            .create_mapping(offset, exported_fd.as_fd(), rw)
+            .create_mapping(offset, &host_buffer, rw)
             // TODO: better error mapping?
             .map_err(|_| libc::EINVAL)?;
 

@@ -1,9 +1,11 @@
 // Copyright 2024 The ChromiumOS Authors
 
-use std::os::fd::BorrowedFd;
+use std::collections::HashMap;
 
 use thiserror::Error;
 
+use crate::HostBuffer;
+use crate::VirtioMediaBufferAllocator;
 use crate::VirtioMediaHostMemoryMapper;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +60,10 @@ pub struct MmapMappingManager<M: VirtioMediaHostMemoryMapper> {
     /// Buffers that are unregistered but still mapped are still kept here, but do not take space
     /// in the MMAP range (i.e. they are skipped during the binary search).
     buffers: Vec<MmapBuffer>,
+    /// Guest address of every live mapping, back to the offset of the buffer it maps, so that
+    /// `MUNMAP` (which only carries the guest address) finds its buffer without walking
+    /// `buffers`. Kept in step with `MmapBuffer::mapping`.
+    mapped: HashMap<u64, u32>,
     /// Memory mapper used to create buffer mappings.
     mapper: M,
 }
@@ -66,6 +72,7 @@ impl<M: VirtioMediaHostMemoryMapper> From<M> for MmapMappingManager<M> {
     fn from(mapper: M) -> Self {
         Self {
             buffers: Vec::new(),
+            mapped: HashMap::new(),
             mapper,
         }
     }
@@ -187,9 +194,19 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
         }
     }
 
-    /// Create a new mapping for the buffer registered at `offset`. `rw` indicates whether the
-    /// mapping is read-only or read-write. Returns the guest address at which the buffer is
-    /// mapped, and the size of the mapping, which should be equal to the size of the buffer.
+    /// Size of the buffer registered at `offset`, if there is one (registered or not yet
+    /// garbage-collected).
+    pub fn buffer_size(&self, offset: u32) -> Option<u32> {
+        self.buffers
+            .binary_search_by_key(&offset, |b| b.offset)
+            .ok()
+            .map(|i| self.buffers[i].size)
+    }
+
+    /// Create a new mapping for the buffer registered at `offset`, backed by `buffer`. `rw`
+    /// indicates whether the mapping is read-only or read-write. Returns the guest address at
+    /// which the buffer is mapped, and the size of the mapping, which should be equal to the size
+    /// of the buffer.
     ///
     /// This method can be called several times and will reuse the prior mapping if it exists. The
     /// mapping will also persist until an identical number of calls to [`Self::remove_mapping`]
@@ -200,51 +217,47 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
     pub fn create_mapping(
         &mut self,
         offset: u32,
-        fd: BorrowedFd,
+        buffer: &HostBuffer,
         rw: bool,
     ) -> Result<(u64, u64), CreateMappingError> {
-        let buffer = self
+        let entry = self
             .buffers
             .binary_search_by_key(&offset, |b| b.offset)
             .map(|i| &mut self.buffers[i])
             .map_err(|_| CreateMappingError::InvalidOffset)?;
-        let last_buffer_address = buffer
+        let last_buffer_address = entry
             .offset
-            .checked_add(buffer.size - 1)
+            .checked_add(entry.size - 1)
             .ok_or(CreateMappingError::InvalidOffset)?;
 
         // Cannot create additional mappings for buffers that have been destroyed on the guest side.
-        if !buffer.registered {
+        if !entry.registered {
             return Err(CreateMappingError::UnregisteredBuffer);
         }
 
         // Check that we are not requiring more mapping than the buffer can cover.
-        if last_buffer_address > buffer.offset + (buffer.size - 1) {
+        if last_buffer_address > entry.offset + (entry.size - 1) {
+            return Err(CreateMappingError::SizeOutOfBounds);
+        }
+        // The host buffer must cover the range the guest was told the buffer has.
+        if buffer.len < entry.size as u64 {
             return Err(CreateMappingError::SizeOutOfBounds);
         }
 
-        let guest_addr = match &mut buffer.mapping {
+        let guest_addr = match &mut entry.mapping {
             None => {
                 let guest_addr = self
                     .mapper
-                    .add_mapping(
-                        fd,
-                        // Always map the full buffer so we can reuse the mapping even with different
-                        // sizes.
-                        buffer.size as u64,
-                        buffer.offset as u64,
-                        rw,
-                    )
+                    .add_mapping(buffer, entry.offset as u64, rw)
                     .map_err(CreateMappingError::MappingFailure)?;
 
-                buffer.mapping = Some(MmapBufferMapping {
+                entry.mapping = Some(MmapBufferMapping {
                     num_mappings: 1,
                     rw,
                     guest_addr,
                 });
+                self.mapped.insert(guest_addr, entry.offset);
 
-                // TODO: need to be able to lookup the buffer back by guest address - add a
-                // guest_addr -> offset table?
                 guest_addr
             }
             Some(mapping) => {
@@ -256,36 +269,43 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
             }
         };
 
-        Ok((guest_addr, buffer.size as u64))
+        Ok((guest_addr, entry.size as u64))
     }
 
     /// Returns `true` if the buffer still has other mappings, `false` if this was the last mapping.
     pub fn remove_mapping(&mut self, guest_addr: u64) -> Result<bool, RemoveMappingError> {
-        // TODO: use a guest_addr -> offset table to avoid O(n) here?
-        for (i, buffer) in self.buffers.iter_mut().enumerate() {
-            match &mut buffer.mapping {
-                Some(mapping) if mapping.guest_addr == guest_addr => {
-                    mapping.num_mappings -= 1;
-                    if mapping.num_mappings == 0 {
-                        if let Err(e) = self.mapper.remove_mapping(guest_addr) {
-                            log::error!("error while unmapping MMAP buffer: {:#}", e);
-                        }
-                        buffer.mapping = None;
-                        // If this was the last dangling mapping then the buffer can be removed
-                        // from the MMAP range.
-                        if !buffer.registered {
-                            self.buffers.remove(i);
-                        }
-                        return Ok(false);
-                    } else {
-                        return Ok(true);
-                    }
-                }
-                _ => (),
-            }
+        let offset = *self
+            .mapped
+            .get(&guest_addr)
+            .ok_or(RemoveMappingError::InvalidOffset)?;
+        // Unregistered-but-mapped buffers stay in the sorted vector until their last mapping
+        // goes, so a mapped offset is always found here.
+        let i = self
+            .buffers
+            .binary_search_by_key(&offset, |b| b.offset)
+            .map_err(|_| RemoveMappingError::InvalidOffset)?;
+        let buffer = &mut self.buffers[i];
+        let mapping = buffer
+            .mapping
+            .as_mut()
+            .ok_or(RemoveMappingError::InvalidOffset)?;
+
+        mapping.num_mappings -= 1;
+        if mapping.num_mappings > 0 {
+            return Ok(true);
         }
 
-        Err(RemoveMappingError::InvalidOffset)
+        if let Err(e) = self.mapper.remove_mapping(guest_addr) {
+            log::error!("error while unmapping MMAP buffer: {:#}", e);
+        }
+        buffer.mapping = None;
+        self.mapped.remove(&guest_addr);
+        // If this was the last dangling mapping then the buffer can be removed from the MMAP
+        // range.
+        if !buffer.registered {
+            self.buffers.remove(i);
+        }
+        Ok(false)
     }
     /// Returns `true` if the buffer registered at `offset` is already mapped.
     pub fn is_mapped(&self, offset: u64) -> bool {
@@ -299,19 +319,90 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
         }
     }
 
+    /// The mapper this manager was constructed from.
+    pub fn mapper_mut(&mut self) -> &mut M {
+        &mut self.mapper
+    }
+
     /// Consume the mapping manager and return the mapper it has been constructed from.
     pub fn into_mapper(self) -> M {
         self.mapper
     }
 }
 
+/// Host buffers a device is done with but must not hand back to their allocator yet.
+///
+/// A guest may still have a buffer mapped when the device frees it (`REQBUFS(0)` with a mapping
+/// outstanding, a session closed with `mmap`s alive). The allocator is free to hand the same
+/// backing out again the moment it gets the buffer back, and for a pool-backed buffer that means
+/// the guest's stale mapping would look straight into someone else's fresh frame. So the release
+/// waits until [`MmapMappingManager`] reports the buffer's last guest mapping gone -- the same
+/// point at which the manager itself forgets the offset (`VPU_DESIGN.md` §2.5).
+///
+/// Usage: `retire` instead of `allocator.release` when freeing, and `reap` after every
+/// `remove_mapping`.
+#[derive(Default)]
+pub struct RetiredBuffers {
+    pending: Vec<(u32, HostBuffer)>,
+}
+
+impl RetiredBuffers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Unregisters the buffer at `offset` and releases `buffer` to `allocator` now if the guest
+    /// has no mapping of it, or later, from `reap`, once it has none.
+    pub fn retire<M, A>(
+        &mut self,
+        manager: &mut MmapMappingManager<M>,
+        allocator: &mut A,
+        offset: u32,
+        buffer: HostBuffer,
+    ) where
+        M: VirtioMediaHostMemoryMapper,
+        A: VirtioMediaBufferAllocator,
+    {
+        manager.unregister_buffer(offset);
+        if manager.is_mapped(offset as u64) {
+            self.pending.push((offset, buffer));
+        } else {
+            allocator.release(buffer);
+        }
+    }
+
+    /// Releases every retired buffer whose guest mappings are all gone.
+    pub fn reap<M, A>(&mut self, manager: &MmapMappingManager<M>, allocator: &mut A)
+    where
+        M: VirtioMediaHostMemoryMapper,
+        A: VirtioMediaBufferAllocator,
+    {
+        let mut i = 0;
+        while i < self.pending.len() {
+            if manager.is_mapped(self.pending[i].0 as u64) {
+                i += 1;
+            } else {
+                let (_, buffer) = self.pending.swap_remove(i);
+                allocator.release(buffer);
+            }
+        }
+    }
+
+    /// Number of buffers waiting for the guest to unmap them.
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::os::fd::AsFd;
-    use std::os::fd::BorrowedFd;
-    use std::os::fd::FromRawFd;
-
+    use crate::HostBuffer;
+    use crate::MemFdAllocator;
+    use crate::VirtioMediaBufferAllocator;
     use crate::VirtioMediaHostMemoryMapper;
 
     use super::CreateMappingError;
@@ -320,22 +411,51 @@ mod tests {
     use super::MmapMappingManager;
     use super::RegisterBufferError;
     use super::RemoveMappingError;
+    use super::RetiredBuffers;
 
     struct DummyHostMemoryMapper;
 
     impl VirtioMediaHostMemoryMapper for DummyHostMemoryMapper {
-        fn add_mapping(
-            &mut self,
-            _buffer: BorrowedFd,
-            _length: u64,
-            offset: u64,
-            _rw: bool,
-        ) -> Result<u64, i32> {
+        fn add_mapping(&mut self, _buffer: &HostBuffer, offset: u64, _rw: bool) -> Result<u64, i32> {
             Ok(offset | 0x8000_0000)
         }
 
         fn remove_mapping(&mut self, _guest_addr: u64) -> Result<(), i32> {
             Ok(())
+        }
+    }
+
+    /// A mapper for pool-style buffers: the answer is the buffer's own pool offset, as crosvm's
+    /// pool backing does it.
+    struct PoolStyleMapper;
+
+    impl VirtioMediaHostMemoryMapper for PoolStyleMapper {
+        fn add_mapping(&mut self, buffer: &HostBuffer, _offset: u64, _rw: bool) -> Result<u64, i32> {
+            buffer.pool_offset.ok_or(libc::EINVAL)
+        }
+
+        fn remove_mapping(&mut self, _guest_addr: u64) -> Result<(), i32> {
+            Ok(())
+        }
+    }
+
+    fn host_buffer(size: u64) -> HostBuffer {
+        MemFdAllocator::new().allocate(size).unwrap()
+    }
+
+    /// An allocator that only counts what comes back, for the retirement tests.
+    #[derive(Default)]
+    struct CountingAllocator {
+        released: usize,
+    }
+
+    impl VirtioMediaBufferAllocator for CountingAllocator {
+        fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
+            MemFdAllocator::new().allocate(len)
+        }
+
+        fn release(&mut self, _buf: HostBuffer) {
+            self.released += 1;
         }
     }
 
@@ -615,14 +735,23 @@ mod tests {
             ]
         );
 
-        let file = unsafe { File::from_raw_fd(0) };
+        let buffer = host_buffer(0x5000);
+
+        // A host buffer smaller than what the guest was told is refused.
+        let short = host_buffer(0x4000);
+        assert_eq!(
+            mm.create_mapping(0x1000, &short, false),
+            Err(CreateMappingError::SizeOutOfBounds)
+        );
 
         // Single mapping
         assert_eq!(
-            mm.create_mapping(0x1000, file.as_fd(), false),
+            mm.create_mapping(0x1000, &buffer, false),
             Ok((0x8000_1000, 0x5000))
         );
+        assert!(mm.is_mapped(0x1000));
         assert_eq!(mm.remove_mapping(0x8000_1000), Ok(false));
+        assert!(!mm.is_mapped(0x1000));
         assert_eq!(
             mm.remove_mapping(0x8000_1000),
             Err(RemoveMappingError::InvalidOffset)
@@ -630,11 +759,11 @@ mod tests {
 
         // Multiple mappings
         assert_eq!(
-            mm.create_mapping(0x1000, file.as_fd(), false),
+            mm.create_mapping(0x1000, &buffer, false),
             Ok((0x8000_1000, 0x5000))
         );
         assert_eq!(
-            mm.create_mapping(0x1000, file.as_fd(), false),
+            mm.create_mapping(0x1000, &buffer, false),
             Ok((0x8000_1000, 0x5000))
         );
         assert_eq!(mm.remove_mapping(0x8000_1000), Ok(true));
@@ -646,24 +775,24 @@ mod tests {
 
         // Mapping at non-existing offset
         assert_eq!(
-            mm.create_mapping(0x2000, file.as_fd(), false),
+            mm.create_mapping(0x2000, &buffer, false),
             Err(CreateMappingError::InvalidOffset)
         );
 
         // Requesting same mapping with different access
         assert_eq!(
-            mm.create_mapping(0x1000, file.as_fd(), false),
+            mm.create_mapping(0x1000, &buffer, false),
             Ok((0x8000_1000, 0x5000))
         );
         assert_eq!(
-            mm.create_mapping(0x1000, file.as_fd(), true),
+            mm.create_mapping(0x1000, &buffer, true),
             Err(CreateMappingError::NonMatchingPermissions)
         );
         assert_eq!(mm.remove_mapping(0x8000_1000), Ok(false));
 
         // Mappings must survive a buffer's deregistration
         assert_eq!(
-            mm.create_mapping(0x1000, file.as_fd(), false),
+            mm.create_mapping(0x1000, &buffer, false),
             Ok((0x8000_1000, 0x5000))
         );
         assert!(mm.unregister_buffer(0x1000));
@@ -685,6 +814,92 @@ mod tests {
         );
         // ... but un-registered buffers are removed alongside their last mapping.
         assert_eq!(mm.remove_mapping(0x8000_1000), Ok(false));
-        assert_eq!(mm.buffers, vec![MmapBuffer::new(0x0, 0x1000),])
+        assert_eq!(mm.buffers, vec![MmapBuffer::new(0x0, 0x1000),]);
+        assert!(mm.mapped.is_empty());
+    }
+
+    /// Two buffers mapped at once: `MUNMAP` must find each by its own guest address, and the
+    /// table must not confuse them.
+    #[test]
+    fn mmap_manager_addr_table() {
+        let mut mm = MmapMappingManager::from(DummyHostMemoryMapper);
+        let a = host_buffer(0x1000);
+        let b = host_buffer(0x1000);
+        assert_eq!(mm.register_buffer(None, 0x1000), Ok(0x0));
+        assert_eq!(mm.register_buffer(None, 0x1000), Ok(0x1000));
+        assert_eq!(mm.buffer_size(0x1000), Some(0x1000));
+        assert_eq!(mm.buffer_size(0x2000), None);
+
+        assert_eq!(mm.create_mapping(0x0, &a, true), Ok((0x8000_0000, 0x1000)));
+        assert_eq!(mm.create_mapping(0x1000, &b, true), Ok((0x8000_1000, 0x1000)));
+        assert_eq!(mm.mapped.len(), 2);
+
+        // Removing the second leaves the first intact.
+        assert_eq!(mm.remove_mapping(0x8000_1000), Ok(false));
+        assert!(mm.is_mapped(0x0));
+        assert!(!mm.is_mapped(0x1000));
+        assert_eq!(
+            mm.remove_mapping(0x8000_1000),
+            Err(RemoveMappingError::InvalidOffset)
+        );
+        assert_eq!(mm.remove_mapping(0x8000_0000), Ok(false));
+        assert!(mm.mapped.is_empty());
+    }
+
+    /// A pool-style mapper answers with the buffer's pool offset rather than a fresh address.
+    #[test]
+    fn mmap_manager_pool_offsets() {
+        let mut mm = MmapMappingManager::from(PoolStyleMapper);
+        let mut buffer = host_buffer(0x2000);
+        buffer.pool_offset = Some(0x40_0000);
+        assert_eq!(mm.register_buffer(None, 0x2000), Ok(0x0));
+        assert_eq!(mm.create_mapping(0x0, &buffer, true), Ok((0x40_0000, 0x2000)));
+        assert_eq!(mm.remove_mapping(0x40_0000), Ok(false));
+
+        // A buffer that is not in a pool cannot be mapped by a pool-only mapper.
+        let plain = host_buffer(0x2000);
+        assert_eq!(mm.register_buffer(None, 0x2000), Ok(0x1000));
+        assert_eq!(
+            mm.create_mapping(0x1000, &plain, true),
+            Err(CreateMappingError::MappingFailure(libc::EINVAL))
+        );
+    }
+
+    /// The allocator gets a retired buffer back only once the guest has unmapped it.
+    #[test]
+    fn retired_buffers_wait_for_the_last_munmap() {
+        let mut mm = MmapMappingManager::from(DummyHostMemoryMapper);
+        let mut allocator = CountingAllocator::default();
+        let mut retired = RetiredBuffers::new();
+
+        let mapped = allocator.allocate(0x1000).unwrap();
+        let unmapped = allocator.allocate(0x1000).unwrap();
+        assert_eq!(mm.register_buffer(None, 0x1000), Ok(0x0));
+        assert_eq!(mm.register_buffer(None, 0x1000), Ok(0x1000));
+        assert_eq!(mm.create_mapping(0x0, &mapped, true), Ok((0x8000_0000, 0x1000)));
+        assert_eq!(mm.create_mapping(0x0, &mapped, true), Ok((0x8000_0000, 0x1000)));
+
+        // Never mapped: released on the spot.
+        retired.retire(&mut mm, &mut allocator, 0x1000, unmapped);
+        assert_eq!(allocator.released, 1);
+        assert!(retired.is_empty());
+
+        // Mapped twice: held through both munmaps.
+        retired.retire(&mut mm, &mut allocator, 0x0, mapped);
+        assert_eq!(allocator.released, 1);
+        assert_eq!(retired.len(), 1);
+        retired.reap(&mm, &mut allocator);
+        assert_eq!(allocator.released, 1);
+
+        assert_eq!(mm.remove_mapping(0x8000_0000), Ok(true));
+        retired.reap(&mm, &mut allocator);
+        assert_eq!(allocator.released, 1);
+
+        assert_eq!(mm.remove_mapping(0x8000_0000), Ok(false));
+        retired.reap(&mm, &mut allocator);
+        assert_eq!(allocator.released, 2);
+        assert!(retired.is_empty());
+        // The offset is free again only now.
+        assert_eq!(mm.register_buffer(None, 0x1000), Ok(0x0));
     }
 }

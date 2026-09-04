@@ -20,8 +20,11 @@
 //!   events to the guest.
 //! * The guest memory must be made accessible through an implementation of
 //!   `VirtioMediaGuestMemoryMapper`.
-//! * Optionally, .... can be implemented if the host supports mapping MMAP buffers into the guest
-//!   address space.
+//! * Host-owned (`MMAP`) buffers come from an implementation of `VirtioMediaBufferAllocator`,
+//!   and are made visible to the guest through an implementation of
+//!   `VirtioMediaHostMemoryMapper`. The crate ships `MemFdAllocator`, one sealed memfd per
+//!   buffer, as the default allocator; a VMM that serves buffers out of a pre-shared pool
+//!   provides its own and hands out `HostBuffer`s with `pool_offset` set.
 //!
 //! These traits allow any device that implements `VirtioMediaDevice` to run on any VMM that
 //! implements them.
@@ -44,6 +47,8 @@
 //!
 //! * A device that proxies any host V4L2 device into the guest, in the `crate::v4l2_device_proxy`
 //!   module.
+//! * A pattern-generating capture device (`simple_device`) and a memory-to-memory loopback device
+//!   (`loopback_device`) for exercising a guest without hardware.
 
 pub mod devices;
 pub mod io;
@@ -55,15 +60,21 @@ pub mod protocol;
 
 use io::ReadFromDescriptorChain;
 use io::WriteToDescriptorChain;
+pub use memfd::MemFdAllocator;
 use poll::SessionPoller;
 pub use v4l2r;
 
 use std::collections::HashMap;
 use std::io::Result as IoResult;
+use std::num::NonZeroUsize;
+use std::os::fd::AsFd;
 use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
+use std::ptr::NonNull;
 
 use anyhow::Context;
 use log::error;
+use nix::sys::mman;
 
 use protocol::*;
 
@@ -100,7 +111,206 @@ pub trait VirtioMediaGuestMemoryMapper {
 
     /// Maps `sgs`, which contains a list of guest-physical SG entries into a linear mapping on the
     /// host.
+    ///
+    /// Implementations that want the guest to see a specific error code (e.g. `EFAULT` for
+    /// memory the host is not allowed to touch) wrap a [`GuestMappingError`] in the returned
+    /// error; devices recover it with [`guest_mapping_errno`]. Any other error is reported as
+    /// `EINVAL`.
     fn new_mapping(&self, sgs: Vec<SgEntry>) -> anyhow::Result<Self::GuestMemoryMapping>;
+}
+
+/// Error a [`VirtioMediaGuestMemoryMapper`] can return to name the errno the guest should get.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestMappingError(pub i32);
+
+impl std::fmt::Display for GuestMappingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "guest memory mapping failed with errno {}", self.0)
+    }
+}
+
+impl std::error::Error for GuestMappingError {}
+
+/// The errno a failed [`VirtioMediaGuestMemoryMapper::new_mapping`] call asked for, or `EINVAL`
+/// when it did not say.
+pub fn guest_mapping_errno(e: &anyhow::Error) -> i32 {
+    e.downcast_ref::<GuestMappingError>()
+        .map(|e| e.0)
+        .unwrap_or(libc::EINVAL)
+}
+
+/// Whether a [`HostBuffer`] made its own host mapping, and so must undo it, or was handed a window
+/// into a mapping someone else keeps alive.
+enum HostBufferMapping {
+    /// `ptr` points into a mapping owned by the allocator (a pool). Nothing to undo.
+    Borrowed,
+    /// `ptr` is a mapping of `len` bytes this buffer created; unmapped when it is dropped.
+    Owned,
+}
+
+/// A host-owned buffer that the guest can be given `MMAP` access to.
+///
+/// Every field a VMM needs in order to expose the buffer to the guest is here: the backing object
+/// (`fd`, always a dup the buffer owns), the byte range of it the buffer occupies (`fd_offset`,
+/// `len`), a host mapping of exactly that range (`ptr`), and, when the buffer is a slice of a
+/// pre-shared pool the guest already maps as a whole, its offset inside that pool
+/// (`pool_offset`). A `pool_offset` of `Some` tells [`VirtioMediaHostMemoryMapper::add_mapping`]
+/// that no new guest mapping is needed: the offset itself is the answer.
+///
+/// # Ownership contract
+///
+/// Buffers come from a [`VirtioMediaBufferAllocator`] and **must be handed back to the same
+/// allocator's `release()`** once the device is done with them. Dropping one without doing so is
+/// memory-safe but leaks its backing: a pool slice stays allocated in the pool for the life of the
+/// allocator, and a memfd's pages stay until the last dup of its descriptor is closed. Dropping
+/// only ever tears down what the buffer itself created (its own mapping, its own descriptor); it
+/// never touches memory another party -- the guest, the allocator -- may still be mapping.
+pub struct HostBuffer {
+    /// The backing object. A dup owned by this buffer.
+    pub fd: OwnedFd,
+    /// Byte offset of the buffer's first byte inside `fd`. Zero for a per-buffer memfd; the
+    /// pool's own offset plus `pool_offset` for a pool slice.
+    pub fd_offset: u64,
+    /// Length of the buffer in bytes.
+    pub len: u64,
+    /// Host mapping of the `len` bytes at `fd_offset`. Valid for as long as the buffer exists.
+    pub ptr: NonNull<u8>,
+    /// Offset of the buffer inside the pool the guest maps as a whole, if it lives in one.
+    pub pool_offset: Option<u64>,
+    mapping: HostBufferMapping,
+}
+
+// SAFETY: `ptr` is a plain pointer into a shared file mapping; nothing about it is bound to the
+// thread that created it, and the buffer is only ever accessed through `&self`/`&mut self`.
+unsafe impl Send for HostBuffer {}
+
+impl HostBuffer {
+    /// Wraps a buffer whose host mapping is owned by someone else, typically a pool allocator that
+    /// maps its whole pool once and hands out windows into it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for reads and writes of `len` bytes and must stay valid for as long as
+    /// the returned buffer exists; the caller keeps the underlying mapping alive at least that
+    /// long (a pool allocator outlives every buffer it hands out, which is why `release()` takes
+    /// buffers back before the allocator goes away). `(fd, fd_offset, len)` must describe the same
+    /// bytes `ptr` maps.
+    pub unsafe fn from_raw_parts(
+        fd: OwnedFd,
+        fd_offset: u64,
+        len: u64,
+        ptr: NonNull<u8>,
+        pool_offset: Option<u64>,
+    ) -> Self {
+        Self {
+            fd,
+            fd_offset,
+            len,
+            ptr,
+            pool_offset,
+            mapping: HostBufferMapping::Borrowed,
+        }
+    }
+
+    /// Creates a buffer over `len` bytes at `fd_offset` of `fd` by mapping them into the host,
+    /// read-write when `rw` is set and read-only otherwise. The mapping is undone when the buffer
+    /// is dropped. `pool_offset` is `None`: the guest gets its own mapping of the descriptor.
+    ///
+    /// `fd_offset` must be page-aligned and `len` non-zero. Errors are `libc` error codes.
+    pub fn map_fd(fd: OwnedFd, fd_offset: u64, len: u64, rw: bool) -> Result<Self, i32> {
+        let size = usize::try_from(len)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or(libc::EINVAL)?;
+        let offset = libc::off_t::try_from(fd_offset).map_err(|_| libc::EINVAL)?;
+        let prot = if rw {
+            mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE
+        } else {
+            mman::ProtFlags::PROT_READ
+        };
+
+        // SAFETY: `fd` is a valid descriptor we own; we ask the kernel for a fresh mapping of
+        // it and only hand the pointer out through this buffer's accessors.
+        let ptr = unsafe { mman::mmap(None, size, prot, mman::MapFlags::MAP_SHARED, &fd, offset) }
+            .map_err(|e| e as i32)?;
+
+        Ok(Self {
+            fd,
+            fd_offset,
+            len,
+            ptr: ptr.cast(),
+            pool_offset: None,
+            mapping: HostBufferMapping::Owned,
+        })
+    }
+
+    /// The buffer's descriptor, borrowed.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    /// The buffer's bytes.
+    ///
+    /// The pages may be mapped by the guest at the same time, so their content is untrusted and
+    /// can change underneath; treat what is read as data, never as an invariant.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `ptr` is valid for `len` bytes for the life of `self` (constructor contract),
+        // and the returned borrow cannot outlive `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    /// The buffer's bytes, writable. Same caveat as [`Self::as_slice`], and a buffer created with
+    /// `map_fd(.., rw = false)` must not be written through this.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: as `as_slice`, and `&mut self` makes this the only borrow of the bytes on the
+        // host side.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
+    }
+}
+
+impl Drop for HostBuffer {
+    fn drop(&mut self) {
+        if let HostBufferMapping::Owned = self.mapping {
+            // SAFETY: this mapping was created by `map_fd` with exactly this pointer and length,
+            // and nothing else references it once the buffer is gone.
+            if let Err(e) = unsafe { mman::munmap(self.ptr.cast(), self.len as usize) } {
+                error!("error while unmapping host buffer: {:#}", e);
+            }
+        }
+    }
+}
+
+/// Trait for allocating the host-owned buffers that back `MMAP` V4L2 buffers.
+///
+/// Devices call `allocate` when the guest requests buffers (`VIDIOC_REQBUFS`,
+/// `VIDIOC_CREATE_BUFS`) and `release` when they are done with them, and never free a
+/// [`HostBuffer`] any other way (see its ownership contract).
+pub trait VirtioMediaBufferAllocator {
+    /// Allocates a buffer of `len` bytes. Returns `ENOMEM` when the backing store is exhausted,
+    /// or another `libc` error code.
+    fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32>;
+
+    /// Takes `buf`, which came from this allocator, back.
+    fn release(&mut self, buf: HostBuffer);
+}
+
+/// No-op implementation of `VirtioMediaBufferAllocator`: every allocation fails with `ENOMEM`,
+/// so a device using it cannot serve `MMAP` buffers. For tests and for devices that only ever
+/// use guest memory.
+impl VirtioMediaBufferAllocator for () {
+    fn allocate(&mut self, _len: u64) -> Result<HostBuffer, i32> {
+        Err(libc::ENOMEM)
+    }
+
+    fn release(&mut self, _buf: HostBuffer) {}
 }
 
 /// Trait for mapping host buffers into the guest physical address space.
@@ -112,18 +322,14 @@ pub trait VirtioMediaGuestMemoryMapper {
 /// trait. It will return `ENOTTY` to each `mmap` attempt, effectively disabling the ability to
 /// map `MMAP` buffers into the guest.
 pub trait VirtioMediaHostMemoryMapper {
-    /// Maps `length` bytes of host memory starting at `offset` and backed by `buffer` into the
-    /// guest's shared memory region.
+    /// Makes `buffer` visible to the guest and returns the offset the guest adds to its base to
+    /// reach it: for a buffer with `pool_offset` set, that offset (the guest already maps the
+    /// whole pool); otherwise the offset in the guest shared memory region the VMM mapped the
+    /// buffer's descriptor at.
     ///
-    /// Returns the offset in the guest shared memory region of the start of the mapped memory on
-    /// success, or a `libc` error code in case of failure.
-    fn add_mapping(
-        &mut self,
-        buffer: BorrowedFd,
-        length: u64,
-        offset: u64,
-        rw: bool,
-    ) -> Result<u64, i32>;
+    /// `offset` is the buffer's V4L2 `mem_offset`, useful as a stable tag. `rw` is whether the
+    /// guest asked for a writable mapping. Errors are `libc` error codes.
+    fn add_mapping(&mut self, buffer: &HostBuffer, offset: u64, rw: bool) -> Result<u64, i32>;
 
     /// Removes a guest mapping previously created at shared memory region offset `shm_offset`.
     fn remove_mapping(&mut self, shm_offset: u64) -> Result<(), i32>;
@@ -132,7 +338,7 @@ pub trait VirtioMediaHostMemoryMapper {
 /// No-op implementation of `VirtioMediaHostMemoryMapper`. Can be used for testing purposes or when
 /// it is not needed to map `MMAP` buffers into the guest.
 impl VirtioMediaHostMemoryMapper for () {
-    fn add_mapping(&mut self, _: BorrowedFd, _: u64, _: u64, _: bool) -> Result<u64, i32> {
+    fn add_mapping(&mut self, _: &HostBuffer, _: u64, _: bool) -> Result<u64, i32> {
         Err(libc::ENOTTY)
     }
 

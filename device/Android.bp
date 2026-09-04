@@ -23,6 +23,7 @@ rust_library {
     edition: "2021",
     features: [
         "default",
+        "loopback-device",
         "simple-device",
     ],
     rustlibs: [
@@ -58,6 +59,7 @@ rust_test {
     edition: "2021",
     features: [
         "default",
+        "loopback-device",
         "simple-device",
     ],
     rustlibs: [

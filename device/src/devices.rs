@@ -23,11 +23,21 @@
 //!
 //! [v4l2_device_proxy] proxies any host V4L2 device to the guest, making its functionality
 //! available to the guest with minimal overhead.
+//!
+//! [loopback_device] is a memory-to-memory device that copies every OUTPUT buffer the guest
+//! queues into the next available CAPTURE buffer. It exercises both buffer ownerships at once --
+//! guest-owned `USERPTR` and host-owned `MMAP`, on either queue -- which is what a guest driver
+//! with its own buffer pool needs to be tested against (`VPU_DESIGN.md` §4.2).
 
 #[cfg(feature = "simple-device")]
 pub mod simple_device;
 #[cfg(feature = "simple-device")]
 pub use simple_device::SimpleCaptureDevice;
+
+#[cfg(feature = "loopback-device")]
+pub mod loopback_device;
+#[cfg(feature = "loopback-device")]
+pub use loopback_device::LoopbackDevice;
 
 pub mod v4l2_device_proxy;
 pub use v4l2_device_proxy::V4l2ProxyDevice;

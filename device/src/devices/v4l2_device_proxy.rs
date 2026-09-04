@@ -727,7 +727,14 @@ where
         session: &mut Self::Session,
         guest_buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
     ) -> IoctlResult<V4l2Buffer> {
+        // The payload fields were zeroed to make the buffer representable, so forwarding it to
+        // the host device would queue something the guest did not ask for. The host driver would
+        // have answered `EINVAL` for an unprepared buffer anyway.
+        if !payload_valid {
+            return Err(libc::EINVAL);
+        }
         // Proactively dequeue output buffers we are done with. Errors can be ignored in
         // this context.
         let _ = self.dequeue_output_buffers(session);
@@ -1117,7 +1124,12 @@ where
         session: &mut Self::Session,
         guest_buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
     ) -> IoctlResult<V4l2Buffer> {
+        // `PREPARE_BUF` is where the payload description is checked, never ignored.
+        if !payload_valid {
+            return Err(libc::EINVAL);
+        }
         let (host_buffer, guest_resources) =
             guest_v4l2_buffer_to_host(&guest_buffer, guest_regions, &self.mem)
                 .map_err(|e| guest_mapping_errno(&e))?;

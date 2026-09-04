@@ -626,7 +626,13 @@ where
         session: &mut Self::Session,
         buffer: v4l2r::ioctl::V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
     ) -> IoctlResult<v4l2r::ioctl::V4l2Buffer> {
+        // This device has no `PREPARE_BUF`, so a payload description that does not fit the
+        // buffer is always the guest's mistake.
+        if !payload_valid {
+            return Err(libc::EINVAL);
+        }
         if buffer.queue() != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }

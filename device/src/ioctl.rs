@@ -52,6 +52,7 @@ use v4l2r::ioctl::TunerTransmissionFlags;
 use v4l2r::ioctl::TunerType;
 use v4l2r::ioctl::UncheckedV4l2Buffer;
 use v4l2r::ioctl::V4l2Buffer;
+use v4l2r::ioctl::V4l2BufferFromError;
 use v4l2r::ioctl::V4l2PlanesWithBacking;
 use v4l2r::memory::MemoryType;
 use v4l2r::QueueDirection;
@@ -122,9 +123,24 @@ where
     }
 }
 
+/// A `v4l2_buffer` as the guest sent it, together with the SG lists of its `USERPTR` planes.
+///
+/// `payload_valid` says whether the guest's `bytesused` and `data_offset` describe a payload the
+/// buffer can actually hold. They are the two fields of a queued buffer a guest can make
+/// nonsensical without making the buffer itself unusable, and V4L2 does not treat them the same
+/// way everywhere: `QBUF` **ignores** both once `PREPARE_BUF` has taken the buffer, so only the
+/// device knows whether an inconsistent pair is an error. When it is not, the fields have been
+/// zeroed here so that the rest of the buffer -- index, memory type, plane backing, SG lists --
+/// is still there to be used.
+pub struct GuestV4l2Buffer {
+    pub buffer: V4l2Buffer,
+    pub guest_regions: Vec<Vec<SgEntry>>,
+    pub payload_valid: bool,
+}
+
 /// Implementation to easily read a `v4l2_buffer` of `USERPTR` memory type and its associated
 /// guest-side buffers from a descriptor chain.
-impl FromDescriptorChain for (V4l2Buffer, Vec<Vec<SgEntry>>) {
+impl FromDescriptorChain for GuestV4l2Buffer {
     fn read_from_chain<R: ReadFromDescriptorChain>(reader: &mut R) -> IoResult<Self>
     where
         Self: Sized,
@@ -155,8 +171,30 @@ impl FromDescriptorChain for (V4l2Buffer, Vec<Vec<SgEntry>>) {
             None
         };
 
-        let v4l2_buffer = V4l2Buffer::try_from(UncheckedV4l2Buffer(v4l2_buffer, v4l2_planes))
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        // A `v4l2_buffer` whose `bytesused` overflows its `length`, or whose `data_offset` is not
+        // inside its payload, is refused by `V4l2Buffer`'s invariants -- but it is a legal thing
+        // for a guest to send on a prepared buffer, where V4L2 says both fields are ignored. Zero
+        // them and try again, and let the device decide (`payload_valid` below).
+        let (v4l2_buffer, payload_valid) =
+            match V4l2Buffer::try_from(UncheckedV4l2Buffer(v4l2_buffer, v4l2_planes)) {
+                Ok(buffer) => (buffer, true),
+                Err(V4l2BufferFromError::PlaneSizeOverflow(..))
+                | Err(V4l2BufferFromError::InvalidDataOffset(..)) => {
+                    let mut zeroed = v4l2_buffer;
+                    zeroed.bytesused = 0;
+                    let v4l2_planes = v4l2_planes.map(|mut planes| {
+                        for plane in planes.iter_mut() {
+                            plane.bytesused = 0;
+                            plane.data_offset = 0;
+                        }
+                        planes
+                    });
+                    let buffer = V4l2Buffer::try_from(UncheckedV4l2Buffer(zeroed, v4l2_planes))
+                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+                    (buffer, false)
+                }
+                Err(_) => return Err(std::io::ErrorKind::InvalidData.into()),
+            };
 
         // Read the `MemRegion`s of all planes if the buffer is `USERPTR`.
         let guest_regions = if let V4l2PlanesWithBacking::UserPtr(planes) =
@@ -173,7 +211,11 @@ impl FromDescriptorChain for (V4l2Buffer, Vec<Vec<SgEntry>>) {
             vec![]
         };
 
-        Ok((v4l2_buffer, guest_regions))
+        Ok(GuestV4l2Buffer {
+            buffer: v4l2_buffer,
+            guest_regions,
+            payload_valid,
+        })
     }
 }
 
@@ -322,12 +364,16 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    // TODO qbuf needs a better structure to represent a buffer and its potential guest buffers.
+    /// `payload_valid` is `false` when the guest's `bytesused` / `data_offset` did not describe a
+    /// payload the buffer can hold and were zeroed by the dispatcher. V4L2 ignores both fields on
+    /// a buffer `PREPARE_BUF` has already taken, so a device that implements `prepare_buf` may
+    /// accept such a buffer; every other device must answer `EINVAL`.
     fn qbuf(
         &mut self,
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
     ) -> IoctlResult<V4l2Buffer> {
         unhandled_ioctl!()
     }
@@ -625,13 +671,19 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    // TODO like qbuf, this needs a better structure to represent a buffer and its potential guest
-    // buffers.
+    /// `payload_valid` is as in [`Self::qbuf`], except that `PREPARE_BUF` is the ioctl that
+    /// *validates* the payload, so an implementation must always refuse `false`.
+    ///
+    /// The default is `ENOTTY` whatever the guest sent, which is what makes "this device has no
+    /// `PREPARE_BUF`" a single answer: the dispatcher used to validate the payload first, so a
+    /// device without the ioctl answered `EINVAL` to a malformed buffer and `ENOTTY` to a
+    /// well-formed one, and `v4l2-compliance` reads the first answer as "the ioctl exists".
     fn prepare_buf(
         &mut self,
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
     ) -> IoctlResult<V4l2Buffer> {
         unhandled_ioctl!()
     }
@@ -910,11 +962,16 @@ where
         VIDIOC_G_FBUF => invalid_ioctl(ioctl, writer),
         VIDIOC_S_FBUF => invalid_ioctl(ioctl, writer),
         VIDIOC_OVERLAY => invalid_ioctl(ioctl, writer),
-        VIDIOC_QBUF => wr_ioctl(ioctl, reader, writer, |(guest_buffer, guest_regions)| {
-            let num_planes = guest_buffer.num_planes();
+        VIDIOC_QBUF => wr_ioctl(ioctl, reader, writer, |input: GuestV4l2Buffer| {
+            let num_planes = input.buffer.num_planes();
 
             handler
-                .qbuf(session, guest_buffer, guest_regions)
+                .qbuf(
+                    session,
+                    input.buffer,
+                    input.guest_regions,
+                    input.payload_valid,
+                )
                 .map(|guest_buffer| (guest_buffer, num_planes))
         }),
         // TODO implement EXPBUF.
@@ -1150,11 +1207,16 @@ where
 
             handler.create_bufs(session, input.count, queue, memory, input.format)
         }),
-        VIDIOC_PREPARE_BUF => wr_ioctl(ioctl, reader, writer, |(guest_buffer, guest_regions)| {
-            let num_planes = guest_buffer.num_planes();
+        VIDIOC_PREPARE_BUF => wr_ioctl(ioctl, reader, writer, |input: GuestV4l2Buffer| {
+            let num_planes = input.buffer.num_planes();
 
             handler
-                .prepare_buf(session, guest_buffer, guest_regions)
+                .prepare_buf(
+                    session,
+                    input.buffer,
+                    input.guest_regions,
+                    input.payload_valid,
+                )
                 .map(|out_buffer| (out_buffer, num_planes))
         }),
         VIDIOC_G_SELECTION => wr_ioctl(ioctl, reader, writer, |mut selection: v4l2_selection| {
@@ -1247,6 +1309,66 @@ mod tests {
     fn zero_length_sg_entry_is_refused_instead_of_spinning() {
         let bytes = sg_bytes(&[(0x1000, 0)]);
         assert!(get_userptr_regions(&mut &bytes[..], 0x1000).is_err());
+    }
+
+    /// A device that implements no ioctl at all: everything falls through to the trait's
+    /// defaults, as `simple_device`, `video_decoder` and a future camera device do for
+    /// `PREPARE_BUF`.
+    struct NoopHandler;
+
+    impl VirtioMediaIoctlHandler for NoopHandler {
+        type Session = ();
+    }
+
+    /// One `v4l2_buffer` on the wire: MPLANE OUTPUT, MMAP, one plane with `bytesused`/`length`.
+    fn mplane_buffer_bytes(bytesused: u32, length: u32) -> Vec<u8> {
+        use zerocopy::AsBytes;
+        let buffer = v4l2_buffer {
+            index: 0,
+            type_: QueueType::VideoOutputMplane as u32,
+            memory: MemoryType::Mmap as u32,
+            length: 1,
+            ..Default::default()
+        };
+        let plane = v4l2_plane {
+            bytesused,
+            length,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(buffer.to_le().as_bytes());
+        out.extend_from_slice(plane.to_le().as_bytes());
+        out
+    }
+
+    fn dispatch_prepare_buf(bytes: &[u8]) -> i32 {
+        let mut out = Vec::new();
+        virtio_media_dispatch_ioctl(
+            &mut NoopHandler,
+            &mut (),
+            V4l2Ioctl::VIDIOC_PREPARE_BUF,
+            &mut &bytes[..],
+            &mut out,
+        )
+        .unwrap();
+        i32::from_le_bytes(out[0..4].try_into().unwrap())
+    }
+
+    /// An ioctl a device does not implement answers `ENOTTY` whatever the guest sent.
+    ///
+    /// The payload used to be validated before the handler was asked, so a buffer whose
+    /// `bytesused` overflows its `length` came back `EINVAL` from a device that has no
+    /// `PREPARE_BUF` at all -- and `v4l2-compliance` reads that first `EINVAL` as "the ioctl
+    /// exists", then fails when the well-formed call answers `ENOTTY` (defect D6).
+    #[test]
+    fn an_unimplemented_ioctl_is_enotty_for_a_malformed_payload_too() {
+        assert_eq!(dispatch_prepare_buf(&mplane_buffer_bytes(0, 4096)), libc::ENOTTY);
+        // `bytesused > length`: refused by `V4l2Buffer`'s invariants, sanitised by the reader.
+        assert_eq!(dispatch_prepare_buf(&mplane_buffer_bytes(4097, 4096)), libc::ENOTTY);
+        // A buffer that is not addressable at all is still `EINVAL`: there is no ioctl to run.
+        let mut broken = mplane_buffer_bytes(0, 4096);
+        broken[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes()); // `type_`
+        assert_eq!(dispatch_prepare_buf(&broken), libc::EINVAL);
     }
 
     #[test]

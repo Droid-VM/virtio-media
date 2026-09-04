@@ -100,6 +100,58 @@ impl Default for FrameFormat {
     }
 }
 
+/// The colorimetry a session reports, and what `S_FMT` on the OUTPUT queue stored.
+///
+/// V4L2 keeps these four fields together and, on an m2m device, propagates them from OUTPUT to
+/// CAPTURE: `v4l2-compliance`'s `testM2MFormats` sets them on OUTPUT and expects both queues to
+/// report them back. They describe bytes the device never interprets -- it copies -- so it stores
+/// whatever the guest asked for, only replacing values a `v4l2_format` may not carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ColorSpec {
+    colorspace: u32,
+    ycbcr_enc: u32,
+    quantization: u32,
+    xfer_func: u32,
+}
+
+impl ColorSpec {
+    /// What the device reports for `pixelformat` when the guest expressed no preference.
+    fn default_for(pixelformat: PixelFormat) -> Self {
+        Self {
+            colorspace: if pixelformat == RGB3 {
+                bindings::v4l2_colorspace_V4L2_COLORSPACE_SRGB
+            } else {
+                bindings::v4l2_colorspace_V4L2_COLORSPACE_REC709
+            },
+            ycbcr_enc: bindings::v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_DEFAULT,
+            quantization: bindings::v4l2_quantization_V4L2_QUANTIZATION_DEFAULT,
+            xfer_func: bindings::v4l2_xfer_func_V4L2_XFER_FUNC_DEFAULT,
+        }
+    }
+
+    /// The colorimetry the device will use for `pixelformat` given what the guest set.
+    ///
+    /// `DEFAULT` (0) and anything a `__u8` field cannot carry back becomes the format's own
+    /// default; `BT878` and `JPEG` are refused by `v4l2-compliance` for a non-JPEG codec. Every
+    /// other value is kept verbatim, because this device does not look at the pixels.
+    fn adjusted(pixelformat: PixelFormat, pix_mp: &bindings::v4l2_pix_format_mplane) -> Self {
+        let default = Self::default_for(pixelformat);
+        let usable = |v: u32, fallback: u32| if v == 0 || v >= 0xff { fallback } else { v };
+        let colorspace = match pix_mp.colorspace {
+            bindings::v4l2_colorspace_V4L2_COLORSPACE_BT878
+            | bindings::v4l2_colorspace_V4L2_COLORSPACE_JPEG => default.colorspace,
+            other => usable(other, default.colorspace),
+        };
+        Self {
+            colorspace,
+            // SAFETY: `ycbcr_enc` and `hsv_enc` are the same `__u8`; only the meaning differs.
+            ycbcr_enc: usable(unsafe { pix_mp.__bindgen_anon_1.ycbcr_enc } as u32, default.ycbcr_enc),
+            quantization: usable(pix_mp.quantization as u32, default.quantization),
+            xfer_func: usable(pix_mp.xfer_func as u32, default.xfer_func),
+        }
+    }
+}
+
 impl FrameFormat {
     /// The closest format this device can do to what was asked: unknown pixel formats become
     /// NV12, dimensions are clamped to the stepwise range and rounded down to a multiple of the
@@ -136,27 +188,24 @@ impl FrameFormat {
         }
     }
 
-    fn colorspace(&self) -> u32 {
-        if self.pixelformat == RGB3 {
-            bindings::v4l2_colorspace_V4L2_COLORSPACE_SRGB
-        } else {
-            bindings::v4l2_colorspace_V4L2_COLORSPACE_REC709
-        }
-    }
-
-    /// The format as a single-plane multi-planar `v4l2_format` for `queue`.
-    fn to_v4l2(self, queue: QueueType) -> v4l2_format {
+    /// The format as a single-plane multi-planar `v4l2_format` for `queue`, with `colors` as its
+    /// colorimetry and `sizeimage` bytes per buffer (`CREATE_BUFS` may ask for more than the
+    /// format itself needs).
+    fn to_v4l2_sized(self, queue: QueueType, colors: ColorSpec, sizeimage: u32) -> v4l2_format {
         let mut pix_mp = bindings::v4l2_pix_format_mplane {
             width: self.width,
             height: self.height,
             pixelformat: self.pixelformat.to_u32(),
             field: bindings::v4l2_field_V4L2_FIELD_NONE,
-            colorspace: self.colorspace(),
+            colorspace: colors.colorspace,
             num_planes: 1,
             ..Default::default()
         };
+        pix_mp.__bindgen_anon_1.ycbcr_enc = colors.ycbcr_enc as u8;
+        pix_mp.quantization = colors.quantization as u8;
+        pix_mp.xfer_func = colors.xfer_func as u8;
         pix_mp.plane_fmt[0] = bindings::v4l2_plane_pix_format {
-            sizeimage: self.sizeimage(),
+            sizeimage,
             bytesperline: self.bytesperline(),
             ..Default::default()
         };
@@ -165,6 +214,10 @@ impl FrameFormat {
             type_: queue as u32,
             fmt: bindings::v4l2_format__bindgen_ty_1 { pix_mp },
         }
+    }
+
+    fn to_v4l2(self, queue: QueueType, colors: ColorSpec) -> v4l2_format {
+        self.to_v4l2_sized(queue, colors, self.sizeimage())
     }
 }
 
@@ -188,6 +241,12 @@ struct Buffer<GM> {
     /// never changes afterwards -- unlike the plane `length` of a `Backing::Guest` buffer, which
     /// is replaced by the guest's own number on every `QBUF`.
     size: u32,
+    /// `(bytesused, length)` `PREPARE_BUF` accepted for this buffer, while it is prepared.
+    ///
+    /// V4L2 says `QBUF` ignores a prepared buffer's payload description, so these are the numbers
+    /// the following `QBUF` uses -- whatever the guest puts in the `v4l2_buffer` it queues with
+    /// (`v4l2-compliance` queues `0xdeadbeef` on purpose to check exactly this).
+    prepared: Option<(u32, u32)>,
 }
 
 impl<GM: GuestMemoryRange> Buffer<GM> {
@@ -227,7 +286,9 @@ impl<GM: GuestMemoryRange> Buffer<GM> {
     fn unqueue(&mut self) {
         self.drop_guest_mapping();
         self.queued = false;
-        self.v4l2_buffer.clear_flags(BufferFlags::QUEUED);
+        self.prepared = None;
+        self.v4l2_buffer
+            .clear_flags(BufferFlags::QUEUED | BufferFlags::PREPARED);
     }
 }
 
@@ -262,6 +323,8 @@ pub struct LoopbackSession<GM> {
     id: u32,
     output: Queue<GM>,
     capture: Queue<GM>,
+    /// Colorimetry, set on the OUTPUT queue and reported by both (V4L2 m2m rule).
+    colors: ColorSpec,
 }
 
 impl<GM> VirtioMediaDeviceSession for LoopbackSession<GM> {
@@ -406,6 +469,7 @@ where
                 backing,
                 queued: false,
                 size: sizeimage,
+                prepared: None,
             });
         }
 
@@ -491,23 +555,27 @@ where
         }
     }
 
-    /// Validate `format` for `queue` and return what the device would actually use.
+    /// Validate `format` for `queue` and return what the device would actually use, together
+    /// with the colorimetry it would report.
     fn adjust_format(
         &self,
         session: &LoopbackSession<M::GuestMemoryMapping>,
         queue: QueueType,
         format: &v4l2_format,
-    ) -> IoctlResult<FrameFormat> {
+    ) -> IoctlResult<(FrameFormat, ColorSpec)> {
         session.queue(queue)?;
         // SAFETY: both accepted queue types are multi-planar, so `pix_mp` is the live member.
         let pix_mp = unsafe { format.fmt.pix_mp };
         let mut wanted = FrameFormat::adjusted(pix_mp.pixelformat, pix_mp.width, pix_mp.height);
-        if queue.direction() == QueueDirection::Capture {
-            // The CAPTURE resolution follows the OUTPUT one.
+        let colors = if queue.direction() == QueueDirection::Output {
+            ColorSpec::adjusted(wanted.pixelformat, &pix_mp)
+        } else {
+            // The CAPTURE resolution and colorimetry follow the OUTPUT ones.
             wanted.width = session.output.format.width;
             wanted.height = session.output.format.height;
-        }
-        Ok(wanted)
+            session.colors
+        };
+        Ok((wanted, colors))
     }
 }
 
@@ -527,6 +595,7 @@ where
             id: session_id,
             output: Default::default(),
             capture: Default::default(),
+            colors: ColorSpec::default_for(FrameFormat::default().pixelformat),
         })
     }
 
@@ -649,7 +718,7 @@ where
     }
 
     fn g_fmt(&mut self, session: &Self::Session, queue: QueueType) -> IoctlResult<v4l2_format> {
-        Ok(session.queue(queue)?.format.to_v4l2(queue))
+        Ok(session.queue(queue)?.format.to_v4l2(queue, session.colors))
     }
 
     fn try_fmt(
@@ -658,7 +727,8 @@ where
         queue: QueueType,
         format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
-        Ok(self.adjust_format(session, queue, &format)?.to_v4l2(queue))
+        let (wanted, colors) = self.adjust_format(session, queue, &format)?;
+        Ok(wanted.to_v4l2(queue, colors))
     }
 
     fn s_fmt(
@@ -667,7 +737,7 @@ where
         queue: QueueType,
         format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
-        let wanted = self.adjust_format(session, queue, &format)?;
+        let (wanted, colors) = self.adjust_format(session, queue, &format)?;
         // Buffers were sized for the old format.
         if !session.queue(queue)?.buffers.is_empty() {
             return Err(libc::EBUSY);
@@ -676,8 +746,11 @@ where
         if queue.direction() == QueueDirection::Output {
             session.capture.format.width = wanted.width;
             session.capture.format.height = wanted.height;
+            // Colorimetry belongs to the stream, so it is set on OUTPUT and both queues report
+            // it (`v4l2-compliance` testM2MFormats). A CAPTURE `S_FMT` may not change it.
+            session.colors = colors;
         }
-        Ok(wanted.to_v4l2(queue))
+        Ok(wanted.to_v4l2(queue, session.colors))
     }
 
     fn reqbufs(
@@ -742,7 +815,20 @@ where
             Some(id) if id != session.id => return Err(libc::EBUSY),
             _ => (),
         }
-        let wanted = self.adjust_format(session, queue_type, &format)?;
+        let (wanted, colors) = self.adjust_format(session, queue_type, &format)?;
+        // `CREATE_BUFS` is the one call where the guest sizes the buffers itself, so the format
+        // it hands over is checked rather than adjusted: V4L2 requires `EINVAL` for a plane
+        // count the format does not have, and for a `sizeimage` too small to hold a frame
+        // (`v4l2-compliance` testReqBufs walks both). Both loopback formats are single-plane.
+        // SAFETY: both accepted queue types are multi-planar, so `pix_mp` is the live member.
+        let pix_mp = unsafe { format.fmt.pix_mp };
+        if pix_mp.num_planes != 1 {
+            return Err(libc::EINVAL);
+        }
+        let asked = pix_mp.plane_fmt[0].sizeimage;
+        if asked < wanted.sizeimage() {
+            return Err(libc::EINVAL);
+        }
         let queue = session.queue_mut(queue_type)?;
         // One memory type per queue.
         if let Some(existing) = queue.memory {
@@ -753,9 +839,10 @@ where
 
         let first = queue.buffers.len();
         let count = (count as usize).min(MAX_BUFFERS - first);
+        // What the guest asked for, but never less than the queue's own format needs, so the
+        // buffer stays usable after a `CREATE_BUFS` for a smaller format.
+        let sizeimage = asked.max(queue.format.sizeimage());
         if count > 0 {
-            // At least what the queue's own format needs, so the buffer stays usable.
-            let sizeimage = wanted.sizeimage().max(queue.format.sizeimage());
             self.add_buffers(queue, queue_type, memory, count, sizeimage)?;
             queue.memory = Some(memory);
         }
@@ -769,7 +856,7 @@ where
             index: first as u32,
             count: count as u32,
             memory: memory as u32,
-            format: wanted.to_v4l2(queue_type),
+            format: wanted.to_v4l2_sized(queue_type, colors, sizeimage),
             capabilities: (BufferCapabilities::SUPPORTS_MMAP
                 | BufferCapabilities::SUPPORTS_USERPTR
                 | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
@@ -797,6 +884,7 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
     ) -> IoctlResult<V4l2Buffer> {
         let queue_type = buffer.queue();
         let direction = queue_type.direction();
@@ -808,12 +896,22 @@ where
         if entry.queued || Some(buffer.memory()) != queue.memory {
             return Err(libc::EINVAL);
         }
+        // A prepared buffer keeps the payload description `PREPARE_BUF` accepted, and V4L2 says
+        // this call's own `bytesused` / `data_offset` are ignored -- including the nonsense the
+        // dispatcher had to zero to make the buffer representable at all.
+        let prepared = entry.prepared;
+        if prepared.is_none() && !payload_valid {
+            return Err(libc::EINVAL);
+        }
 
         // A guest-supplied MPLANE buffer may legitimately carry no plane at all -- v4l2r only
         // refuses `length >= VIDEO_MAX_PLANES` -- so the first plane is asked for, never assumed
         // (`get_first_plane()` would panic, and this VMM is built with `panic = 'abort'`).
         let guest_plane = buffer.planes_iter().next().ok_or(libc::EINVAL)?;
-        let (guest_bytesused, guest_length) = (*guest_plane.bytesused, *guest_plane.length);
+        let (guest_bytesused, guest_length) = match prepared {
+            Some(payload) => payload,
+            None => (*guest_plane.bytesused, *guest_plane.length),
+        };
         // What this buffer was sized for at REQBUFS/CREATE_BUFS time.
         let max_length = entry.size;
 
@@ -843,18 +941,21 @@ where
                     guest_mapping_errno(&e)
                 })?;
                 *slot = Some(mapping);
-                // The guest's view of its own buffer -- userptr and length -- is what must be
-                // echoed back in the dequeue event.
-                let mut v4l2_buffer = buffer.clone();
-                v4l2_buffer.set_field(BufferField::None);
-                v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
-                *v4l2_buffer.get_first_plane_mut().bytesused =
-                    if direction == QueueDirection::Output {
-                        guest_bytesused.min(guest_length)
-                    } else {
-                        0
-                    };
-                entry.v4l2_buffer = v4l2_buffer;
+                if prepared.is_none() {
+                    // The guest's view of its own buffer -- userptr and length -- is what must be
+                    // echoed back in the dequeue event. A prepared buffer already carries the
+                    // description `PREPARE_BUF` stored.
+                    let mut v4l2_buffer = buffer.clone();
+                    v4l2_buffer.set_field(BufferField::None);
+                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
+                    *v4l2_buffer.get_first_plane_mut().bytesused =
+                        if direction == QueueDirection::Output {
+                            guest_bytesused.min(guest_length)
+                        } else {
+                            0
+                        };
+                    entry.v4l2_buffer = v4l2_buffer;
+                }
             }
         }
 
@@ -869,6 +970,8 @@ where
         }
 
         entry.queued = true;
+        entry.prepared = None;
+        entry.v4l2_buffer.clear_flags(BufferFlags::PREPARED | BufferFlags::LAST);
         entry.v4l2_buffer.add_flags(BufferFlags::QUEUED);
         queue.queued.push_back(buffer.index() as usize);
         let reply = entry.v4l2_buffer.clone();
@@ -876,6 +979,77 @@ where
         self.process(session);
 
         Ok(reply)
+    }
+
+    /// `VIDIOC_PREPARE_BUF`: everything `QBUF` validates, minus the queueing.
+    ///
+    /// The buffer keeps the payload description accepted here until it is queued or the queue is
+    /// torn down, which is what lets `QBUF` ignore what the guest sends next (V4L2's rule for a
+    /// prepared buffer). No guest memory is mapped: the driver sends the `USERPTR` SG list again
+    /// with the `QBUF` that follows, so holding a mapping here would only widen the window in
+    /// which the host has the guest's pages (`VPU_DESIGN.md` §2.5).
+    fn prepare_buf(
+        &mut self,
+        session: &mut Self::Session,
+        buffer: V4l2Buffer,
+        _guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
+    ) -> IoctlResult<V4l2Buffer> {
+        // Unlike `QBUF`, this is the call that checks the payload description.
+        if !payload_valid {
+            return Err(libc::EINVAL);
+        }
+        let queue_type = buffer.queue();
+        let direction = queue_type.direction();
+        let queue = session.queue_mut(queue_type)?;
+        let entry = queue
+            .buffers
+            .get_mut(buffer.index() as usize)
+            .ok_or(libc::EINVAL)?;
+        // Preparing a queued or already prepared buffer is `EINVAL`, as in `vb2`.
+        if entry.queued || entry.prepared.is_some() || Some(buffer.memory()) != queue.memory {
+            return Err(libc::EINVAL);
+        }
+
+        let guest_plane = buffer.planes_iter().next().ok_or(libc::EINVAL)?;
+        let (guest_bytesused, guest_length) = (*guest_plane.bytesused, *guest_plane.length);
+        let max_length = entry.size;
+
+        if let Backing::Guest(_) = &entry.backing {
+            // Same ceiling as `QBUF`: `length` is the guest's own number and sizes the mapping.
+            if guest_length == 0 || guest_length > max_length {
+                return Err(libc::EINVAL);
+            }
+            // Keep the guest's own description of its pages; the payload is filled in below.
+            let mut v4l2_buffer = buffer.clone();
+            v4l2_buffer.set_field(BufferField::None);
+            v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
+            entry.v4l2_buffer = v4l2_buffer;
+        }
+
+        // A prepared buffer is neither queued nor done, and carries no timestamp or sequence
+        // yet -- `v4l2-compliance` checks all four on the reply and on a following `QUERYBUF`.
+        entry.v4l2_buffer.set_timestamp(Default::default());
+        entry.v4l2_buffer.set_sequence(0);
+        entry
+            .v4l2_buffer
+            .clear_flags(BufferFlags::QUEUED | BufferFlags::DONE | BufferFlags::LAST);
+        let capacity = entry.capacity();
+        let bytesused = if direction == QueueDirection::Output {
+            // "bytesused == 0 means the whole buffer", resolved now against our capacity.
+            if guest_bytesused == 0 || guest_bytesused > capacity {
+                capacity
+            } else {
+                guest_bytesused
+            }
+        } else {
+            0
+        };
+        *entry.v4l2_buffer.get_first_plane_mut().bytesused = bytesused;
+        entry.v4l2_buffer.add_flags(BufferFlags::PREPARED);
+        entry.prepared = Some((bytesused, guest_length));
+
+        Ok(entry.v4l2_buffer.clone())
     }
 
     fn streamon(&mut self, session: &mut Self::Session, queue_type: QueueType) -> IoctlResult<()> {
@@ -1096,12 +1270,12 @@ mod tests {
     }
 
     fn format(queue: QueueType, pixelformat: PixelFormat, width: u32, height: u32) -> v4l2_format {
-        FrameFormat {
+        let fmt = FrameFormat {
             pixelformat,
             width,
             height,
-        }
-        .to_v4l2(queue)
+        };
+        fmt.to_v4l2(queue, ColorSpec::default_for(pixelformat))
     }
 
     fn sizeimage(format: &v4l2_format) -> u32 {
@@ -1257,7 +1431,7 @@ mod tests {
 
         // CAPTURE first: nothing happens until an OUTPUT buffer arrives.
         let cap = mmap_buffer(QueueType::VideoCaptureMplane, 0, size);
-        let reply = r.device.qbuf(&mut s, cap, vec![]).unwrap();
+        let reply = r.device.qbuf(&mut s, cap, vec![], true).unwrap();
         assert!(reply.flags().contains(BufferFlags::QUEUED));
         assert!(r.events.borrow().is_empty());
 
@@ -1267,7 +1441,7 @@ mod tests {
             tv_sec: 12,
             tv_usec: 34,
         });
-        let reply = r.device.qbuf(&mut s, out, sgs).unwrap();
+        let reply = r.device.qbuf(&mut s, out, sgs, true).unwrap();
         // The reply is our view of the queued buffer, userptr preserved.
         assert_eq!(reply.index(), 1);
         assert_eq!(reply.memory(), MemoryType::UserPtr);
@@ -1313,14 +1487,14 @@ mod tests {
 
         // Requeueing a dequeued buffer works, requeueing a queued one does not.
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
-        r.device.qbuf(&mut s, out, sgs).unwrap();
+        r.device.qbuf(&mut s, out, sgs, true).unwrap();
         assert_eq!(*r.guest.live_mappings.borrow(), 1, "held while queued");
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
-        assert_eq!(r.device.qbuf(&mut s, out, sgs).err(), Some(libc::EINVAL));
+        assert_eq!(r.device.qbuf(&mut s, out, sgs, true).err(), Some(libc::EINVAL));
         // A memory type other than the one REQBUFS chose is refused.
         assert_eq!(
             r.device
-                .qbuf(&mut s, mmap_buffer(QueueType::VideoOutputMplane, 1, size), vec![])
+                .qbuf(&mut s, mmap_buffer(QueueType::VideoOutputMplane, 1, size), vec![], true)
                 .err(),
             Some(libc::EINVAL)
         );
@@ -1368,12 +1542,12 @@ mod tests {
 
         // bytesused == 0 means the whole buffer; the CAPTURE buffer is 100 bytes shorter.
         let out = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
-        r.device.qbuf(&mut s, out, vec![]).unwrap();
+        r.device.qbuf(&mut s, out, vec![], true).unwrap();
         assert!(r.events.borrow().is_empty());
 
         let gpa = 8 * 0x1000u64;
         let (cap, sgs) = userptr_buffer(QueueType::VideoCaptureMplane, 0, gpa, size - 100);
-        r.device.qbuf(&mut s, cap, sgs).unwrap();
+        r.device.qbuf(&mut s, cap, sgs, true).unwrap();
         // A CAPTURE buffer is the one direction the device writes, so it is mapped writable.
         assert_eq!(*r.guest.directions.borrow(), vec![true]);
 
@@ -1410,19 +1584,32 @@ mod tests {
     fn create_bufs_appends_and_rejects_mixed_memory() {
         let mut r = rig();
         let mut s = session(&mut r.device);
-        let fmt = format(QueueType::VideoCaptureMplane, RGB3, 64, 64);
+        let fmt = format(QueueType::VideoCaptureMplane, RGB3, 640, 480);
         r.device
             .reqbufs(&mut s, QueueType::VideoCaptureMplane, MemoryType::Mmap, 2)
             .unwrap();
+        // A `sizeimage` too small for the format the device would use is refused, not enlarged:
+        // CAPTURE takes OUTPUT's 640x480, so RGB3 at 64x64 does not describe a frame.
+        assert_eq!(
+            r.device
+                .create_bufs(
+                    &mut s,
+                    1,
+                    QueueType::VideoCaptureMplane,
+                    MemoryType::Mmap,
+                    format(QueueType::VideoCaptureMplane, RGB3, 64, 64),
+                )
+                .err(),
+            Some(libc::EINVAL)
+        );
         let reply = r
             .device
             .create_bufs(&mut s, 3, QueueType::VideoCaptureMplane, MemoryType::Mmap, fmt)
             .unwrap();
         assert_eq!((reply.index, reply.count), (2, 3));
         assert_eq!(s.capture.buffers.len(), 5);
-        // The requested format is adjusted first (CAPTURE takes OUTPUT's 640x480, so RGB3 at
-        // 64x64 becomes RGB3 at 640x480), and the new buffers are at least as large as both that
-        // and the queue's current format (NV12 640x480) need.
+        // The new buffers are at least as large as both the requested format and the queue's
+        // current format (NV12 640x480) need.
         let adjusted = sizeimage(&reply.format);
         assert_eq!(adjusted, 640 * 480 * 3);
         let Backing::Host { buffer, .. } = &s.capture.buffers[4].backing else {
@@ -1498,7 +1685,7 @@ mod tests {
         assert_eq!(planeless.planes_iter().count(), 0);
 
         assert_eq!(
-            r.device.qbuf(&mut s, planeless, vec![]).err(),
+            r.device.qbuf(&mut s, planeless, vec![], true).err(),
             Some(libc::EINVAL)
         );
         assert!(r.events.borrow().is_empty(), "nothing was dequeued");
@@ -1508,8 +1695,8 @@ mod tests {
         let gpa = 4 * 0x1000u64;
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
         let cap = mmap_buffer(QueueType::VideoCaptureMplane, 0, size);
-        r.device.qbuf(&mut s, cap, vec![]).unwrap();
-        r.device.qbuf(&mut s, out, sgs).unwrap();
+        r.device.qbuf(&mut s, cap, vec![], true).unwrap();
+        r.device.qbuf(&mut s, out, sgs, true).unwrap();
         assert_eq!(dequeued(&r.events.borrow()).len(), 2);
 
         close(&mut r.device, s);
@@ -1532,16 +1719,16 @@ mod tests {
 
         let gpa = 4 * 0x1000u64;
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size + 1);
-        assert_eq!(r.device.qbuf(&mut s, out, sgs).err(), Some(libc::EINVAL));
+        assert_eq!(r.device.qbuf(&mut s, out, sgs, true).err(), Some(libc::EINVAL));
         assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
 
         // Zero-length is refused too, and exactly `sizeimage` is accepted.
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, 0);
-        assert_eq!(r.device.qbuf(&mut s, out, sgs).err(), Some(libc::EINVAL));
+        assert_eq!(r.device.qbuf(&mut s, out, sgs, true).err(), Some(libc::EINVAL));
         let (mut out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
         // `bytesused` beyond the plane's own length is clamped to it, never trusted.
         *out.get_first_plane_mut().bytesused = size;
-        let reply = r.device.qbuf(&mut s, out, sgs).unwrap();
+        let reply = r.device.qbuf(&mut s, out, sgs, true).unwrap();
         assert_eq!(*reply.get_first_plane().bytesused, size);
         assert_eq!(*r.guest.live_mappings.borrow(), 1);
 
@@ -1572,4 +1759,216 @@ mod tests {
         );
         close(&mut r.device, s);
     }
+    /// D6.1 -- `PREPARE_BUF` works, and the `QBUF` that follows ignores the payload description
+    /// the guest sends with it, which is what V4L2 says about a prepared buffer and what
+    /// `v4l2-compliance`'s `bufferOutputErrorTest` checks with `bytesused = 0xdeadbeef`.
+    #[test]
+    fn prepare_buf_then_qbuf_keeps_the_prepared_payload() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let size = s.output.format.sizeimage();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::Mmap, 2)
+            .unwrap();
+
+        // A payload that does not fit is the dispatcher's `payload_valid == false`: refused here,
+        // because `PREPARE_BUF` is the call that validates it.
+        assert_eq!(
+            r.device
+                .prepare_buf(
+                    &mut s,
+                    mmap_buffer(QueueType::VideoOutputMplane, 0, size),
+                    vec![],
+                    false,
+                )
+                .err(),
+            Some(libc::EINVAL)
+        );
+
+        let mut buf = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
+        *buf.get_first_plane_mut().bytesused = size;
+        let reply = r.device.prepare_buf(&mut s, buf, vec![], true).unwrap();
+        // Prepared, and neither queued nor done; no timestamp or sequence yet.
+        assert_eq!(
+            (reply.flags() & (BufferFlags::QUEUED | BufferFlags::PREPARED | BufferFlags::DONE))
+                .bits(),
+            BufferFlags::PREPARED.bits()
+        );
+        assert_eq!(reply.sequence(), 0);
+        assert_eq!(reply.timestamp().tv_sec, 0);
+        assert_eq!(*reply.get_first_plane().bytesused, size);
+        // QUERYBUF says the same.
+        let queried = r
+            .device
+            .querybuf(&s, QueueType::VideoOutputMplane, 0)
+            .unwrap();
+        assert!(queried.flags().contains(BufferFlags::PREPARED));
+
+        // Preparing it twice is refused.
+        assert_eq!(
+            r.device
+                .prepare_buf(
+                    &mut s,
+                    mmap_buffer(QueueType::VideoOutputMplane, 0, size),
+                    vec![],
+                    true,
+                )
+                .err(),
+            Some(libc::EINVAL)
+        );
+
+        // The guest now queues the same buffer with a payload the dispatcher had to zero.
+        // Because the buffer is prepared, the numbers `PREPARE_BUF` accepted are kept.
+        let queued = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
+        let reply = r.device.qbuf(&mut s, queued, vec![], false).unwrap();
+        assert!(reply.flags().contains(BufferFlags::QUEUED));
+        assert!(!reply.flags().contains(BufferFlags::PREPARED));
+        assert_eq!(*reply.get_first_plane().bytesused, size);
+        assert_eq!(reply.get_first_plane().data_offset.copied(), Some(0));
+
+        // A buffer that was never prepared gets no such indulgence.
+        assert_eq!(
+            r.device
+                .qbuf(
+                    &mut s,
+                    mmap_buffer(QueueType::VideoOutputMplane, 1, size),
+                    vec![],
+                    false,
+                )
+                .err(),
+            Some(libc::EINVAL)
+        );
+        // Nor does a queued one.
+        assert_eq!(
+            r.device
+                .prepare_buf(
+                    &mut s,
+                    mmap_buffer(QueueType::VideoOutputMplane, 0, size),
+                    vec![],
+                    true,
+                )
+                .err(),
+            Some(libc::EINVAL)
+        );
+
+        close(&mut r.device, s);
+    }
+
+    /// D6.2 -- `CREATE_BUFS` refuses a format it cannot size buffers for.
+    #[test]
+    fn create_bufs_refuses_a_format_it_cannot_size() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let queue = QueueType::VideoOutputMplane;
+        let good = format(queue, NV12, 640, 480);
+        let create = |r: &mut Rig, s: &mut Session, fmt| {
+            r.device
+                .create_bufs(s, 1, queue, MemoryType::Mmap, fmt)
+                .err()
+        };
+
+        // No plane at all.
+        let mut fmt = good;
+        fmt.fmt.pix_mp.num_planes = 0;
+        assert_eq!(create(&mut r, &mut s, fmt), Some(libc::EINVAL));
+
+        // More planes than this device's formats have.
+        let mut fmt = good;
+        fmt.fmt.pix_mp.num_planes = 2;
+        // SAFETY: multi-planar, so `pix_mp` is the live member.
+        unsafe { fmt.fmt.pix_mp.plane_fmt[1].sizeimage = 65536 };
+        assert_eq!(create(&mut r, &mut s, fmt), Some(libc::EINVAL));
+
+        // A first plane that cannot hold a frame.
+        for sizeimage in [0, 640 * 480 * 3 / 2 / 2] {
+            let mut fmt = good;
+            // SAFETY: multi-planar, so `pix_mp` is the live member.
+            unsafe { fmt.fmt.pix_mp.plane_fmt[0].sizeimage = sizeimage };
+            assert_eq!(create(&mut r, &mut s, fmt), Some(libc::EINVAL));
+        }
+
+        // One that can hold more than a frame is honoured, buffer size and all.
+        let mut fmt = good;
+        // SAFETY: multi-planar, so `pix_mp` is the live member.
+        unsafe { fmt.fmt.pix_mp.plane_fmt[0].sizeimage += 1 << 20 };
+        let reply = r
+            .device
+            .create_bufs(&mut s, 1, queue, MemoryType::Mmap, fmt)
+            .unwrap();
+        let asked = sizeimage(&fmt);
+        assert_eq!(sizeimage(&reply.format), asked);
+        let Backing::Host { buffer, .. } = &s.output.buffers[0].backing else {
+            panic!()
+        };
+        assert!(buffer.len >= asked as u64);
+
+        close(&mut r.device, s);
+    }
+
+    /// D6.3 -- colorimetry set on OUTPUT comes back on both queues.
+    #[test]
+    fn s_fmt_round_trips_colorimetry_to_both_queues() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+
+        let colors = |fmt: &v4l2_format| {
+            // SAFETY: multi-planar. (Copied out because the struct is packed.)
+            let pix_mp = unsafe { fmt.fmt.pix_mp };
+            (
+                pix_mp.colorspace,
+                // SAFETY: `ycbcr_enc` and `hsv_enc` are the same byte.
+                unsafe { pix_mp.__bindgen_anon_1.ycbcr_enc } as u32,
+                pix_mp.quantization as u32,
+                pix_mp.xfer_func as u32,
+            )
+        };
+
+        // Both queues agree before anything is set.
+        let out = r.device.g_fmt(&s, QueueType::VideoOutputMplane).unwrap();
+        let cap = r.device.g_fmt(&s, QueueType::VideoCaptureMplane).unwrap();
+        assert_eq!(colors(&out), colors(&cap));
+
+        let wanted = (
+            bindings::v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M,
+            bindings::v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_601,
+            bindings::v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE,
+            bindings::v4l2_xfer_func_V4L2_XFER_FUNC_SRGB,
+        );
+        let mut fmt = format(QueueType::VideoOutputMplane, NV12, 640, 480);
+        fmt.fmt.pix_mp.colorspace = wanted.0;
+        fmt.fmt.pix_mp.__bindgen_anon_1.ycbcr_enc = wanted.1 as u8;
+        fmt.fmt.pix_mp.quantization = wanted.2 as u8;
+        fmt.fmt.pix_mp.xfer_func = wanted.3 as u8;
+        let reply = r
+            .device
+            .s_fmt(&mut s, QueueType::VideoOutputMplane, fmt)
+            .unwrap();
+        assert_eq!(colors(&reply), wanted);
+        let out = r.device.g_fmt(&s, QueueType::VideoOutputMplane).unwrap();
+        let cap = r.device.g_fmt(&s, QueueType::VideoCaptureMplane).unwrap();
+        assert_eq!(colors(&out), wanted);
+        assert_eq!(colors(&cap), wanted, "CAPTURE follows OUTPUT");
+
+        // Values a `v4l2_format` cannot report back, and the ones v4l2-compliance refuses for a
+        // non-JPEG device, become the format's own default instead of being echoed.
+        let mut fmt = format(QueueType::VideoOutputMplane, RGB3, 640, 480);
+        fmt.fmt.pix_mp.colorspace = bindings::v4l2_colorspace_V4L2_COLORSPACE_JPEG;
+        fmt.fmt.pix_mp.__bindgen_anon_1.ycbcr_enc = 0xff;
+        let reply = r
+            .device
+            .s_fmt(&mut s, QueueType::VideoOutputMplane, fmt)
+            .unwrap();
+        assert_eq!(
+            colors(&reply).0,
+            bindings::v4l2_colorspace_V4L2_COLORSPACE_SRGB
+        );
+        assert_eq!(
+            colors(&reply).1,
+            bindings::v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_DEFAULT
+        );
+
+        close(&mut r.device, s);
+    }
+
+
 }

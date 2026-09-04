@@ -1190,7 +1190,13 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         _guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
     ) -> IoctlResult<V4l2Buffer> {
+        // This device has no `PREPARE_BUF`, so a payload description that does not fit the
+        // buffer is always the guest's mistake.
+        if !payload_valid {
+            return Err(libc::EINVAL);
+        }
         let buffers = match buffer.queue() {
             QueueType::VideoOutputMplane => &mut session.input_buffers,
             QueueType::VideoCaptureMplane => &mut session.output_buffers,

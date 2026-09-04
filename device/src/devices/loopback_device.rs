@@ -29,6 +29,8 @@ use std::os::fd::BorrowedFd;
 
 use v4l2r::bindings;
 use v4l2r::bindings::v4l2_create_buffers;
+use v4l2r::bindings::v4l2_decoder_cmd;
+use v4l2r::bindings::v4l2_encoder_cmd;
 use v4l2r::bindings::v4l2_event_subscription;
 use v4l2r::bindings::v4l2_fmtdesc;
 use v4l2r::bindings::v4l2_format;
@@ -318,6 +320,23 @@ impl<GM> Default for Queue<GM> {
     }
 }
 
+/// Where a `V4L2_DEC_CMD_STOP` / `V4L2_ENC_CMD_STOP` drain has got to.
+///
+/// The stateful codec rule (`V4L2` "Decoder Interface", drain sequence): after `STOP` the device
+/// returns every CAPTURE buffer it still owes, and the last of them carries
+/// `V4L2_BUF_FLAG_LAST`; further `DQBUF` on CAPTURE answers `EPIPE` until the queue is restarted.
+/// This device owes at most the buffers still queued on OUTPUT, so the drain is either immediate
+/// or finishes with the pair that consumes the last of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drain {
+    /// No `STOP` is outstanding.
+    None,
+    /// `STOP` was issued; the CAPTURE buffer that empties the OUTPUT queue gets the flag.
+    Pending,
+    /// The `LAST` buffer has been returned.
+    Done,
+}
+
 /// Session data of [`LoopbackDevice`].
 pub struct LoopbackSession<GM> {
     id: u32,
@@ -325,6 +344,7 @@ pub struct LoopbackSession<GM> {
     capture: Queue<GM>,
     /// Colorimetry, set on the OUTPUT queue and reported by both (V4L2 m2m rule).
     colors: ColorSpec,
+    drain: Drain,
 }
 
 impl<GM> VirtioMediaDeviceSession for LoopbackSession<GM> {
@@ -542,6 +562,13 @@ where
             session.capture.sequence = session.capture.sequence.wrapping_add(1);
             cap.v4l2_buffer.set_timestamp(timestamp);
             cap.v4l2_buffer.add_flags(BufferFlags::TIMESTAMP_COPY);
+            // A drain that was waiting for the OUTPUT queue to empty ends on this buffer: it
+            // carries the data *and* the flag, which is what the V4L2 drain sequence asks for
+            // when the last input produced a frame.
+            if session.drain == Drain::Pending && session.output.queued.is_empty() {
+                cap.v4l2_buffer.add_flags(BufferFlags::LAST);
+                session.drain = Drain::Done;
+            }
             let cap_event = cap.v4l2_buffer.clone();
 
             // Mappings are gone (`unqueue`), so a shadowed CAPTURE buffer has been written back
@@ -553,6 +580,37 @@ where
                 session.id, cap_event,
             )));
         }
+
+        self.finish_drain(session);
+    }
+
+    /// Close a drain that has no OUTPUT buffer left to consume by handing back the next CAPTURE
+    /// buffer empty and flagged `LAST` (`V4L2_DEC_CMD_STOP` with nothing pending).
+    ///
+    /// Does nothing while OUTPUT buffers are still queued -- `process` flags the buffer that
+    /// consumes the last of them instead -- or when no CAPTURE buffer is available yet, in which
+    /// case the next `QBUF`/`STREAMON` gets here again.
+    fn finish_drain(&mut self, session: &mut LoopbackSession<M::GuestMemoryMapping>) {
+        if session.drain != Drain::Pending
+            || !session.capture.streaming
+            || !session.output.queued.is_empty()
+        {
+            return;
+        }
+        let Some(cap_idx) = session.capture.queued.pop_front() else {
+            return;
+        };
+        let cap = &mut session.capture.buffers[cap_idx];
+        cap.unqueue();
+        *cap.v4l2_buffer.get_first_plane_mut().bytesused = 0;
+        cap.v4l2_buffer.set_sequence(session.capture.sequence);
+        session.capture.sequence = session.capture.sequence.wrapping_add(1);
+        cap.v4l2_buffer.add_flags(BufferFlags::TIMESTAMP_COPY | BufferFlags::LAST);
+        let cap_event = cap.v4l2_buffer.clone();
+        session.drain = Drain::Done;
+        self.evt_queue.send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
+            session.id, cap_event,
+        )));
     }
 
     /// Validate `format` for `queue` and return what the device would actually use, together
@@ -596,6 +654,7 @@ where
             output: Default::default(),
             capture: Default::default(),
             colors: ColorSpec::default_for(FrameFormat::default().pixelformat),
+            drain: Drain::None,
         })
     }
 
@@ -659,6 +718,46 @@ where
     fn process_events(&mut self, _session: &mut Self::Session) -> Result<(), i32> {
         Ok(())
     }
+}
+
+/// `START` and `STOP` with their payload reduced to what this device implements.
+///
+/// A `TRY_` ioctl must return the command it *would* run, so unknown flags and the `start` speed
+/// and format -- none of which a byte-for-byte copy can honour -- are cleared rather than
+/// refused. `PAUSE` and `RESUME` are `EINVAL`: there is nothing to pause between two ioctls.
+fn normalize_decoder_cmd(cmd: v4l2_decoder_cmd) -> IoctlResult<v4l2_decoder_cmd> {
+    let anon = match cmd.cmd {
+        bindings::V4L2_DEC_CMD_STOP => bindings::v4l2_decoder_cmd__bindgen_ty_1 {
+            stop: bindings::v4l2_decoder_cmd__bindgen_ty_1__bindgen_ty_1 { pts: 0 },
+        },
+        bindings::V4L2_DEC_CMD_START => bindings::v4l2_decoder_cmd__bindgen_ty_1 {
+            start: bindings::v4l2_decoder_cmd__bindgen_ty_1__bindgen_ty_2 {
+                speed: 0,
+                format: 0,
+            },
+        },
+        _ => return Err(libc::EINVAL),
+    };
+    Ok(v4l2_decoder_cmd {
+        cmd: cmd.cmd,
+        flags: 0,
+        __bindgen_anon_1: anon,
+    })
+}
+
+/// As [`normalize_decoder_cmd`], for `v4l2_encoder_cmd`.
+fn normalize_encoder_cmd(cmd: v4l2_encoder_cmd) -> IoctlResult<v4l2_encoder_cmd> {
+    match cmd.cmd {
+        bindings::V4L2_ENC_CMD_STOP | bindings::V4L2_ENC_CMD_START => (),
+        _ => return Err(libc::EINVAL),
+    }
+    Ok(v4l2_encoder_cmd {
+        cmd: cmd.cmd,
+        flags: 0,
+        __bindgen_anon_1: bindings::v4l2_encoder_cmd__bindgen_ty_1 {
+            raw: bindings::v4l2_encoder_cmd__bindgen_ty_1__bindgen_ty_1 { data: [0; 8] },
+        },
+    })
 }
 
 impl<Q, M, HM, A> VirtioMediaIoctlHandler for LoopbackDevice<Q, M, HM, A>
@@ -771,6 +870,8 @@ where
         if queue.streaming {
             return Err(libc::EBUSY);
         }
+        session.drain = Drain::None;
+        let queue = session.queue_mut(queue_type)?;
 
         // Old buffers go first, mappings and all, so the reply never races a stale view.
         self.free_buffers(queue);
@@ -1063,6 +1164,9 @@ where
     }
 
     fn streamoff(&mut self, session: &mut Self::Session, queue_type: QueueType) -> IoctlResult<()> {
+        // `STREAMOFF` ends a drain: the `LAST` buffer and the `EPIPE` that follows it are the
+        // state a restart clears (V4L2 decoder drain sequence).
+        session.drain = Drain::None;
         let queue = session.queue_mut(queue_type)?;
         queue.streaming = false;
         queue.queued.clear();
@@ -1072,6 +1176,71 @@ where
             buffer.unqueue();
         }
         Ok(())
+    }
+
+    /// `VIDIOC_TRY_DECODER_CMD`: `START` and `STOP` only, with every flag this device does not
+    /// act on cleared -- which is what a `TRY` is for.
+    fn try_decoder_cmd(
+        &mut self,
+        _session: &Self::Session,
+        cmd: v4l2_decoder_cmd,
+    ) -> IoctlResult<v4l2_decoder_cmd> {
+        normalize_decoder_cmd(cmd)
+    }
+
+    /// `VIDIOC_DECODER_CMD`: the drain half of the stateful codec interface.
+    ///
+    /// `v4l2-ctl --stream-out-mmap` ends every m2m run with `STOP` and then waits for a CAPTURE
+    /// buffer flagged `V4L2_BUF_FLAG_LAST`; without one it waits forever (defect D5). What this
+    /// device owes at that point is at most the OUTPUT buffers still queued, so `STOP` either
+    /// finishes right away with an empty `LAST` buffer or flags the buffer that consumes the
+    /// last input. `START` puts the queue back in the running state.
+    fn decoder_cmd(
+        &mut self,
+        session: &mut Self::Session,
+        cmd: v4l2_decoder_cmd,
+    ) -> IoctlResult<v4l2_decoder_cmd> {
+        let cmd = normalize_decoder_cmd(cmd)?;
+        match cmd.cmd {
+            bindings::V4L2_DEC_CMD_STOP => {
+                if session.drain == Drain::None {
+                    session.drain = Drain::Pending;
+                }
+                self.process(session);
+            }
+            bindings::V4L2_DEC_CMD_START => session.drain = Drain::None,
+            _ => return Err(libc::EINVAL),
+        }
+        Ok(cmd)
+    }
+
+    /// `VIDIOC_TRY_ENCODER_CMD`: as [`Self::try_decoder_cmd`], with the encoder's own flags.
+    fn try_encoder_cmd(
+        &mut self,
+        _session: &Self::Session,
+        cmd: v4l2_encoder_cmd,
+    ) -> IoctlResult<v4l2_encoder_cmd> {
+        normalize_encoder_cmd(cmd)
+    }
+
+    /// `VIDIOC_ENCODER_CMD`: the same drain, for a client that drives this device as an encoder.
+    fn encoder_cmd(
+        &mut self,
+        session: &mut Self::Session,
+        cmd: v4l2_encoder_cmd,
+    ) -> IoctlResult<v4l2_encoder_cmd> {
+        let cmd = normalize_encoder_cmd(cmd)?;
+        match cmd.cmd {
+            bindings::V4L2_ENC_CMD_STOP => {
+                if session.drain == Drain::None {
+                    session.drain = Drain::Pending;
+                }
+                self.process(session);
+            }
+            bindings::V4L2_ENC_CMD_START => session.drain = Drain::None,
+            _ => return Err(libc::EINVAL),
+        }
+        Ok(cmd)
     }
 
     /// This device never emits `EOS` or `SOURCE_CHANGE`, but a codec-shaped client subscribes
@@ -1970,5 +2139,196 @@ mod tests {
         close(&mut r.device, s);
     }
 
+    /// Queue `count` MMAP CAPTURE buffers and stream both queues.
+    fn streaming_rig(count: u32) -> (Rig, Session) {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let size = s.output.format.sizeimage();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::Mmap, 2)
+            .unwrap();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoCaptureMplane, MemoryType::Mmap, count)
+            .unwrap();
+        r.device
+            .streamon(&mut s, QueueType::VideoOutputMplane)
+            .unwrap();
+        r.device
+            .streamon(&mut s, QueueType::VideoCaptureMplane)
+            .unwrap();
+        for index in 0..count {
+            let cap = mmap_buffer(QueueType::VideoCaptureMplane, index, size);
+            r.device.qbuf(&mut s, cap, vec![], true).unwrap();
+        }
+        (r, s)
+    }
 
+    fn dec_stop() -> v4l2_decoder_cmd {
+        v4l2_decoder_cmd {
+            cmd: bindings::V4L2_DEC_CMD_STOP,
+            flags: !0,
+            __bindgen_anon_1: bindings::v4l2_decoder_cmd__bindgen_ty_1 {
+                stop: bindings::v4l2_decoder_cmd__bindgen_ty_1__bindgen_ty_1 { pts: !0 },
+            },
+        }
+    }
+
+    /// D5 -- `V4L2_DEC_CMD_STOP` with nothing queued on OUTPUT hands back an empty CAPTURE
+    /// buffer flagged `LAST`, which is the buffer `v4l2-ctl`'s drain waits for.
+    #[test]
+    fn dec_cmd_stop_with_nothing_pending_returns_an_empty_last_buffer() {
+        let (mut r, mut s) = streaming_rig(1);
+        assert!(dequeued(&r.events.borrow()).is_empty());
+
+        let reply = r.device.decoder_cmd(&mut s, dec_stop()).unwrap();
+        // A `TRY`/`CMD` reply carries only what the device implements.
+        assert_eq!(reply.cmd, bindings::V4L2_DEC_CMD_STOP);
+        assert_eq!(reply.flags, 0);
+
+        let events = dequeued(&r.events.borrow());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].queue(), QueueType::VideoCaptureMplane);
+        assert!(events[0].flags().contains(BufferFlags::LAST));
+        assert_eq!(*events[0].get_first_plane().bytesused, 0);
+
+        // The drain is over: a second STOP produces nothing more.
+        r.device.decoder_cmd(&mut s, dec_stop()).unwrap();
+        assert_eq!(dequeued(&r.events.borrow()).len(), 1);
+
+        // STREAMOFF/STREAMON starts a new one.
+        r.device
+            .streamoff(&mut s, QueueType::VideoCaptureMplane)
+            .unwrap();
+        r.device
+            .streamon(&mut s, QueueType::VideoCaptureMplane)
+            .unwrap();
+        let size = s.output.format.sizeimage();
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(QueueType::VideoCaptureMplane, 0, size),
+                vec![],
+                true,
+            )
+            .unwrap();
+        r.device.decoder_cmd(&mut s, dec_stop()).unwrap();
+        assert_eq!(dequeued(&r.events.borrow()).len(), 2);
+
+        close(&mut r.device, s);
+    }
+
+    /// D5 -- a drain that comes after every input has already been copied still returns one
+    /// `LAST` buffer, and does not retroactively flag the frame that was already handed back.
+    #[test]
+    fn dec_cmd_stop_after_a_completed_pair_returns_one_more_empty_buffer() {
+        let (mut r, mut s) = streaming_rig(2);
+        let size = s.output.format.sizeimage();
+
+        // One OUTPUT buffer queued: the pair is copied straight away, before any STOP.
+        let mut out = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
+        *out.get_first_plane_mut().bytesused = size;
+        r.device.qbuf(&mut s, out, vec![], true).unwrap();
+        let events = dequeued(&r.events.borrow());
+        assert_eq!(events.len(), 2, "one DQBUF per queue, no drain yet");
+        assert!(!events[1].flags().contains(BufferFlags::LAST));
+
+        // Now stop with the OUTPUT queue empty again: one more CAPTURE buffer is left, and it
+        // comes back empty and flagged.
+        r.device.decoder_cmd(&mut s, dec_stop()).unwrap();
+        let events = dequeued(&r.events.borrow());
+        assert_eq!(events.len(), 3);
+        assert!(events[2].flags().contains(BufferFlags::LAST));
+        assert_eq!(*events[2].get_first_plane().bytesused, 0);
+
+        close(&mut r.device, s);
+    }
+
+    /// D5 -- a `STOP` issued while an OUTPUT buffer is still waiting for a CAPTURE buffer flags
+    /// the buffer that finally carries its bytes.
+    #[test]
+    fn dec_cmd_stop_waits_for_the_pending_output_buffer() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let size = s.output.format.sizeimage();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::Mmap, 2)
+            .unwrap();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoCaptureMplane, MemoryType::Mmap, 2)
+            .unwrap();
+        r.device
+            .streamon(&mut s, QueueType::VideoOutputMplane)
+            .unwrap();
+        r.device
+            .streamon(&mut s, QueueType::VideoCaptureMplane)
+            .unwrap();
+
+        // OUTPUT queued with no CAPTURE buffer to copy into yet.
+        let mut out = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
+        *out.get_first_plane_mut().bytesused = size;
+        r.device.qbuf(&mut s, out, vec![], true).unwrap();
+        assert!(dequeued(&r.events.borrow()).is_empty());
+
+        // STOP now: nothing may be returned, the input is still owed a frame.
+        r.device.decoder_cmd(&mut s, dec_stop()).unwrap();
+        assert!(dequeued(&r.events.borrow()).is_empty());
+
+        // The CAPTURE buffer that completes it carries the data *and* the flag.
+        let cap = mmap_buffer(QueueType::VideoCaptureMplane, 0, size);
+        r.device.qbuf(&mut s, cap, vec![], true).unwrap();
+        let events = dequeued(&r.events.borrow());
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].queue(), QueueType::VideoCaptureMplane);
+        assert!(events[1].flags().contains(BufferFlags::LAST));
+        assert_eq!(*events[1].get_first_plane().bytesused, size);
+
+        close(&mut r.device, s);
+    }
+
+    /// The codec commands this device answers, and the ones it refuses.
+    #[test]
+    fn codec_cmds_are_start_and_stop_only() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        for cmd in [
+            bindings::V4L2_DEC_CMD_PAUSE,
+            bindings::V4L2_DEC_CMD_RESUME,
+            bindings::V4L2_DEC_CMD_FLUSH,
+            0xffff_ffff,
+        ] {
+            let mut dec = dec_stop();
+            dec.cmd = cmd;
+            assert_eq!(r.device.try_decoder_cmd(&s, dec).err(), Some(libc::EINVAL));
+            assert_eq!(r.device.decoder_cmd(&mut s, dec).err(), Some(libc::EINVAL));
+        }
+        // START clears every flag and the speed/format a copy cannot honour.
+        let mut dec = dec_stop();
+        dec.cmd = bindings::V4L2_DEC_CMD_START;
+        dec.__bindgen_anon_1 = bindings::v4l2_decoder_cmd__bindgen_ty_1 {
+            start: bindings::v4l2_decoder_cmd__bindgen_ty_1__bindgen_ty_2 {
+                speed: !0,
+                format: !0,
+            },
+        };
+        let reply = r.device.try_decoder_cmd(&s, dec).unwrap();
+        assert_eq!(reply.flags, 0);
+        // SAFETY: the command is START, so `start` is the live member.
+        let start = unsafe { reply.__bindgen_anon_1.start };
+        assert_eq!((start.speed, start.format), (0, 0));
+
+        let enc = v4l2_encoder_cmd {
+            cmd: bindings::V4L2_ENC_CMD_STOP,
+            flags: !0,
+            __bindgen_anon_1: bindings::v4l2_encoder_cmd__bindgen_ty_1 {
+                raw: bindings::v4l2_encoder_cmd__bindgen_ty_1__bindgen_ty_1 { data: [!0; 8] },
+            },
+        };
+        assert_eq!(r.device.try_encoder_cmd(&s, enc).unwrap().flags, 0);
+        let mut bad = enc;
+        bad.cmd = 0xffff_ffff;
+        assert_eq!(r.device.try_encoder_cmd(&s, bad).err(), Some(libc::EINVAL));
+        assert_eq!(r.device.encoder_cmd(&mut s, bad).err(), Some(libc::EINVAL));
+
+        close(&mut r.device, s);
+    }
 }

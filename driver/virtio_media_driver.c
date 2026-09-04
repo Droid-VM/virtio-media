@@ -677,11 +677,22 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 		else if (!list_empty(&capture_queue->pending_dqbufs))
 			rc |= EPOLLIN | EPOLLRDNORM;
 	}
+	/*
+	 * EPOLLOUT on an OUTPUT queue means a buffer is ready to be *dequeued*,
+	 * not that a free slot is ready to be queued into: vb2_core_poll()
+	 * reports a free slot only for queues that emulate write() (VB2_WRITE),
+	 * which virtio-media does not offer. Reporting a free slot invited a
+	 * blocking DQBUF that could never complete (defect D10, B3 acceptance
+	 * §5.3). Mirror vb2: not streaming or no buffers -> EPOLLERR, otherwise
+	 * EPOLLOUT only for a buffer waiting in @pending_dqbufs (vb2's
+	 * @done_list); vb2's waiting_for_buffers quirk is capture-only, so an
+	 * idle-but-streaming OUTPUT queue reports nothing at all.
+	 */
 	if (req_events & (EPOLLOUT | EPOLLWRNORM)) {
-		if (!output_queue->streaming)
+		if (!output_queue->streaming ||
+		    output_queue->allocated_bufs == 0)
 			rc |= EPOLLERR;
-		else if (output_queue->queued_bufs <
-			 output_queue->allocated_bufs)
+		else if (!list_empty(&output_queue->pending_dqbufs))
 			rc |= EPOLLOUT | EPOLLWRNORM;
 	}
 	mutex_unlock(&session->dqbufs_lock);

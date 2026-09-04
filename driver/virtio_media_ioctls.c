@@ -1649,7 +1649,19 @@ const struct v4l2_ioctl_ops virtio_media_ioctl_ops = {
 	.vidioc_decoder_cmd = virtio_media_decoder_cmd,
 	.vidioc_try_decoder_cmd = virtio_media_try_decoder_cmd,
 
-	/* Stream type-dependent parameter ioctls */
+	/*
+	 * Stream type-dependent parameter ioctls.
+	 *
+	 * v4l2-compliance fails these on an m2m device that is not a stateful
+	 * encoder (v4l2-test-formats.cpp:1445; defect D6.4 of the B3
+	 * acceptance run): a non-encoder m2m driver must not offer G/S_PARM at
+	 * all, i.e. the video device would have to v4l2_disable_ioctl() them.
+	 * Deferred by decision, not an oversight: this table is shared by every
+	 * virtio-media device, and the driver cannot tell an m2m decoder from a
+	 * camera or from a device that legitimately implements G/S_PARM until
+	 * the host says which ioctls its session supports. Revisit together
+	 * with the codec device, when that contract exists.
+	 */
 	.vidioc_g_parm = virtio_media_g_parm,
 	.vidioc_s_parm = virtio_media_s_parm,
 

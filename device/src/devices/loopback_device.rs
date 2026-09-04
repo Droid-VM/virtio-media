@@ -930,6 +930,28 @@ where
         if asked < wanted.sizeimage() {
             return Err(libc::EINVAL);
         }
+        // The queue's *current* format is a second floor, and the one `v4l2-compliance` tests
+        // (D9): `testMmap` halves the height and the `sizeimage` together
+        // (`v4l2-test-buffers.cpp:1653-1663`) and requires `EINVAL` both with buffers allocated
+        // and with none. Checking only `wanted` misses it, because `adjust_format` re-derives
+        // `wanted` from the *requested* dimensions on the OUTPUT queue, so a halved `sizeimage`
+        // is exactly what a halved height asks for. A buffer set smaller than the format the
+        // queue would stream with is of no use to anyone, so it is refused whatever the request
+        // says.
+        let current = session.queue(queue_type)?.format;
+        if asked < current.sizeimage() {
+            return Err(libc::EINVAL);
+        }
+        // While buffers exist they were sized and shaped for `current` (`S_FMT` answers `EBUSY`
+        // for the same reason), so a set in a different geometry may not join them; without
+        // buffers the queue is free to take a larger one. On CAPTURE `wanted` always carries the
+        // OUTPUT geometry, which `s_fmt` keeps `capture.format` equal to, so this is in practice
+        // an OUTPUT rule.
+        if !session.queue(queue_type)?.buffers.is_empty()
+            && (wanted.width != current.width || wanted.height != current.height)
+        {
+            return Err(libc::EINVAL);
+        }
         let queue = session.queue_mut(queue_type)?;
         // One memory type per queue.
         if let Some(existing) = queue.memory {
@@ -940,9 +962,9 @@ where
 
         let first = queue.buffers.len();
         let count = (count as usize).min(MAX_BUFFERS - first);
-        // What the guest asked for, but never less than the queue's own format needs, so the
-        // buffer stays usable after a `CREATE_BUFS` for a smaller format.
-        let sizeimage = asked.max(queue.format.sizeimage());
+        // What the guest asked for; the checks above already put it at or above both the
+        // requested format's and the queue's own `sizeimage`.
+        let sizeimage = asked;
         if count > 0 {
             self.add_buffers(queue, queue_type, memory, count, sizeimage)?;
             queue.memory = Some(memory);
@@ -2070,6 +2092,107 @@ mod tests {
             panic!()
         };
         assert!(buffer.len >= asked as u64);
+
+        close(&mut r.device, s);
+    }
+
+    /// D9 -- `CREATE_BUFS` for a format halved in both height and `sizeimage` is refused on
+    /// either queue, with buffers allocated and without.
+    ///
+    /// `v4l2-compliance`'s `testMmap` (`v4l2-test-buffers.cpp:1653-1663`) takes `G_FMT`, halves
+    /// the height and every plane's `sizeimage`, and requires `EINVAL` twice: once with the
+    /// queue's buffers allocated and once after `REQBUFS(0)`. Halving the height halves the
+    /// `sizeimage` the *requested* format needs, so only the queue's own format catches it.
+    #[test]
+    fn create_bufs_refuses_a_format_halved_in_height_and_size() {
+        for queue in [QueueType::VideoOutputMplane, QueueType::VideoCaptureMplane] {
+            let mut r = rig();
+            let mut s = session(&mut r.device);
+            r.device
+                .reqbufs(&mut s, queue, MemoryType::Mmap, 2)
+                .unwrap();
+
+            let cur = r.device.g_fmt(&s, queue).unwrap();
+            // SAFETY: both queue types are multi-planar, so `pix_mp` is the live member.
+            let cur_mp = unsafe { cur.fmt.pix_mp };
+            let full = sizeimage(&cur);
+            let halved = format(
+                queue,
+                PixelFormat::from_u32(cur_mp.pixelformat),
+                cur_mp.width,
+                cur_mp.height / 2,
+            );
+            // What made this slip through: the halved format asks for exactly half the bytes.
+            assert_eq!(sizeimage(&halved), full / 2);
+
+            // With buffers...
+            assert_eq!(
+                r.device
+                    .create_bufs(&mut s, 1, queue, MemoryType::Mmap, halved)
+                    .err(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(s.queue(queue).unwrap().buffers.len(), 2);
+            // ...and without.
+            r.device
+                .reqbufs(&mut s, queue, MemoryType::Mmap, 0)
+                .unwrap();
+            assert_eq!(
+                r.device
+                    .create_bufs(&mut s, 1, queue, MemoryType::Mmap, halved)
+                    .err(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(s.queue(queue).unwrap().buffers.len(), 0);
+
+            // A larger buffer set is still legitimate, and gets the size it asked for.
+            r.device
+                .reqbufs(&mut s, queue, MemoryType::Mmap, 2)
+                .unwrap();
+            let mut bigger = cur;
+            // SAFETY: multi-planar, so `pix_mp` is the live member.
+            unsafe { bigger.fmt.pix_mp.plane_fmt[0].sizeimage = full * 2 };
+            let reply = r
+                .device
+                .create_bufs(&mut s, 1, queue, MemoryType::Mmap, bigger)
+                .unwrap();
+            assert_eq!((reply.index, reply.count), (2, 1));
+            assert_eq!(sizeimage(&reply.format), full * 2);
+            let Backing::Host { buffer, .. } = &s.queue(queue).unwrap().buffers[2].backing else {
+                panic!()
+            };
+            assert!(buffer.len >= (full * 2) as u64);
+
+            close(&mut r.device, s);
+        }
+    }
+
+    /// D9 -- a taller format may not join buffers sized for the current one, but is fine once
+    /// they are gone. OUTPUT only: `adjust_format` gives a CAPTURE request the OUTPUT geometry,
+    /// which is what `capture.format` already carries.
+    #[test]
+    fn create_bufs_refuses_a_different_geometry_while_buffers_exist() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let queue = QueueType::VideoOutputMplane;
+        let taller = format(queue, NV12, 640, 960);
+        r.device
+            .reqbufs(&mut s, queue, MemoryType::Mmap, 1)
+            .unwrap();
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 1, queue, MemoryType::Mmap, taller)
+                .err(),
+            Some(libc::EINVAL)
+        );
+        r.device
+            .reqbufs(&mut s, queue, MemoryType::Mmap, 0)
+            .unwrap();
+        let reply = r
+            .device
+            .create_bufs(&mut s, 1, queue, MemoryType::Mmap, taller)
+            .unwrap();
+        assert_eq!(sizeimage(&reply.format), sizeimage(&taller));
 
         close(&mut r.device, s);
     }

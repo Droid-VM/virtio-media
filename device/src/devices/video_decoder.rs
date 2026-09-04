@@ -1204,6 +1204,12 @@ where
         if buffer.memory() != host_buffer.v4l2_buffer.memory() {
             return Err(libc::EINVAL);
         }
+        // A guest-supplied MPLANE buffer may carry no plane at all (v4l2r only refuses
+        // `length >= VIDEO_MAX_PLANES`), so the guest's first plane is asked for rather than
+        // assumed: `get_first_plane()` would panic on it.
+        if buffer.planes_iter().next().is_none() {
+            return Err(libc::EINVAL);
+        }
 
         match buffer.queue().direction() {
             QueueDirection::Output => {

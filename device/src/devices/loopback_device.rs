@@ -182,6 +182,12 @@ struct Buffer<GM> {
     backing: Backing<GM>,
     /// Queued and not yet returned.
     queued: bool,
+    /// Bytes this buffer was created for: the `sizeimage` `REQBUFS`/`CREATE_BUFS` sized it with.
+    ///
+    /// It is the ceiling a guest-owned (`USERPTR`) buffer's `length` is held to at `QBUF`, and it
+    /// never changes afterwards -- unlike the plane `length` of a `Backing::Guest` buffer, which
+    /// is replaced by the guest's own number on every `QBUF`.
+    size: u32,
 }
 
 impl<GM: GuestMemoryRange> Buffer<GM> {
@@ -399,6 +405,7 @@ where
                 v4l2_buffer,
                 backing,
                 queued: false,
+                size: sizeimage,
             });
         }
 
@@ -802,8 +809,13 @@ where
             return Err(libc::EINVAL);
         }
 
-        let guest_plane = buffer.get_first_plane();
+        // A guest-supplied MPLANE buffer may legitimately carry no plane at all -- v4l2r only
+        // refuses `length >= VIDEO_MAX_PLANES` -- so the first plane is asked for, never assumed
+        // (`get_first_plane()` would panic, and this VMM is built with `panic = 'abort'`).
+        let guest_plane = buffer.planes_iter().next().ok_or(libc::EINVAL)?;
         let (guest_bytesused, guest_length) = (*guest_plane.bytesused, *guest_plane.length);
+        // What this buffer was sized for at REQBUFS/CREATE_BUFS time.
+        let max_length = entry.size;
 
         match &mut entry.backing {
             Backing::Host { .. } => {
@@ -816,7 +828,10 @@ where
                 };
             }
             Backing::Guest(slot) => {
-                if guest_length == 0 {
+                // `length` is entirely the guest's number and decides both how much guest memory
+                // is mapped and how many bytes `process()` copies synchronously on the device
+                // thread; hold it to the size the queue allocated the buffer for.
+                if guest_length == 0 || guest_length > max_length {
                     return Err(libc::EINVAL);
                 }
                 let sgs = guest_regions.into_iter().next().ok_or(libc::EINVAL)?;
@@ -832,7 +847,7 @@ where
                 v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
                 *v4l2_buffer.get_first_plane_mut().bytesused =
                     if direction == QueueDirection::Output {
-                        guest_bytesused
+                        guest_bytesused.min(guest_length)
                     } else {
                         0
                     };
@@ -915,6 +930,8 @@ where
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    use v4l2r::ioctl::UncheckedV4l2Buffer;
 
     use super::*;
     use crate::MemFdAllocator;
@@ -1430,6 +1447,84 @@ mod tests {
             .reqbufs(&mut other, QueueType::VideoOutputMplane, MemoryType::Mmap, 1)
             .unwrap();
         close(&mut r.device, other);
+    }
+
+    /// A guest can send an MPLANE `v4l2_buffer` that carries no plane at all: v4l2r only refuses
+    /// `length >= VIDEO_MAX_PLANES`, so `QBUF` sees a buffer whose `planes_iter()` is empty.
+    /// Reading its first plane used to panic, and this VMM aborts on panic -- the whole VM died
+    /// with it. The device must answer `EINVAL` and keep working.
+    #[test]
+    fn qbuf_of_a_planeless_mplane_buffer_is_refused() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let size = s.output.format.sizeimage();
+
+        r.device
+            .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::UserPtr, 2)
+            .unwrap();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoCaptureMplane, MemoryType::Mmap, 1)
+            .unwrap();
+        r.device.streamon(&mut s, QueueType::VideoOutputMplane).unwrap();
+        r.device.streamon(&mut s, QueueType::VideoCaptureMplane).unwrap();
+
+        // `length == 0` means "no plane" for a multi-planar buffer, and that is what the guest
+        // driver forwards unchanged.
+        let mut raw = UncheckedV4l2Buffer::new_for_querybuf(QueueType::VideoOutputMplane, Some(0));
+        raw.0.memory = MemoryType::UserPtr as u32;
+        raw.0.length = 0;
+        let planeless = V4l2Buffer::try_from(raw).expect("v4l2r accepts a zero-plane buffer");
+        assert_eq!(planeless.planes_iter().count(), 0);
+
+        assert_eq!(
+            r.device.qbuf(&mut s, planeless, vec![]).err(),
+            Some(libc::EINVAL)
+        );
+        assert!(r.events.borrow().is_empty(), "nothing was dequeued");
+        assert_eq!(*r.guest.live_mappings.borrow(), 0);
+
+        // The device is still usable afterwards: a well-formed pair goes through.
+        let gpa = 4 * 0x1000u64;
+        let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
+        let cap = mmap_buffer(QueueType::VideoCaptureMplane, 0, size);
+        r.device.qbuf(&mut s, cap, vec![]).unwrap();
+        r.device.qbuf(&mut s, out, sgs).unwrap();
+        assert_eq!(dequeued(&r.events.borrow()).len(), 2);
+
+        close(&mut r.device, s);
+    }
+
+    /// The `length` of a `USERPTR` plane is the guest's own number and bounds both the mapping
+    /// and the synchronous copy `process()` does; a buffer larger than what the queue was sized
+    /// for is refused rather than mapped.
+    #[test]
+    fn userptr_length_is_bounded_by_the_queue_format() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let fmt = format(QueueType::VideoOutputMplane, RGB3, 64, 64);
+        r.device.s_fmt(&mut s, QueueType::VideoOutputMplane, fmt).unwrap();
+        let size = sizeimage(&fmt);
+
+        r.device
+            .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::UserPtr, 1)
+            .unwrap();
+
+        let gpa = 4 * 0x1000u64;
+        let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size + 1);
+        assert_eq!(r.device.qbuf(&mut s, out, sgs).err(), Some(libc::EINVAL));
+        assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
+
+        // Zero-length is refused too, and exactly `sizeimage` is accepted.
+        let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, 0);
+        assert_eq!(r.device.qbuf(&mut s, out, sgs).err(), Some(libc::EINVAL));
+        let (mut out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
+        // `bytesused` beyond the plane's own length is clamped to it, never trusted.
+        *out.get_first_plane_mut().bytesused = size;
+        let reply = r.device.qbuf(&mut s, out, sgs).unwrap();
+        assert_eq!(*reply.get_first_plane().bytesused, size);
+        assert_eq!(*r.guest.live_mappings.borrow(), 1);
+
+        close(&mut r.device, s);
     }
 
     #[test]

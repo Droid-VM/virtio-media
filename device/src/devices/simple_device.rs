@@ -598,11 +598,17 @@ where
         }
 
         if let Backing::Guest(slot) = &mut host_buffer.backing {
-            // A guest-owned buffer: the guest's pages must hold a whole frame.
-            let length = *buffer.get_first_plane().length;
+            // A guest-owned buffer: the guest's pages must hold a whole frame, and no more than
+            // one. `length` is the guest's own number and decides how much guest memory is
+            // mapped, so it is held to the queue format's `sizeimage` in both directions.
+            // The buffer's queue is `VIDEO_CAPTURE` (checked above), which is single-planar and
+            // so always has exactly one plane, but the plane is still asked for rather than
+            // assumed -- `get_first_plane()` panics on a plane-less multi-planar buffer, which a
+            // guest can build.
+            let length = *buffer.planes_iter().next().ok_or(libc::EINVAL)?.length;
             let sgs = guest_regions.into_iter().next().ok_or(libc::EINVAL)?;
             let covered: u64 = sgs.iter().map(|sg| sg.len as u64).sum();
-            if length < BUFFER_SIZE || covered < BUFFER_SIZE as u64 {
+            if length != BUFFER_SIZE || covered < BUFFER_SIZE as u64 {
                 return Err(libc::EINVAL);
             }
             let mapping = self.mem.new_mapping(sgs).map_err(|e| {

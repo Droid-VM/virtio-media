@@ -58,6 +58,10 @@ struct virtio_media_buffer {
  * @pending_dqbufs: Buffers that are available for being dequeued.
  * @driver_owned: the buffers user-space requested as MMAP are allocated by
  *	the driver and presented to the host as USERPTR (VPU_DESIGN.md 2.1).
+ * @memory: the V4L2_MEMORY_* type user-space set the queue up with, valid
+ *	while @allocated_bufs is non-zero. Buffer ioctls must name it; it is
+ *	not always what the host sees, which is USERPTR whenever
+ *	@driver_owned.
  */
 struct virtio_media_queue_state {
 	bool streaming;
@@ -68,6 +72,7 @@ struct virtio_media_queue_state {
 	size_t queued_bufs;
 	struct list_head pending_dqbufs;
 	bool driver_owned;
+	u32 memory;
 };
 
 /**

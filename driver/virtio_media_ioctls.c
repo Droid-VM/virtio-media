@@ -6,6 +6,7 @@
  * Copyright (c) 2023-2024 Google LLC.
  */
 
+#include <linux/overflow.h>
 #include <linux/virtio_config.h>
 #include <linux/vmalloc.h>
 #include <media/v4l2-event.h>
@@ -757,20 +758,26 @@ static bool virtio_media_host_mmap_available(struct virtio_media *vv)
 static bool virtio_media_type_is_driver_owned(u32 type)
 {
 	const char *mode = driver_owned_queues;
+	bool wanted;
 
-	if (!vmedia_dbuf_type_supported(type))
+	/*
+	 * driver_owned_queues_set() rejects anything else, so an unexpected
+	 * value can only be a NULL default; treat it as "output".
+	 */
+	if (mode && sysfs_streq(mode, "all"))
+		wanted = true;
+	else if (mode && sysfs_streq(mode, "none"))
+		wanted = false;
+	else
+		wanted = V4L2_TYPE_IS_OUTPUT(type);
+
+	if (wanted && !vmedia_dbuf_type_supported(type)) {
+		pr_info_once("virtio-media: queue type %u carries no buffer size in its format (VBI/overlay), its MMAP buffers stay host-owned\n",
+			     type);
 		return false;
+	}
 
-	if (!mode || sysfs_streq(mode, "output"))
-		return V4L2_TYPE_IS_OUTPUT(type);
-	if (sysfs_streq(mode, "all"))
-		return true;
-	if (sysfs_streq(mode, "none"))
-		return false;
-
-	pr_warn_once("virtio-media: unknown driver_owned_queues=\"%s\", behaving as \"output\"\n",
-		     mode);
-	return V4L2_TYPE_IS_OUTPUT(type);
+	return wanted;
 }
 
 /**
@@ -795,15 +802,64 @@ static int virtio_media_queue_plane_sizes(struct v4l2_fh *fh, u32 type,
 
 /**
  * The reply of a REQBUFS/CREATE_BUFS that went out as USERPTR on behalf of
- * driver-owned MMAP buffers: user-space asked for MMAP and gets MMAP, and the
- * capabilities say what this driver serves on the queue.
+ * driver-owned MMAP buffers: user-space gets @user_memory back, the value it
+ * asked with, and the capabilities say what this driver serves on the queue.
+ *
+ * @user_memory is not always MMAP: a REQBUFS(0) that tears such a queue down
+ * has to name the type the host holds (USERPTR), whatever user-space asked
+ * with. The capability rewrite only makes sense for the MMAP answer.
+ *
+ * ORPHANED_BUFS is true of driver-owned buffers: vmedia_dbuf keeps its memory
+ * for as long as a VMA maps it, so REQBUFS(0) with buffers still mapped
+ * succeeds instead of returning -EBUSY (VPU_DESIGN.md 2.5).
  */
 static void virtio_media_fixup_driver_owned_reply(u32 *memory,
-						  u32 *capabilities)
+						  u32 *capabilities,
+						  u32 user_memory)
 {
-	*memory = V4L2_MEMORY_MMAP;
-	*capabilities |= V4L2_BUF_CAP_SUPPORTS_MMAP;
+	*memory = user_memory;
+
+	if (user_memory != V4L2_MEMORY_MMAP)
+		return;
+
+	*capabilities |= V4L2_BUF_CAP_SUPPORTS_MMAP |
+			 V4L2_BUF_CAP_SUPPORTS_ORPHANED_BUFS;
 	*capabilities &= ~V4L2_BUF_CAP_SUPPORTS_USERPTR;
+}
+
+/**
+ * A buffer ioctl must name the memory type its queue was set up with. The
+ * driver-owned substitution means the host sees USERPTR on a queue user-space
+ * knows as MMAP, so the check cannot be made against what goes on the wire or
+ * against the presence of a dbuf: only the queue's recorded type says what
+ * user-space agreed to (review bug 4).
+ */
+static int virtio_media_check_buffer_memory(struct virtio_media_queue_state *queue,
+					    const struct v4l2_buffer *b)
+{
+	if (b->memory != queue->memory)
+		return -EINVAL;
+
+	return 0;
+}
+
+/**
+ * Drop everything the queue holds for its current buffers: the driver-owned
+ * backing (kept alive by any VMA still mapping it) and the buffer state array.
+ * Leaves the queue in the shape it has before its first REQBUFS.
+ *
+ * virtio_media_clear_queue() must run first when there may be queued or
+ * pending buffers: it walks the array this frees.
+ */
+static void
+virtio_media_release_queue_bufs(struct virtio_media_queue_state *queue)
+{
+	vmedia_queue_put_dbufs(queue);
+	vfree(queue->buffers);
+	queue->buffers = NULL;
+	queue->allocated_bufs = 0;
+	queue->driver_owned = false;
+	queue->memory = 0;
 }
 
 /* Bound on what the host may claim it allocated; vb2 itself stops at 1024. */
@@ -818,7 +874,9 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	struct virtio_media_queue_state *queue;
 	size_t sizes[VIDEO_MAX_PLANES];
 	u32 num_planes = 0;
+	const u32 user_memory = b->memory;
 	bool driver_owned = false;
+	bool as_userptr;
 	int ret;
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
@@ -832,7 +890,7 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	 * sizes come from the current format, fetched before anything on the
 	 * host changes so a failure here leaves both sides untouched.
 	 */
-	if (b->memory == V4L2_MEMORY_MMAP && b->count > 0) {
+	if (user_memory == V4L2_MEMORY_MMAP && b->count > 0) {
 		driver_owned = virtio_media_type_is_driver_owned(b->type);
 		if (driver_owned) {
 			ret = virtio_media_queue_plane_sizes(fh, b->type, sizes,
@@ -844,13 +902,23 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 		}
 	}
 
-	if (driver_owned)
+	/*
+	 * REQBUFS(0) frees whatever the queue holds, and the type it must name
+	 * is the one the host has: USERPTR for a queue whose MMAP buffers this
+	 * driver owns, whatever user-space passed. A backend that checks
+	 * q->memory (v4l2-proxy does) returns -EINVAL otherwise (review
+	 * contract 3).
+	 */
+	as_userptr = b->count > 0 ? driver_owned : queue->driver_owned;
+
+	if (as_userptr)
 		b->memory = V4L2_MEMORY_USERPTR;
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_REQBUFS, b, sizeof(*b),
 					 sizeof(*b));
-	if (driver_owned)
+	if (as_userptr)
 		virtio_media_fixup_driver_owned_reply(&b->memory,
-						      &b->capabilities);
+						      &b->capabilities,
+						      user_memory);
 	if (ret)
 		return ret;
 
@@ -871,11 +939,7 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	 * The host has answered, so it holds no mapping of the previous
 	 * buffers any more and their memory can go back (VPU_DESIGN.md 2.5).
 	 */
-	vmedia_queue_put_dbufs(queue);
-	vfree(queue->buffers);
-	queue->buffers = NULL;
-	queue->allocated_bufs = 0;
-	queue->driver_owned = false;
+	virtio_media_release_queue_bufs(queue);
 
 	if (b->count > 0) {
 		queue->buffers =
@@ -885,17 +949,14 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 			goto err_release_host;
 		}
 		queue->allocated_bufs = b->count;
+		queue->memory = user_memory;
 
 		if (driver_owned) {
 			ret = vmedia_queue_alloc_dbufs(vv, session, queue, 0,
 						       b->count, sizes,
 						       num_planes);
-			if (ret) {
-				vfree(queue->buffers);
-				queue->buffers = NULL;
-				queue->allocated_bufs = 0;
+			if (ret)
 				goto err_release_host;
-			}
 			queue->driver_owned = true;
 		}
 	}
@@ -916,20 +977,24 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 err_release_host:
 	/*
 	 * The host allocated buffers we cannot track: put it back to zero so
-	 * both sides agree, and report zero buffers.
+	 * both sides agree, and report zero buffers. Our own side has to go
+	 * away too -- whichever of the failures above we came from, the buffer
+	 * array and the dbufs it may still hold describe buffers the host no
+	 * longer has (review bug 3).
 	 */
 	{
 		struct v4l2_requestbuffers zero = {
 			.count = 0,
 			.type = b->type,
-			.memory = driver_owned ? V4L2_MEMORY_USERPTR :
-						 b->memory,
+			.memory = as_userptr ? V4L2_MEMORY_USERPTR :
+					       user_memory,
 		};
 
 		virtio_media_send_wr_ioctl(fh, VIDIOC_REQBUFS, &zero,
 					   sizeof(zero), sizeof(zero));
 	}
 	virtio_media_clear_queue(vv, session, queue);
+	virtio_media_release_queue_bufs(queue);
 	b->count = 0;
 	return ret;
 }
@@ -977,7 +1042,9 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	size_t sizes[VIDEO_MAX_PLANES];
 	u32 num_planes = 0;
 	u32 type = b->format.type;
+	const u32 user_memory = b->memory;
 	bool driver_owned = false;
+	u32 last_buf;
 	int ret;
 
 	if (type > VIRTIO_MEDIA_LAST_QUEUE)
@@ -988,13 +1055,16 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	/*
 	 * Same rule as REQBUFS, except that a queue that already has buffers
 	 * keeps whatever ownership they have: the host sees one memory type
-	 * per queue.
+	 * per queue. count == 0 is only a format probe, but it still has to
+	 * name the type the host holds on an existing queue (review
+	 * contract 3).
 	 */
-	if (b->memory == V4L2_MEMORY_MMAP && b->count > 0) {
+	if (user_memory == V4L2_MEMORY_MMAP) {
 		driver_owned = queue->allocated_bufs > 0 ?
 				       queue->driver_owned :
 				       virtio_media_type_is_driver_owned(type);
-		if (!driver_owned && !virtio_media_host_mmap_available(vv))
+		if (!driver_owned && b->count > 0 &&
+		    !virtio_media_host_mmap_available(vv))
 			return -ENOMEM;
 	}
 
@@ -1004,7 +1074,8 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 					 sizeof(*b));
 	if (driver_owned)
 		virtio_media_fixup_driver_owned_reply(&b->memory,
-						      &b->capabilities);
+						      &b->capabilities,
+						      user_memory);
 	if (ret)
 		return ret;
 
@@ -1012,8 +1083,14 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	if (b->count == 0)
 		return 0;
 
-	if (b->index != queue->allocated_bufs ||
-	    b->index + b->count > VIRTIO_MEDIA_MAX_BUFFERS) {
+	/*
+	 * The host's index and count are u32 and only the host's word for it:
+	 * add them with an overflow check before anything sizes an allocation
+	 * with the sum (review bug 3).
+	 */
+	if (check_add_overflow(b->index, b->count, &last_buf) ||
+	    b->index != queue->allocated_bufs ||
+	    last_buf > VIRTIO_MEDIA_MAX_BUFFERS) {
 		v4l2_err(&vv->v4l2_dev,
 			 "host created %u buffers at index %u, expected index %zu and at most %u buffers\n",
 			 b->count, b->index, queue->allocated_bufs,
@@ -1023,8 +1100,8 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 
 	buffers = queue->buffers;
 
-	queue->buffers = vzalloc(sizeof(struct virtio_media_buffer) *
-				 (b->index + b->count));
+	queue->buffers =
+		vzalloc(sizeof(struct virtio_media_buffer) * last_buf);
 	if (!queue->buffers) {
 		queue->buffers = buffers;
 		return -ENOMEM;
@@ -1034,7 +1111,8 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	       sizeof(*buffers) * queue->allocated_bufs);
 	vfree(buffers);
 
-	queue->allocated_bufs = b->index + b->count;
+	queue->allocated_bufs = last_buf;
+	queue->memory = user_memory;
 
 	if (driver_owned) {
 		/* The host may have adjusted the format; size from its reply. */
@@ -1073,6 +1151,9 @@ static int virtio_media_prepare_buf(struct file *file, void *fh,
 	queue = &session->queues[b->type];
 	if (b->index >= queue->allocated_bufs)
 		return -EINVAL;
+	ret = virtio_media_check_buffer_memory(queue, b);
+	if (ret)
+		return ret;
 	buffer = &queue->buffers[b->index];
 
 	buffer->buffer.m = b->m;
@@ -1106,6 +1187,9 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	queue = &session->queues[b->type];
 	if (b->index >= queue->allocated_bufs)
 		return -EINVAL;
+	ret = virtio_media_check_buffer_memory(queue, b);
+	if (ret)
+		return ret;
 	buffer = &queue->buffers[b->index];
 	prepared = buffer->buffer.flags & V4L2_BUF_FLAG_PREPARED;
 

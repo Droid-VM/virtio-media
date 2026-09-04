@@ -65,7 +65,33 @@ module_param(driver_name, charp, 0660);
  * comparison. Evaluated at REQBUFS/CREATE_BUFS time.
  */
 char *driver_owned_queues = "output";
-module_param(driver_owned_queues, charp, 0660);
+
+/*
+ * Only the three values above are accepted, at insmod time and through sysfs:
+ * a typo used to be logged once and silently behave as "output", which made a
+ * mistyped A/B comparison look like a driver bug (review nit on WP G1).
+ */
+static int driver_owned_queues_set(const char *val,
+				   const struct kernel_param *kp)
+{
+	if (!val)
+		return -EINVAL;
+
+	if (!sysfs_streq(val, "output") && !sysfs_streq(val, "all") &&
+	    !sysfs_streq(val, "none"))
+		return -EINVAL;
+
+	return param_set_charp(val, kp);
+}
+
+static const struct kernel_param_ops driver_owned_queues_ops = {
+	.set = driver_owned_queues_set,
+	.get = param_get_charp,
+	.free = param_free_charp,
+};
+
+module_param_cb(driver_owned_queues, &driver_owned_queues_ops,
+		&driver_owned_queues, 0660);
 MODULE_PARM_DESC(driver_owned_queues,
 		 "queues whose MMAP buffers the driver allocates: output (default), all, none");
 
@@ -828,10 +854,17 @@ static int virtio_media_device_mmap(struct file *file,
 	map->driver_addr = driver_addr;
 	refcount_set(&map->vmas, 1);
 
-	/* Guest PFN of the mapping: host offset relative to the MMAP region. */
-	vma->vm_pgoff = (driver_addr + vv->mmap_region.addr) >> PAGE_SHIFT;
-
-	ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+	/*
+	 * Guest PFN of the mapping: host offset relative to the MMAP region.
+	 * vm_pgoff keeps the cookie user-space passed to mmap() -- that is
+	 * what /proc/self/maps and mremap() show, and MUNMAP uses
+	 * map->driver_addr, so nothing needs the PFN to be stored there.
+	 * remap_pfn_range() only rewrites vm_pgoff for COW mappings, and this
+	 * one is VM_SHARED.
+	 */
+	ret = io_remap_pfn_range(vma, vma->vm_start,
+				 (driver_addr + vv->mmap_region.addr) >>
+					 PAGE_SHIFT,
 				 vma->vm_end - vma->vm_start,
 				 vma->vm_page_prot);
 	if (ret) {

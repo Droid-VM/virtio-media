@@ -482,27 +482,53 @@ static void virtio_media_clear_queue(struct virtio_media *vv,
 
 /*
  * Macros suitable for defining ioctls with a constant size payload.
+ *
+ * Since Linux 6.18 the V4L2 core calls every driver op as
+ * `ops->vidioc_xxx(file, NULL, arg)`: all of the call sites in
+ * drivers/media/v4l2-core/v4l2-ioctl.c pass NULL for the `priv` argument,
+ * where 6.17 and earlier passed the file's `v4l2_fh`. A driver must now take
+ * its file handle from the file itself with `file_to_v4l2_fh(file)`, which is
+ * literally `file->private_data` (include/media/v4l2-fh.h). That is exactly
+ * what the core used to hand over, so deriving it here is correct on every
+ * kernel version, old and new. Every op below therefore ignores the `priv`
+ * argument -- it is named `priv_unused` so that a stray use fails to
+ * compile -- and derives `fh` from `file`.
  */
 
 #define SIMPLE_WR_IOCTL(name, ioctl, type)                            \
-	static int virtio_media_##name(struct file *file, void *fh,   \
+	static int virtio_media_##name(struct file *file,             \
+				       void *priv_unused,             \
 				       type *payload)                 \
 	{                                                             \
+		struct v4l2_fh *fh = file->private_data;              \
+                                                                      \
+		if (!fh)                                              \
+			return -ENODEV;                               \
 		return virtio_media_send_wr_ioctl(fh, ioctl, payload, \
 						  sizeof(*payload),   \
 						  sizeof(*payload));  \
 	}
 #define SIMPLE_R_IOCTL(name, ioctl, type)                            \
-	static int virtio_media_##name(struct file *file, void *fh,  \
+	static int virtio_media_##name(struct file *file,            \
+				       void *priv_unused,            \
 				       type *payload)                \
 	{                                                            \
+		struct v4l2_fh *fh = file->private_data;             \
+                                                                     \
+		if (!fh)                                             \
+			return -ENODEV;                              \
 		return virtio_media_send_r_ioctl(fh, ioctl, payload, \
 						 sizeof(*payload));  \
 	}
 #define SIMPLE_W_IOCTL(name, ioctl, type)                            \
-	static int virtio_media_##name(struct file *file, void *fh,  \
+	static int virtio_media_##name(struct file *file,            \
+				       void *priv_unused,            \
 				       type *payload)                \
 	{                                                            \
+		struct v4l2_fh *fh = file->private_data;             \
+                                                                     \
+		if (!fh)                                             \
+			return -ENODEV;                              \
 		return virtio_media_send_w_ioctl(fh, ioctl, payload, \
 						 sizeof(*payload));  \
 	}
@@ -578,7 +604,7 @@ SIMPLE_W_IOCTL(s_hw_freq_seek, VIDIOC_S_HW_FREQ_SEEK,
  *
  */
 
-static int virtio_media_querycap(struct file *file, void *fh,
+static int virtio_media_querycap(struct file *file, void *priv_unused,
 				 struct v4l2_capability *cap)
 {
 	struct video_device *video_dev = video_devdata(file);
@@ -605,23 +631,38 @@ static int virtio_media_querycap(struct file *file, void *fh,
  * Extended control ioctls are handled mostly identically.
  */
 
-static int virtio_media_g_ext_ctrls(struct file *file, void *fh,
+static int virtio_media_g_ext_ctrls(struct file *file, void *priv_unused,
 				    struct v4l2_ext_controls *ctrls)
 {
+	struct v4l2_fh *fh = file->private_data;
+
+	if (!fh)
+		return -ENODEV;
+
 	return virtio_media_send_ext_controls_ioctl(fh, VIDIOC_G_EXT_CTRLS,
 						    ctrls);
 }
 
-static int virtio_media_s_ext_ctrls(struct file *file, void *fh,
+static int virtio_media_s_ext_ctrls(struct file *file, void *priv_unused,
 				    struct v4l2_ext_controls *ctrls)
 {
+	struct v4l2_fh *fh = file->private_data;
+
+	if (!fh)
+		return -ENODEV;
+
 	return virtio_media_send_ext_controls_ioctl(fh, VIDIOC_S_EXT_CTRLS,
 						    ctrls);
 }
 
-static int virtio_media_try_ext_ctrls(struct file *file, void *fh,
+static int virtio_media_try_ext_ctrls(struct file *file, void *priv_unused,
 				      struct v4l2_ext_controls *ctrls)
 {
+	struct v4l2_fh *fh = file->private_data;
+
+	if (!fh)
+		return -ENODEV;
+
 	return virtio_media_send_ext_controls_ioctl(fh, VIDIOC_TRY_EXT_CTRLS,
 						    ctrls);
 }
@@ -634,9 +675,19 @@ static int
 virtio_media_subscribe_event(struct v4l2_fh *fh,
 			     const struct v4l2_event_subscription *sub)
 {
-	struct video_device *video_dev = fh->vdev;
-	struct virtio_media *vv = to_virtio_media(video_dev);
+	struct video_device *video_dev;
+	struct virtio_media *vv;
 	int ret;
+
+	/*
+	 * v4l_subscribe_event() resolves the handle with file_to_v4l2_fh()
+	 * and hands it to us directly, so this is only a guard.
+	 */
+	if (!fh)
+		return -ENODEV;
+
+	video_dev = fh->vdev;
+	vv = to_virtio_media(video_dev);
 
 	/* First subscribe to the event in the guest. */
 	switch (sub->type) {
@@ -675,6 +726,9 @@ virtio_media_unsubscribe_event(struct v4l2_fh *fh,
 {
 	int ret;
 
+	if (!fh)
+		return -ENODEV;
+
 	ret = virtio_media_send_w_ioctl(fh, VIDIOC_UNSUBSCRIBE_EVENT, sub,
 					sizeof(*sub));
 	if (ret < 0)
@@ -691,11 +745,16 @@ virtio_media_unsubscribe_event(struct v4l2_fh *fh,
  * Streamon/off affect the local queue state.
  */
 
-static int virtio_media_streamon(struct file *file, void *fh,
+static int virtio_media_streamon(struct file *file, void *priv_unused,
 				 enum v4l2_buf_type i)
 {
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (i > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -709,13 +768,18 @@ static int virtio_media_streamon(struct file *file, void *fh,
 	return 0;
 }
 
-static int virtio_media_streamoff(struct file *file, void *fh,
+static int virtio_media_streamoff(struct file *file, void *priv_unused,
 				  enum v4l2_buf_type i)
 {
 	struct video_device *video_dev = video_devdata(file);
 	struct virtio_media *vv = to_virtio_media(video_dev);
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (i > VIRTIO_MEDIA_LAST_QUEUE) {
 		return -EINVAL;
@@ -865,12 +929,13 @@ virtio_media_release_queue_bufs(struct virtio_media_queue_state *queue)
 /* Bound on what the host may claim it allocated; vb2 itself stops at 1024. */
 #define VIRTIO_MEDIA_MAX_BUFFERS 1024
 
-static int virtio_media_reqbufs(struct file *file, void *fh,
+static int virtio_media_reqbufs(struct file *file, void *priv_unused,
 				struct v4l2_requestbuffers *b)
 {
 	struct video_device *video_dev = video_devdata(file);
 	struct virtio_media *vv = to_virtio_media(video_dev);
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	size_t sizes[VIDEO_MAX_PLANES];
 	u32 num_planes = 0;
@@ -878,6 +943,10 @@ static int virtio_media_reqbufs(struct file *file, void *fh,
 	bool driver_owned = false;
 	bool as_userptr;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -999,13 +1068,18 @@ err_release_host:
 	return ret;
 }
 
-static int virtio_media_querybuf(struct file *file, void *fh,
+static int virtio_media_querybuf(struct file *file, void *priv_unused,
 				 struct v4l2_buffer *b)
 {
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE) {
 		return -EINVAL;
@@ -1031,12 +1105,13 @@ static int virtio_media_querybuf(struct file *file, void *fh,
 	return 0;
 }
 
-static int virtio_media_create_bufs(struct file *file, void *fh,
+static int virtio_media_create_bufs(struct file *file, void *priv_unused,
 				    struct v4l2_create_buffers *b)
 {
 	struct video_device *video_dev = video_devdata(file);
 	struct virtio_media *vv = to_virtio_media(video_dev);
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffers;
 	size_t sizes[VIDEO_MAX_PLANES];
@@ -1046,6 +1121,10 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	bool driver_owned = false;
 	u32 last_buf;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -1138,13 +1217,18 @@ static int virtio_media_create_bufs(struct file *file, void *fh,
 	return 0;
 }
 
-static int virtio_media_prepare_buf(struct file *file, void *fh,
+static int virtio_media_prepare_buf(struct file *file, void *priv_unused,
 				    struct v4l2_buffer *b)
 {
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
 	int i, ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -1173,14 +1257,20 @@ static int virtio_media_prepare_buf(struct file *file, void *fh,
 	return 0;
 }
 
-static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
+static int virtio_media_qbuf(struct file *file, void *priv_unused,
+			     struct v4l2_buffer *b)
 {
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
 	bool prepared;
 	u32 old_flags;
 	int i, ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -1221,11 +1311,11 @@ static int virtio_media_qbuf(struct file *file, void *fh, struct v4l2_buffer *b)
 	return 0;
 }
 
-static int virtio_media_dqbuf(struct file *file, void *fh,
+static int virtio_media_dqbuf(struct file *file, void *priv_unused,
 			      struct v4l2_buffer *b)
 {
-	struct virtio_media_session *session =
-		fh_to_session(file->private_data);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	struct video_device *video_dev = video_devdata(file);
 	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_buffer *dqbuf;
@@ -1234,6 +1324,10 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	struct v4l2_plane *planes_backup = NULL;
 	const bool is_multiplanar = V4L2_TYPE_IS_MULTIPLANAR(b->type);
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -1302,10 +1396,15 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
  * size is unambiguous.
  */
 
-static int virtio_media_g_input(struct file *file, void *fh, unsigned int *i)
+static int virtio_media_g_input(struct file *file, void *priv_unused,
+				unsigned int *i)
 {
+	struct v4l2_fh *fh = file->private_data;
 	u32 input;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
 
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_G_INPUT, &input,
 					 sizeof(input), sizeof(input));
@@ -1317,18 +1416,28 @@ static int virtio_media_g_input(struct file *file, void *fh, unsigned int *i)
 	return 0;
 }
 
-static int virtio_media_s_input(struct file *file, void *fh, unsigned int i)
+static int virtio_media_s_input(struct file *file, void *priv_unused,
+				unsigned int i)
 {
+	struct v4l2_fh *fh = file->private_data;
 	u32 input = i;
+
+	if (!fh)
+		return -ENODEV;
 
 	return virtio_media_send_wr_ioctl(fh, VIDIOC_S_INPUT, &input,
 					  sizeof(input), sizeof(input));
 }
 
-static int virtio_media_g_output(struct file *file, void *fh, unsigned int *o)
+static int virtio_media_g_output(struct file *file, void *priv_unused,
+				 unsigned int *o)
 {
+	struct v4l2_fh *fh = file->private_data;
 	u32 output;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
 
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_G_OUTPUT, &output,
 					 sizeof(output), sizeof(output));
@@ -1340,9 +1449,14 @@ static int virtio_media_g_output(struct file *file, void *fh, unsigned int *o)
 	return 0;
 }
 
-static int virtio_media_s_output(struct file *file, void *fh, unsigned int o)
+static int virtio_media_s_output(struct file *file, void *priv_unused,
+				 unsigned int o)
 {
+	struct v4l2_fh *fh = file->private_data;
 	u32 output = o;
+
+	if (!fh)
+		return -ENODEV;
 
 	return virtio_media_send_wr_ioctl(fh, VIDIOC_S_OUTPUT, &output,
 					  sizeof(output), sizeof(output));
@@ -1352,11 +1466,16 @@ static int virtio_media_s_output(struct file *file, void *fh, unsigned int o)
  * decoder_cmd can affect the state of the CAPTURE queue.
  */
 
-static int virtio_media_decoder_cmd(struct file *file, void *fh,
+static int virtio_media_decoder_cmd(struct file *file, void *priv_unused,
 				    struct v4l2_decoder_cmd *cmd)
 {
-	struct virtio_media_session *session = fh_to_session(fh);
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
 
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_DECODER_CMD, cmd,
 					 sizeof(*cmd), sizeof(*cmd));
@@ -1378,9 +1497,14 @@ static int virtio_media_decoder_cmd(struct file *file, void *fh,
  * s_std doesn't work with a pointer, so we cannot use SIMPLE_W_IOCTL.
  */
 
-static int virtio_media_s_std(struct file *file, void *fh, v4l2_std_id s)
+static int virtio_media_s_std(struct file *file, void *priv_unused,
+			      v4l2_std_id s)
 {
+	struct v4l2_fh *fh = file->private_data;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
 
 	ret = virtio_media_send_w_ioctl(fh, VIDIOC_S_STD, &s, sizeof(s));
 	if (ret)
@@ -1569,16 +1693,20 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 {
 	struct video_device *video_dev = video_devdata(file);
 	struct virtio_media *vv = to_virtio_media(video_dev);
-	struct v4l2_fh *vfh = NULL;
+	struct v4l2_fh *vfh = file->private_data;
 	struct v4l2_standard standard;
 	v4l2_std_id std_id = 0;
 	int ret;
 
-	if (test_bit(V4L2_FL_USES_V4L2_FH, &video_dev->flags))
-		vfh = file->private_data;
+	/*
+	 * virtio_media_device_open() sets file->private_data (and so does
+	 * v4l2_fh_add()), so this only fires if the session went away.
+	 */
+	if (!vfh)
+		return -ENODEV;
 
 	/* The host closed this session after an error: nothing can go through. */
-	if (vfh && READ_ONCE(fh_to_session(vfh)->dead))
+	if (READ_ONCE(fh_to_session(vfh)->dead))
 		return -ENODEV;
 
 	mutex_lock(&vv->vlock);
@@ -1597,7 +1725,7 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 			ret = -EINVAL;
 			break;
 		}
-		ret = virtio_media_s_std(file, vfh, std_id);
+		ret = virtio_media_s_std(file, NULL, std_id);
 		break;
 	case VIDIOC_ENUMSTD:
 		ret = copy_from_user(&standard, (void __user *)arg,
@@ -1606,7 +1734,7 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 			ret = -EINVAL;
 			break;
 		}
-		ret = virtio_media_enumstd(file, vfh, &standard);
+		ret = virtio_media_enumstd(file, NULL, &standard);
 		if (ret)
 			break;
 		ret = copy_to_user((void __user *)arg, &standard,
@@ -1615,7 +1743,7 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 			ret = -EINVAL;
 		break;
 	case VIDIOC_QUERYSTD:
-		ret = virtio_media_querystd(file, vfh, &std_id);
+		ret = virtio_media_querystd(file, NULL, &std_id);
 		if (ret)
 			break;
 		ret = copy_to_user((void __user *)arg, &std_id, sizeof(std_id));

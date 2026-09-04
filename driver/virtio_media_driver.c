@@ -607,12 +607,17 @@ static int virtio_media_device_close(struct file *file)
 {
 	struct video_device *video_dev = video_devdata(file);
 	struct virtio_media *vv = to_virtio_media(video_dev);
-	struct virtio_media_session *session =
-		fh_to_session(file->private_data);
-	struct virtio_media_cmd_close *cmd_close = &session->cmd.close;
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
+	struct virtio_media_cmd_close *cmd_close;
 	struct scatterlist cmd_sg = {};
 	struct scatterlist *sgs[1] = { &cmd_sg };
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
+	cmd_close = &session->cmd.close;
 
 	mutex_lock(&vv->vlock);
 
@@ -637,20 +642,25 @@ static int virtio_media_device_close(struct file *file)
  */
 static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 {
-	struct virtio_media_session *session =
-		fh_to_session(file->private_data);
-	enum v4l2_buf_type capture_type =
-		session->uses_mplane ? V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
-				       V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	enum v4l2_buf_type output_type =
-		session->uses_mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE :
-				       V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	struct virtio_media_queue_state *capture_queue =
-		&session->queues[capture_type];
-	struct virtio_media_queue_state *output_queue =
-		&session->queues[output_type];
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
+	enum v4l2_buf_type capture_type;
+	enum v4l2_buf_type output_type;
+	struct virtio_media_queue_state *capture_queue;
+	struct virtio_media_queue_state *output_queue;
 	__poll_t req_events = poll_requested_events(wait);
 	__poll_t rc = 0;
+
+	if (!fh)
+		return EPOLLERR;
+	session = fh_to_session(fh);
+	capture_type = session->uses_mplane ?
+			       V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE :
+			       V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	output_type = session->uses_mplane ? V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE :
+					     V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	capture_queue = &session->queues[capture_type];
+	output_queue = &session->queues[output_type];
 
 	if (READ_ONCE(session->dead))
 		return EPOLLERR;
@@ -774,10 +784,10 @@ static int virtio_media_device_mmap(struct file *file,
 {
 	struct video_device *video_dev = video_devdata(file);
 	struct virtio_media *vv = to_virtio_media(video_dev);
-	struct virtio_media_session *session =
-		fh_to_session(file->private_data);
-	struct virtio_media_cmd_mmap *cmd_mmap = &session->cmd.mmap;
-	struct virtio_media_resp_mmap *resp_mmap = &session->resp.mmap;
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
+	struct virtio_media_cmd_mmap *cmd_mmap;
+	struct virtio_media_resp_mmap *resp_mmap;
 	struct scatterlist cmd_sg = {}, resp_sg = {};
 	struct scatterlist *sgs[2] = { &cmd_sg, &resp_sg };
 	struct virtio_media_hostmap *map;
@@ -785,6 +795,12 @@ static int virtio_media_device_mmap(struct file *file,
 	u64 driver_addr;
 	u64 len;
 	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
+	cmd_mmap = &session->cmd.mmap;
+	resp_mmap = &session->resp.mmap;
 
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EINVAL;

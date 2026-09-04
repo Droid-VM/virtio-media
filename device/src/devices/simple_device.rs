@@ -257,6 +257,97 @@ where
             }
         }
     }
+
+    /// Build `count` buffers of the given memory type. All or nothing: if any allocation or
+    /// registration fails, everything this call took is given straight back, so a `REQBUFS` that
+    /// answers an error leaves no pool space and no MMAP offset behind (a leaked pool slice is
+    /// gone for the life of the device).
+    fn add_buffers(
+        &mut self,
+        count: u32,
+        memory: MemoryType,
+    ) -> IoctlResult<Vec<Buffer<M::GuestMemoryMapping>>> {
+        let mut buffers: Vec<Buffer<M::GuestMemoryMapping>> = Vec::with_capacity(count as usize);
+
+        for i in 0..count {
+            let buffer = match memory {
+                MemoryType::Mmap => {
+                    let host_buffer = match self.allocator.allocate(BUFFER_SIZE as u64) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            self.undo_added(buffers);
+                            return Err(e);
+                        }
+                    };
+                    let offset = match self.mmap_manager.register_buffer(None, BUFFER_SIZE) {
+                        Ok(offset) => offset,
+                        Err(e) => {
+                            log::error!("failed to register MMAP buffer: {:#}", e);
+                            self.allocator.release(host_buffer);
+                            self.undo_added(buffers);
+                            return Err(libc::EINVAL);
+                        }
+                    };
+
+                    let mut v4l2_buffer =
+                        V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::Mmap);
+                    if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
+                        v4l2_buffer.planes_with_backing_iter_mut()
+                    {
+                        // SAFETY: every buffer has at least one plane.
+                        let mut plane = planes.next().unwrap();
+                        plane.set_mem_offset(offset);
+                        *plane.length = BUFFER_SIZE;
+                    } else {
+                        // SAFETY: we have just set the buffer type to MMAP. Reaching this point means a bug in
+                        // the code.
+                        panic!()
+                    }
+                    v4l2_buffer.set_field(BufferField::None);
+                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
+
+                    Buffer {
+                        state: BufferState::New,
+                        v4l2_buffer,
+                        backing: Backing::Host {
+                            buffer: host_buffer,
+                            offset,
+                        },
+                    }
+                }
+                MemoryType::UserPtr => {
+                    // The guest brings the memory at QBUF time; until then the buffer is only
+                    // a slot.
+                    let mut v4l2_buffer =
+                        V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::UserPtr);
+                    *v4l2_buffer.get_first_plane_mut().length = BUFFER_SIZE;
+                    v4l2_buffer.set_field(BufferField::None);
+                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
+
+                    Buffer {
+                        state: BufferState::New,
+                        v4l2_buffer,
+                        backing: Backing::Guest(None),
+                    }
+                }
+                _ => return Err(libc::EINVAL),
+            };
+            buffers.push(buffer);
+        }
+
+        Ok(buffers)
+    }
+
+    /// Give back what `add_buffers` took before it failed. These buffers were never handed to
+    /// the guest, so nothing can be mapping them and `RetiredBuffers` is not involved.
+    fn undo_added(&mut self, buffers: Vec<Buffer<M::GuestMemoryMapping>>) {
+        for buffer in buffers {
+            if let Backing::Host { buffer, offset } = buffer.backing {
+                self.mmap_manager.unregister_buffer(offset);
+                self.allocator.release(buffer);
+            }
+        }
+    }
 }
 
 impl<Q, M, HM, A, Reader, Writer> VirtioMediaDevice<Reader, Writer>
@@ -469,85 +560,25 @@ where
 
         // Reqbufs(0) is an implicit streamoff.
         if count == 0 {
-            self.active_session = None;
             self.streamoff(session, queue)?;
-        } else {
-            self.active_session = Some(session.id);
         }
 
         let count = std::cmp::min(count, 32);
 
         // Every mapping the guest holds on the old buffers is released (or parked until the
-        // guest unmaps) before we answer, so a stale mapping never sees a new buffer.
+        // guest unmaps) before we answer, so a stale mapping never sees a new buffer. From here
+        // on the session owns nothing: the state below is set only once the new buffers exist,
+        // so a failed allocation leaves an empty session and a free device rather than a
+        // half-built queue.
         self.free_buffers(session);
-        session.memory = if count > 0 { Some(memory) } else { None };
+        session.memory = None;
+        self.active_session = None;
 
-        let mut buffers: Vec<Buffer<M::GuestMemoryMapping>> = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            let buffer = match memory {
-                MemoryType::Mmap => {
-                    let host_buffer = self.allocator.allocate(BUFFER_SIZE as u64)?;
-                    let offset = match self.mmap_manager.register_buffer(None, BUFFER_SIZE) {
-                        Ok(offset) => offset,
-                        Err(e) => {
-                            log::error!("failed to register MMAP buffer: {:#}", e);
-                            self.allocator.release(host_buffer);
-                            for buffer in buffers {
-                                if let Backing::Host { buffer, offset } = buffer.backing {
-                                    self.mmap_manager.unregister_buffer(offset);
-                                    self.allocator.release(buffer);
-                                }
-                            }
-                            return Err(libc::EINVAL);
-                        }
-                    };
-
-                    let mut v4l2_buffer =
-                        V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::Mmap);
-                    if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
-                        v4l2_buffer.planes_with_backing_iter_mut()
-                    {
-                        // SAFETY: every buffer has at least one plane.
-                        let mut plane = planes.next().unwrap();
-                        plane.set_mem_offset(offset);
-                        *plane.length = BUFFER_SIZE;
-                    } else {
-                        // SAFETY: we have just set the buffer type to MMAP. Reaching this point means a bug in
-                        // the code.
-                        panic!()
-                    }
-                    v4l2_buffer.set_field(BufferField::None);
-                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
-
-                    Buffer {
-                        state: BufferState::New,
-                        v4l2_buffer,
-                        backing: Backing::Host {
-                            buffer: host_buffer,
-                            offset,
-                        },
-                    }
-                }
-                MemoryType::UserPtr => {
-                    // The guest brings the memory at QBUF time; until then the buffer is only
-                    // a slot.
-                    let mut v4l2_buffer =
-                        V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::UserPtr);
-                    *v4l2_buffer.get_first_plane_mut().length = BUFFER_SIZE;
-                    v4l2_buffer.set_field(BufferField::None);
-                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
-
-                    Buffer {
-                        state: BufferState::New,
-                        v4l2_buffer,
-                        backing: Backing::Guest(None),
-                    }
-                }
-                _ => unreachable!("memory type checked above"),
-            };
-            buffers.push(buffer);
+        session.buffers = self.add_buffers(count, memory)?;
+        if count > 0 {
+            session.memory = Some(memory);
+            self.active_session = Some(session.id);
         }
-        session.buffers = buffers;
 
         Ok(v4l2_requestbuffers {
             count,
@@ -712,5 +743,194 @@ where
             Ok(EventType::Eos) | Ok(EventType::SourceChange(0)) => Ok(()),
             _ => Err(libc::EINVAL),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::MemFdAllocator;
+
+    /// Discards the events the device sends; these tests only look at ioctl replies and at what
+    /// the allocator saw.
+    struct NullEvents;
+
+    impl VirtioMediaEventQueue for NullEvents {
+        fn send_event(&mut self, _event: V4l2Event) {}
+    }
+
+    /// No guest memory is involved in these tests; `USERPTR` is not exercised here.
+    struct NoGuest;
+
+    struct NoMapping;
+
+    impl GuestMemoryRange for NoMapping {
+        fn as_ptr(&self) -> *const u8 {
+            unreachable!("no guest mapping is made in these tests")
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            unreachable!("no guest mapping is made in these tests")
+        }
+    }
+
+    impl VirtioMediaGuestMemoryMapper for NoGuest {
+        type GuestMemoryMapping = NoMapping;
+
+        fn new_mapping(&self, _sgs: Vec<SgEntry>) -> anyhow::Result<NoMapping> {
+            anyhow::bail!("no guest memory in this test")
+        }
+    }
+
+    struct FakeHostMapper;
+
+    impl VirtioMediaHostMemoryMapper for FakeHostMapper {
+        fn add_mapping(&mut self, buffer: &HostBuffer, offset: u64, _rw: bool) -> Result<u64, i32> {
+            Ok(buffer.pool_offset.unwrap_or(0x8000_0000 + offset))
+        }
+
+        fn remove_mapping(&mut self, _shm_offset: u64) -> Result<(), i32> {
+            Ok(())
+        }
+    }
+
+    /// An allocator that runs out after `fail_after` buffers, the way a full `media_host` pool
+    /// does, and counts what comes back.
+    struct FlakyAllocator {
+        inner: MemFdAllocator,
+        allocated: Rc<RefCell<usize>>,
+        released: Rc<RefCell<usize>>,
+        fail_after: usize,
+    }
+
+    impl VirtioMediaBufferAllocator for FlakyAllocator {
+        fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
+            if *self.allocated.borrow() >= self.fail_after {
+                return Err(libc::ENOMEM);
+            }
+            let buffer = self.inner.allocate(len)?;
+            *self.allocated.borrow_mut() += 1;
+            Ok(buffer)
+        }
+
+        fn release(&mut self, buf: HostBuffer) {
+            *self.released.borrow_mut() += 1;
+            *self.allocated.borrow_mut() -= 1;
+            self.inner.release(buf);
+        }
+    }
+
+    type Device = SimpleCaptureDevice<NullEvents, NoGuest, FakeHostMapper, FlakyAllocator>;
+    type Session = SimpleCaptureDeviceSession<NoMapping>;
+
+    struct Rig {
+        device: Device,
+        allocated: Rc<RefCell<usize>>,
+        released: Rc<RefCell<usize>>,
+    }
+
+    fn rig(fail_after: usize) -> Rig {
+        let allocated = Rc::new(RefCell::new(0));
+        let released = Rc::new(RefCell::new(0));
+        let device = SimpleCaptureDevice::new(
+            NullEvents,
+            NoGuest,
+            FakeHostMapper,
+            FlakyAllocator {
+                inner: MemFdAllocator::new(),
+                allocated: Rc::clone(&allocated),
+                released: Rc::clone(&released),
+                fail_after,
+            },
+        );
+        Rig {
+            device,
+            allocated,
+            released,
+        }
+    }
+
+    fn session(device: &mut Device, id: u32) -> Session {
+        <Device as VirtioMediaDevice<&[u8], Vec<u8>>>::new_session(device, id).unwrap()
+    }
+
+    fn close(device: &mut Device, session: Session) {
+        <Device as VirtioMediaDevice<&[u8], Vec<u8>>>::close_session(device, session)
+    }
+
+    /// Review bug 1: a `REQBUFS` whose allocator gives out on the third buffer must leave
+    /// nothing behind -- no pool space, no registered MMAP offset, no session claiming to own
+    /// buffers it does not have.
+    #[test]
+    fn reqbufs_unwinds_when_an_allocation_fails() {
+        let mut r = rig(2);
+        let mut s = session(&mut r.device, 0);
+
+        assert_eq!(
+            r.device
+                .reqbufs(&mut s, QueueType::VideoCapture, MemoryType::Mmap, 4)
+                .err(),
+            Some(libc::ENOMEM)
+        );
+
+        // The two buffers the allocator did hand out went straight back.
+        assert_eq!(*r.released.borrow(), 2);
+        assert_eq!(*r.allocated.borrow(), 0);
+        // And the session owns nothing, so another one can take the device.
+        assert!(s.buffers.is_empty());
+        assert_eq!(s.memory, None);
+        assert_eq!(r.device.active_session, None);
+        let mut other = session(&mut r.device, 1);
+        assert_eq!(
+            r.device
+                .reqbufs(&mut other, QueueType::VideoCapture, MemoryType::UserPtr, 1)
+                .map(|r| r.count),
+            Ok(1)
+        );
+        close(&mut r.device, other);
+
+        // Every MMAP offset the failed call registered was unregistered: the manager is empty,
+        // so offsets start at 0 again.
+        r.device.allocator.fail_after = 8;
+        r.device
+            .reqbufs(&mut s, QueueType::VideoCapture, MemoryType::Mmap, 2)
+            .unwrap();
+        let offsets: Vec<u32> = s
+            .buffers
+            .iter()
+            .map(|b| match b.backing {
+                Backing::Host { offset, .. } => offset,
+                _ => panic!("expected host-owned buffers"),
+            })
+            .collect();
+        assert_eq!(offsets, vec![0, 0x1000]);
+
+        close(&mut r.device, s);
+        assert_eq!(*r.allocated.borrow(), 0, "everything went back at close");
+    }
+
+    /// `REQBUFS(0)` on a session that has buffers frees them and hands the device back.
+    #[test]
+    fn reqbufs_zero_frees_everything() {
+        let mut r = rig(8);
+        let mut s = session(&mut r.device, 0);
+
+        r.device
+            .reqbufs(&mut s, QueueType::VideoCapture, MemoryType::Mmap, 3)
+            .unwrap();
+        assert_eq!(*r.allocated.borrow(), 3);
+        assert_eq!(r.device.active_session, Some(0));
+
+        r.device
+            .reqbufs(&mut s, QueueType::VideoCapture, MemoryType::Mmap, 0)
+            .unwrap();
+        assert_eq!(*r.allocated.borrow(), 0);
+        assert_eq!(s.memory, None);
+        assert_eq!(r.device.active_session, None);
+
+        close(&mut r.device, s);
     }
 }

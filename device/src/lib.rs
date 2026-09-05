@@ -95,6 +95,26 @@ pub trait VirtioMediaEventQueue {
 pub trait GuestMemoryRange {
     fn as_ptr(&self) -> *const u8;
     fn as_mut_ptr(&mut self) -> *mut u8;
+
+    /// Bytes this mapping covers, starting at [`Self::as_ptr`].
+    ///
+    /// A device that is about to write a frame into a guest buffer has only the guest's own
+    /// `length` field to go by, and that number and the SG list the mapping was built from are
+    /// two separate things the guest chooses (review-m4 R2). This is the mapping's own account
+    /// of itself, and the last check between a mis-sized one and a `copy_nonoverlapping`.
+    ///
+    /// **Implementations should override this.** The default answers `usize::MAX`, i.e. "no
+    /// bound I can state", so that a mapping type which has not been taught the method yet
+    /// cannot make a device refuse work it should do; it also makes the check it feeds a no-op,
+    /// so it is a backstop and never the only bound a device relies on.
+    fn len(&self) -> usize {
+        usize::MAX
+    }
+
+    /// Whether the mapping covers no bytes at all. Follows [`Self::len`], default and all.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Trait enabling guest memory linear access for the device.

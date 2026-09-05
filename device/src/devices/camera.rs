@@ -447,6 +447,16 @@ impl<GM: GuestMemoryRange> Buffer<GM> {
         }
     }
 
+    /// Bytes the backing can hold. `None` for a guest buffer that is not mapped; for one that
+    /// is, whatever the mapping says (see [`GuestMemoryRange::len`]).
+    fn data_len(&self) -> Option<usize> {
+        match &self.backing {
+            Backing::Host { buffer, .. } => Some(buffer.len as usize),
+            Backing::Guest(Some(mapping)) => Some(mapping.len()),
+            Backing::Guest(None) => None,
+        }
+    }
+
     fn drop_guest_mapping(&mut self) {
         if let Backing::Guest(mapping) = &mut self.backing {
             *mapping = None;
@@ -716,6 +726,13 @@ where
         let stride = session.size.width;
         let stream = session.stream.as_mut().ok_or(libc::EIO)?;
         let entry = session.buffers.get_mut(index).ok_or(libc::EINVAL)?;
+        // The loan is `len` bytes wide and the capture thread writes all of them, so whatever
+        // backs the buffer must be at least that long. `qbuf` has already refused a `length`
+        // that could not hold a frame; this is the mapping's own account of itself, the last
+        // thing between a mis-sized one and a `copy_nonoverlapping` (review-m4 R2).
+        if entry.data_len().is_some_and(|have| have < len) {
+            return Err(libc::EINVAL);
+        }
         let ptr = entry.data_mut_ptr().ok_or(libc::EIO)?;
         stream.give_empty(EmptyBuffer {
             index: index as u32,
@@ -1231,6 +1248,18 @@ where
                 // `length` is the guest's number and sizes the mapping; the stream writes a
                 // whole frame into it, so it must hold one, and no more than the buffer was
                 // allocated for.
+                //
+                // Checked on *this* call's plane whatever `PREPARE_BUF` accepted earlier, and
+                // not only on `guest_length`: the SG list about to be mapped was read against
+                // this call's `length` (`ioctl::get_userptr_regions`), so that is the number
+                // that decides how much guest memory the loan really covers. Trusting the
+                // prepared one let a guest prepare a full-sized buffer and then queue an
+                // 8-byte scatter list, over which the capture thread wrote a whole frame
+                // (review-m4 R2). V4L2 is right that `QBUF` ignores a prepared buffer's
+                // *payload*; the scatter list is not payload, it is the mapping.
+                if *guest_plane.length < sizeimage || *guest_plane.length > entry.size {
+                    return Err(libc::EINVAL);
+                }
                 if guest_length < sizeimage || guest_length > entry.size {
                     return Err(libc::EINVAL);
                 }
@@ -1546,9 +1575,16 @@ mod tests {
     struct FakeMapping {
         guest: FakeGuest,
         start: usize,
+        len: usize,
     }
 
     impl GuestMemoryRange for FakeMapping {
+        /// What the SG list this mapping was built from adds up to, as a real mapping reports
+        /// (`GuestArenaMapping::len`, `GuestShadowMapping::len`).
+        fn len(&self) -> usize {
+            self.len
+        }
+
         fn as_ptr(&self) -> *const u8 {
             // SAFETY: nothing else resizes `memory` while the test runs.
             unsafe {
@@ -1613,6 +1649,7 @@ mod tests {
             Ok(FakeMapping {
                 guest: self.clone(),
                 start,
+                len: total,
             })
         }
     }
@@ -2048,14 +2085,27 @@ mod tests {
     }
 
     fn userptr_buffer(index: u32, gpa: u64, len: u32) -> (V4l2Buffer, Vec<Vec<SgEntry>>) {
+        userptr_buffer_sized(index, gpa, len, len)
+    }
+
+    /// A `USERPTR` buffer whose plane declares `length` bytes while its scatter list covers
+    /// `mapped`: two numbers the guest picks separately, which is the point of review-m4 R2.
+    /// The ioctl layer reads the list against the declared length, so a real guest can only make
+    /// `mapped` *larger*; a device must not depend on that.
+    fn userptr_buffer_sized(
+        index: u32,
+        gpa: u64,
+        length: u32,
+        mapped: u32,
+    ) -> (V4l2Buffer, Vec<Vec<SgEntry>>) {
         let mut buffer = V4l2Buffer::new(QUEUE, index, MemoryType::UserPtr);
         if let V4l2PlanesWithBackingMut::UserPtr(mut planes) = buffer.planes_with_backing_iter_mut()
         {
             let mut plane = planes.next().unwrap();
             plane.set_userptr(0xc000_0000 + index as u64);
-            *plane.length = len;
+            *plane.length = length;
         }
-        (buffer, vec![vec![SgEntry::new(gpa, len)]])
+        (buffer, vec![vec![SgEntry::new(gpa, mapped)]])
     }
 
     fn dequeued(events: &[V4l2Event]) -> Vec<V4l2Buffer> {
@@ -2508,6 +2558,139 @@ mod tests {
             .reqbufs(&mut other, QUEUE, MemoryType::Mmap, 1)
             .unwrap();
         close(&mut r.device, other);
+    }
+
+    /// `PREPARE_BUF` on this device, and the scatter list `QBUF` must not be allowed to smuggle
+    /// past it. The buffer is prepared with a full-sized plane and then queued with a short one:
+    /// the list the ioctl layer read is *this* call's, so it is this call's `length` that
+    /// decides how much guest memory the loan covers, and a prepared buffer may not shrink it
+    /// (review-m4 R2). Nothing is mapped by `PREPARE_BUF` itself.
+    #[test]
+    fn prepare_buf_does_not_let_qbuf_shrink_the_mapping() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::UserPtr, 2)
+            .unwrap();
+        let gpa = 4 * 0x1000u64;
+
+        // The payload is what `PREPARE_BUF` validates, so a dispatcher that could not represent
+        // it is refused, and so are the lengths `QBUF` refuses.
+        let (buf, _) = userptr_buffer(0, gpa, size);
+        assert_eq!(
+            r.device.prepare_buf(&mut s, buf, vec![], false).err(),
+            Some(libc::EINVAL)
+        );
+        for len in [size - 1, size + 1] {
+            let (buf, _) = userptr_buffer(0, gpa, len);
+            assert_eq!(
+                r.device.prepare_buf(&mut s, buf, vec![], true).err(),
+                Some(libc::EINVAL)
+            );
+        }
+
+        let (buf, _) = userptr_buffer(0, gpa, size);
+        let reply = r.device.prepare_buf(&mut s, buf, vec![], true).unwrap();
+        assert_eq!(
+            (reply.flags() & (BufferFlags::QUEUED | BufferFlags::PREPARED | BufferFlags::DONE))
+                .bits(),
+            BufferFlags::PREPARED.bits()
+        );
+        assert_eq!(reply.sequence(), 0);
+        assert_eq!(reply.timestamp().tv_sec, 0);
+        assert_eq!(*reply.get_first_plane().bytesused, 0);
+        assert!(r
+            .device
+            .querybuf(&s, QUEUE, 0)
+            .unwrap()
+            .flags()
+            .contains(BufferFlags::PREPARED));
+        // No guest memory is held between PREPARE_BUF and QBUF.
+        assert_eq!(*r.guest.live_mappings.borrow(), 0);
+        // Preparing it twice is refused.
+        let (buf, _) = userptr_buffer(0, gpa, size);
+        assert_eq!(
+            r.device.prepare_buf(&mut s, buf, vec![], true).err(),
+            Some(libc::EINVAL)
+        );
+
+        // The blocker: queueing the prepared buffer with a plane the guest has shrunk. The
+        // prepared length says a frame fits; this call's does not, and this call's is the one
+        // the scatter list was read against.
+        let (buf, sgs) = userptr_buffer(0, gpa, 8);
+        assert_eq!(
+            r.device.qbuf(&mut s, buf, sgs, true).err(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
+        assert!(!s.buffers[0].queued);
+        assert!(s.buffers[0].prepared.is_some(), "still prepared");
+
+        // Queued honestly it works, and the payload PREPARE_BUF accepted is what comes back.
+        let (buf, sgs) = userptr_buffer(0, gpa, size);
+        let reply = r.device.qbuf(&mut s, buf, sgs, false).unwrap();
+        assert!(reply.flags().contains(BufferFlags::QUEUED));
+        assert!(!reply.flags().contains(BufferFlags::PREPARED));
+        assert_eq!(*reply.get_first_plane().length, size);
+        assert_eq!(*r.guest.live_mappings.borrow(), 1);
+
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        let frames = collect_frames(&mut r, &mut s, 1);
+        assert_eq!(frames[0].index(), 0);
+        close(&mut r.device, s);
+    }
+
+    /// The second line of defence behind the check above: a mapping that turns out to be
+    /// shorter than a frame is never lent, whatever the guest's `length` field claimed
+    /// (review-m4 R2). At `STREAMON` that is the undo path -- the camera is closed again and
+    /// every buffer stays queued, in the order the guest queued them; on a queue that is
+    /// already streaming it ends the session, because a stream that will not take a buffer is
+    /// not going to fill it.
+    #[test]
+    fn a_mapping_too_short_for_a_frame_is_not_lent() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::UserPtr, 2)
+            .unwrap();
+        let gpa = 4 * 0x1000u64;
+
+        // A well-formed `length` over a scatter list that covers a quarter of it.
+        let (buf, sgs) = userptr_buffer_sized(1, gpa + 0x1_0000, size, size / 4);
+        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        let (buf, sgs) = userptr_buffer(0, gpa, size);
+        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        assert_eq!(s.queued, VecDeque::from([1, 0]));
+
+        assert_eq!(r.device.streamon(&mut s, QUEUE).err(), Some(libc::EIO));
+        assert!(s.stream.is_none(), "the camera was closed again");
+        assert!(!s.dead);
+        assert_eq!(r.log.lock().unwrap().closed, 1);
+        assert!(s.buffers.iter().all(|b| b.queued && !b.lent));
+        assert_eq!(s.queued.len(), 2, "both still waiting for a retry");
+
+        // Queued honestly, both stream.
+        r.device.streamoff(&mut s, QUEUE).unwrap();
+        for index in 0..2u32 {
+            let (buf, sgs) = userptr_buffer(index, gpa + index as u64 * 0x1_0000, size);
+            r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        }
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        let _ = collect_frames(&mut r, &mut s, 2);
+        assert_eq!(r.log.lock().unwrap().lent, vec![0, 1]);
+
+        // Now the same short mapping while the queue streams: the session ends.
+        let (buf, sgs) = userptr_buffer_sized(1, gpa + 0x1_0000, size, size / 4);
+        assert_eq!(r.device.qbuf(&mut s, buf, sgs, true).err(), Some(libc::EIO));
+        assert!(s.dead);
+        assert!(s.stream.is_none());
+        assert_eq!(errors(&r.events.borrow()), 1);
+        assert_eq!(*r.guest.live_mappings.borrow(), 0);
+        close(&mut r.device, s);
     }
 
     /// §2.5 on the path that is not an ioctl: a session that is merely *dropped* -- which is what

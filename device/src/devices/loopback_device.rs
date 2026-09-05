@@ -252,11 +252,23 @@ struct Buffer<GM> {
 }
 
 impl<GM: GuestMemoryRange> Buffer<GM> {
-    /// Bytes the buffer can hold: the host buffer's length, or the length the guest declared.
+    /// Bytes the buffer can hold: the host buffer's length, or -- for a guest-owned one -- the
+    /// length the guest declared, held to what the mapping behind it actually covers.
+    ///
+    /// The two are not the same number. `length` is a field of the `v4l2_buffer` and the
+    /// scatter list is read separately, so a guest can send a long `length` with a short list;
+    /// `process()` bounds its `copy` with this, and a mapping that reports its own size is the
+    /// last check between the two (review-m4 R2, `GuestMemoryRange::len`).
     fn capacity(&self) -> u32 {
         match &self.backing {
             Backing::Host { buffer, .. } => buffer.len.min(u32::MAX as u64) as u32,
-            Backing::Guest(_) => *self.v4l2_buffer.get_first_plane().length,
+            Backing::Guest(mapping) => {
+                let declared = *self.v4l2_buffer.get_first_plane().length;
+                match mapping {
+                    Some(mapping) => declared.min(mapping.len().min(u32::MAX as usize) as u32),
+                    None => declared,
+                }
+            }
         }
     }
 
@@ -1055,6 +1067,18 @@ where
                 if guest_length == 0 || guest_length > max_length {
                     return Err(libc::EINVAL);
                 }
+                // The scatter list about to be mapped was read against *this* call's `length`
+                // (`ioctl::get_userptr_regions`), whatever `PREPARE_BUF` accepted earlier, so
+                // this is the number that says how much guest memory the mapping covers -- and
+                // it has to cover everything `process()` may copy, which for a prepared buffer
+                // is the length `PREPARE_BUF` stored. Without this a guest could prepare a
+                // full-sized buffer and then queue an eight-byte list under it (review-m4 R2).
+                // V4L2 is right that `QBUF` ignores a prepared buffer's *payload*; a scatter
+                // list is not payload, it is the mapping.
+                let this_length = *guest_plane.length;
+                if this_length == 0 || this_length > max_length || this_length < guest_length {
+                    return Err(libc::EINVAL);
+                }
                 let sgs = guest_regions.into_iter().next().ok_or(libc::EINVAL)?;
                 // CAPTURE is the only direction this device writes; an OUTPUT buffer is mapped
                 // read-only so a bug here cannot reach into the guest's pages.
@@ -1328,9 +1352,16 @@ mod tests {
     struct FakeMapping {
         guest: FakeGuest,
         start: usize,
+        len: usize,
     }
 
     impl GuestMemoryRange for FakeMapping {
+        /// What the scatter list this mapping was built from adds up to, as a real mapping
+        /// reports (`GuestArenaMapping::len`, `GuestShadowMapping::len`).
+        fn len(&self) -> usize {
+            self.len
+        }
+
         fn as_ptr(&self) -> *const u8 {
             // SAFETY: nothing else resizes `memory` while the test runs.
             unsafe { self.guest.memory.as_ptr().as_ref().unwrap().as_ptr().add(self.start) }
@@ -1367,6 +1398,7 @@ mod tests {
             Ok(FakeMapping {
                 guest: self.clone(),
                 start,
+                len: total,
             })
         }
     }
@@ -1476,14 +1508,26 @@ mod tests {
 
     /// A USERPTR buffer for `queue`, backed by `len` bytes of fake guest memory at `gpa`.
     fn userptr_buffer(queue: QueueType, index: u32, gpa: u64, len: u32) -> (V4l2Buffer, Vec<Vec<SgEntry>>) {
+        userptr_buffer_sized(queue, index, gpa, len, len)
+    }
+
+    /// A `USERPTR` buffer whose plane declares `length` bytes while its scatter list covers
+    /// `mapped`: two numbers the guest picks separately, which is the point of review-m4 R2.
+    fn userptr_buffer_sized(
+        queue: QueueType,
+        index: u32,
+        gpa: u64,
+        length: u32,
+        mapped: u32,
+    ) -> (V4l2Buffer, Vec<Vec<SgEntry>>) {
         let mut buffer = V4l2Buffer::new(queue, index, MemoryType::UserPtr);
         if let V4l2PlanesWithBackingMut::UserPtr(mut planes) = buffer.planes_with_backing_iter_mut()
         {
             let mut plane = planes.next().unwrap();
             plane.set_userptr(0xc000_0000 + index as u64);
-            *plane.length = len;
+            *plane.length = length;
         }
-        (buffer, vec![vec![SgEntry::new(gpa, len)]])
+        (buffer, vec![vec![SgEntry::new(gpa, mapped)]])
     }
 
     fn mmap_buffer(queue: QueueType, index: u32, len: u32) -> V4l2Buffer {
@@ -1922,6 +1966,55 @@ mod tests {
         let reply = r.device.qbuf(&mut s, out, sgs, true).unwrap();
         assert_eq!(*reply.get_first_plane().bytesused, size);
         assert_eq!(*r.guest.live_mappings.borrow(), 1);
+
+        close(&mut r.device, s);
+    }
+
+    /// A prepared `USERPTR` buffer may not then be queued with a shorter scatter list. The list
+    /// is read against the *queueing* call's `length`, so that is what the mapping covers, while
+    /// `process()` copies against the length `PREPARE_BUF` stored: the same shape as the camera
+    /// device's blocker (review-m4 R2). The mapping's own `len` bounds `capacity()` behind it.
+    #[test]
+    fn prepare_buf_does_not_let_qbuf_shrink_the_mapping() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let fmt = format(QueueType::VideoOutputMplane, RGB3, 64, 64);
+        r.device
+            .s_fmt(&mut s, QueueType::VideoOutputMplane, fmt)
+            .unwrap();
+        let size = sizeimage(&fmt);
+        r.device
+            .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::UserPtr, 1)
+            .unwrap();
+        let gpa = 4 * 0x1000u64;
+
+        let (mut out, _) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
+        *out.get_first_plane_mut().bytesused = size;
+        let reply = r.device.prepare_buf(&mut s, out, vec![], true).unwrap();
+        assert!(reply.flags().contains(BufferFlags::PREPARED));
+        assert_eq!(*reply.get_first_plane().bytesused, size);
+        assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing mapped yet");
+
+        // The blocker: a plane the guest has shrunk under a buffer prepared at full size.
+        let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, 8);
+        assert_eq!(
+            r.device.qbuf(&mut s, out, sgs, true).err(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
+        assert!(!s.output.buffers[0].queued);
+        assert!(s.output.buffers[0].prepared.is_some(), "still prepared");
+
+        // ... and a `length` that says one thing while the list covers another: the mapping is
+        // what `capacity()` believes, so no copy can run off the end of it.
+        let (out, sgs) = userptr_buffer_sized(QueueType::VideoOutputMplane, 0, gpa, size, 8);
+        let reply = r.device.qbuf(&mut s, out, sgs, false).unwrap();
+        assert_eq!(s.output.buffers[0].capacity(), 8);
+        assert_eq!(
+            *reply.get_first_plane().bytesused,
+            8,
+            "the payload is held to what the mapping covers, not to what the guest declared"
+        );
 
         close(&mut r.device, s);
     }

@@ -88,7 +88,14 @@ struct virtio_media_queue_state {
  * @shadow_buf: shadow buffer where commandq data can be staged before being sent to the device.
  * @command_sg: SG table gathering descriptors for a given command and its response.
  * @queues: state of all the queues for this session.
- * @dqbufs_lock: protects pending_dqbufs of virtio_media_queue_state.
+ * @dqbufs_lock: protects the queue state that is read outside vv->vlock:
+ *	the @buffers array and the @allocated_bufs it is sized by, the buffer
+ *	flags the event work tests, @queued_bufs and @pending_dqbufs. The
+ *	ioctl path (REQBUFS/CREATE_BUFS/QBUF/DQBUF/STREAMOFF) writes them
+ *	under vlock + dqbufs_lock; the event work and poll read them under
+ *	dqbufs_lock alone (D46, B8 §10). Lock order: vlock or
+ *	events_process_lock -> dqbufs_lock -> guest_pool_lock, never the
+ *	reverse.
  * @dqbufs_wait: waitqueue for dequeued buffers, if VIDIOC_DQBUF needs to block or when polling.
  * @dead: the host reported an error event for this session; it is unusable.
  * @next_dbuf_cookie: mmap offset handed to the next driver-owned buffer.

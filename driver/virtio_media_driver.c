@@ -167,6 +167,18 @@ static void virtio_media_session_close(struct virtio_media *vv,
 	list_del(&session->list);
 	mutex_unlock(&vv->sessions_lock);
 
+	/*
+	 * The event work may have looked this session up before the
+	 * list_del and still be delivering an event into its queues: wait
+	 * that run out before freeing anything it touches (same D46 family
+	 * as the REQBUFS race). A run that starts after the flush cannot
+	 * find the session any more and drops its events. No lock is held
+	 * here, and the work only takes sessions_lock and dqbufs_lock, so
+	 * this cannot deadlock; in virtio_media_remove() the work was
+	 * already cancelled and this is a no-op.
+	 */
+	flush_work(&vv->eventq_work);
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
 	v4l2_fh_del(&session->fh, session->file);
 #else
@@ -395,14 +407,54 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	}
 	queue = &session->queues[queue_type];
 
+	/*
+	 * dqbufs_lock guards the queue's buffer array itself, not only
+	 * @pending_dqbufs: VIDIOC_REQBUFS/CREATE_BUFS vfree() and swap
+	 * @buffers and @allocated_bufs under it, and this work runs under
+	 * events_process_lock only, which the ioctl path never takes.
+	 * Dereferencing the array without the lock was a use-after-free
+	 * whenever a REQBUFS raced an event in flight (D46, B8 §10).
+	 * Lock order: events_process_lock -> dqbufs_lock, the order the
+	 * pending_dqbufs insertion below has always used; never take
+	 * vv->vlock or events_process_lock from under dqbufs_lock.
+	 */
+	mutex_lock(&session->dqbufs_lock);
+
 	if (dqbuf_evt->buffer.index >= queue->allocated_bufs) {
-		v4l2_err(&vv->v4l2_dev,
-			 "invalid buffer ID %d for queue %d in dqbuf event",
-			 dqbuf_evt->buffer.index, dqbuf_evt->buffer.type);
-		return;
+		/*
+		 * With no buffers at all this is not host misbehavior: a
+		 * REQBUFS(0) tore the queue down while this event was in
+		 * flight (the normal STREAMOFF + REQBUFS(0) shutdown), and
+		 * the buffer it names no longer exists. Drop it quietly.
+		 */
+		if (queue->allocated_bufs == 0)
+			pr_debug("virtio-media: dropping dqbuf event for buffer %u of freed queue %d\n",
+				 dqbuf_evt->buffer.index,
+				 dqbuf_evt->buffer.type);
+		else
+			v4l2_err(&vv->v4l2_dev,
+				 "invalid buffer ID %d for queue %d in dqbuf event",
+				 dqbuf_evt->buffer.index,
+				 dqbuf_evt->buffer.type);
+		goto out_unlock;
 	}
 
 	dqbuf = &queue->buffers[dqbuf_evt->buffer.index];
+
+	/*
+	 * Only a buffer the guest queued can be dequeued. A freshly
+	 * reallocated array is zeroed, so a stale event that raced a
+	 * REQBUFS(n) and indexes into the new allocation lands here instead
+	 * of corrupting a buffer that was never queued; so does a host that
+	 * completes the same buffer twice (the first event replaced QUEUED
+	 * with DONE).
+	 */
+	if (!(dqbuf->buffer.flags & V4L2_BUF_FLAG_QUEUED) ||
+	    (dqbuf->buffer.flags & V4L2_BUF_FLAG_DONE)) {
+		pr_debug("virtio-media: dropping dqbuf event for buffer %u of queue %d that is not queued\n",
+			 dqbuf_evt->buffer.index, dqbuf_evt->buffer.type);
+		goto out_unlock;
+	}
 
 	/*
 	 * Preserve the 'm' union that was passed to us during QBUF so userspace
@@ -417,7 +469,7 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 				&vv->v4l2_dev,
 				"invalid number of planes received from host for "
 				"a multiplanar buffer\n");
-			return;
+			goto out_unlock;
 		}
 		for (i = 0; i < dqbuf->buffer.length; i++) {
 			plane_m = dqbuf->planes[i].m;
@@ -439,10 +491,17 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	/* Set the DONE flag as the buffer is waiting for being dequeued. */
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;
 
-	mutex_lock(&session->dqbufs_lock);
 	list_add_tail(&dqbuf->list, &queue->pending_dqbufs);
+	/*
+	 * Guarded: VIDIOC_QBUF counts the buffer before the host sees it,
+	 * so a legitimate completion always observes the increment; only a
+	 * host that dequeues something it was never given lands on zero.
+	 */
+	if (queue->queued_bufs > 0)
+		queue->queued_bufs -= 1;
+
+out_unlock:
 	mutex_unlock(&session->dqbufs_lock);
-	queue->queued_bufs -= 1;
 	wake_up(&session->dqbufs_wait);
 }
 

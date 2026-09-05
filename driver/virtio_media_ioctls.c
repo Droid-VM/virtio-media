@@ -624,7 +624,12 @@ static void virtio_media_clear_queue(struct virtio_media *vv,
 		list_del(&dqbuf->list);
 	}
 
-	mutex_unlock(&session->dqbufs_lock);
+	/*
+	 * The flags walk and the counters stay under dqbufs_lock too: the
+	 * event work reads buffer flags and decrements @queued_bufs under
+	 * that lock (D46), and clearing the flags here is exactly what makes
+	 * it drop an event still in flight for a streamed-off buffer.
+	 */
 
 	/* All buffers are now dequeued. */
 	for (i = 0; i < queue->allocated_bufs; i++) {
@@ -634,6 +639,8 @@ static void virtio_media_clear_queue(struct virtio_media *vv,
 	queue->queued_bufs = 0;
 	queue->streaming = false;
 	queue->is_capture_last = false;
+
+	mutex_unlock(&session->dqbufs_lock);
 }
 
 /*
@@ -1075,6 +1082,13 @@ static int virtio_media_check_buffer_memory(struct virtio_media_queue_state *que
  *
  * virtio_media_clear_queue() must run first when there may be queued or
  * pending buffers: it walks the array this frees.
+ *
+ * The caller must hold session->dqbufs_lock: the event work dereferences
+ * @buffers under that lock (D46), and freeing the array under anything less
+ * (the ioctl path's vv->vlock, which the work never takes) was the B8
+ * use-after-free. @pending_dqbufs is re-initialized because its nodes live
+ * inside the array being freed, and @queued_bufs counted buffers that no
+ * longer exist.
  */
 static void
 virtio_media_release_queue_bufs(struct virtio_media_queue_state *queue)
@@ -1085,6 +1099,8 @@ virtio_media_release_queue_bufs(struct virtio_media_queue_state *queue)
 	queue->allocated_bufs = 0;
 	queue->driver_owned = false;
 	queue->memory = 0;
+	queue->queued_bufs = 0;
+	INIT_LIST_HEAD(&queue->pending_dqbufs);
 }
 
 /* Bound on what the host may claim it allocated; vb2 itself stops at 1024. */
@@ -1168,27 +1184,44 @@ static int virtio_media_reqbufs(struct file *file, void *priv_unused,
 	/*
 	 * The host has answered, so it holds no mapping of the previous
 	 * buffers any more and their memory can go back (VPU_DESIGN.md 2.5).
+	 *
+	 * The teardown and the publication of the new array happen under
+	 * dqbufs_lock: the event work dereferences @buffers/@allocated_bufs
+	 * under that lock and nothing else (D46). Lock order:
+	 * vlock (held by the ioctl dispatcher) -> dqbufs_lock ->
+	 * guest_pool_lock (taken inside vmedia_dbuf_put for pool-backed
+	 * dbufs); the event work orders events_process_lock -> dqbufs_lock
+	 * and never takes vlock, so the two chains cannot cross.
 	 */
+	mutex_lock(&session->dqbufs_lock);
 	virtio_media_release_queue_bufs(queue);
 
 	if (b->count > 0) {
 		queue->buffers =
 			vzalloc(sizeof(struct virtio_media_buffer) * b->count);
 		if (!queue->buffers) {
+			mutex_unlock(&session->dqbufs_lock);
 			ret = -ENOMEM;
 			goto err_release_host;
 		}
 		queue->allocated_bufs = b->count;
 		queue->memory = user_memory;
+	}
+	mutex_unlock(&session->dqbufs_lock);
 
-		if (driver_owned) {
-			ret = vmedia_queue_alloc_dbufs(vv, session, queue, 0,
-						       b->count, sizes,
-						       num_planes);
-			if (ret)
-				goto err_release_host;
-			queue->driver_owned = true;
-		}
+	/*
+	 * The dbuf backing can be filled in outside the lock: none of the
+	 * new buffers carries V4L2_BUF_FLAG_QUEUED yet, so the event work
+	 * will not touch them (it drops events for unqueued buffers), and
+	 * QBUF cannot run before this ioctl returns -- both hold vlock.
+	 * This keeps dqbufs_lock off the allocator's guest_pool_lock path.
+	 */
+	if (b->count > 0 && driver_owned) {
+		ret = vmedia_queue_alloc_dbufs(vv, session, queue, 0, b->count,
+					       sizes, num_planes);
+		if (ret)
+			goto err_release_host;
+		queue->driver_owned = true;
 	}
 
 	/*
@@ -1224,7 +1257,9 @@ err_release_host:
 					   sizeof(zero), sizeof(zero));
 	}
 	virtio_media_clear_queue(vv, session, queue);
+	mutex_lock(&session->dqbufs_lock);
 	virtio_media_release_queue_bufs(queue);
+	mutex_unlock(&session->dqbufs_lock);
 	b->count = 0;
 	return ret;
 }
@@ -1275,6 +1310,8 @@ static int virtio_media_create_bufs(struct file *file, void *priv_unused,
 	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffers;
+	struct virtio_media_buffer *new_buffers;
+	LIST_HEAD(old_pending);
 	size_t sizes[VIDEO_MAX_PLANES];
 	u32 num_planes = 0;
 	u32 type = b->format.type;
@@ -1338,21 +1375,40 @@ static int virtio_media_create_bufs(struct file *file, void *priv_unused,
 		return -EINVAL;
 	}
 
-	buffers = queue->buffers;
-
-	queue->buffers =
-		vzalloc(sizeof(struct virtio_media_buffer) * last_buf);
-	if (!queue->buffers) {
-		queue->buffers = buffers;
+	new_buffers = vzalloc(sizeof(struct virtio_media_buffer) * last_buf);
+	if (!new_buffers)
 		return -ENOMEM;
+
+	/*
+	 * Swap the array under dqbufs_lock, like REQBUFS does: the event
+	 * work dereferences @buffers under that lock and nothing else
+	 * (D46). CREATE_BUFS is legal on a streaming queue, so buffers may
+	 * sit on @pending_dqbufs right now -- their list nodes live inside
+	 * the old array and must be re-threaded onto their copies in the
+	 * new one, or the list would walk into freed memory (the memcpy
+	 * copies stale prev/next pointers, it does not move list
+	 * membership).
+	 */
+	mutex_lock(&session->dqbufs_lock);
+	buffers = queue->buffers;
+	if (buffers)
+		memcpy(new_buffers, buffers,
+		       sizeof(*buffers) * queue->allocated_bufs);
+	list_replace_init(&queue->pending_dqbufs, &old_pending);
+	while (!list_empty(&old_pending)) {
+		struct virtio_media_buffer *old = list_first_entry(
+			&old_pending, struct virtio_media_buffer, list);
+
+		list_del(&old->list);
+		list_add_tail(&new_buffers[old - buffers].list,
+			      &queue->pending_dqbufs);
 	}
-
-	memcpy(queue->buffers, buffers,
-	       sizeof(*buffers) * queue->allocated_bufs);
-	vfree(buffers);
-
+	queue->buffers = new_buffers;
 	queue->allocated_bufs = last_buf;
 	queue->memory = user_memory;
+	mutex_unlock(&session->dqbufs_lock);
+
+	vfree(buffers);
 
 	if (driver_owned) {
 		/* The host may have adjusted the format; size from its reply. */
@@ -1457,17 +1513,30 @@ static int virtio_media_qbuf(struct file *file, void *priv_unused,
 				buffer->planes[i].m = b->m.planes[i].m;
 		}
 	}
+	/*
+	 * Flag and count the buffer as queued under dqbufs_lock *before* the
+	 * host sees the QBUF: the completion event can arrive before this
+	 * ioctl's response, and the event work (which reads the flag and
+	 * decrements the count under the same lock, D46) must then find the
+	 * buffer already accounted for -- counting it afterwards left a
+	 * window where the decrement was lost and @queued_bufs drifted.
+	 */
 	old_flags = buffer->buffer.flags;
+	mutex_lock(&session->dqbufs_lock);
 	buffer->buffer.flags = V4L2_BUF_FLAG_QUEUED;
+	queue->queued_bufs += 1;
+	mutex_unlock(&session->dqbufs_lock);
 
 	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QBUF, b, buffer);
 	if (ret) {
 		/* Rollback the previous flags as the buffer is not queued. */
+		mutex_lock(&session->dqbufs_lock);
 		buffer->buffer.flags = old_flags;
+		if (queue->queued_bufs > 0)
+			queue->queued_bufs -= 1;
+		mutex_unlock(&session->dqbufs_lock);
 		return ret;
 	}
-
-	queue->queued_bufs += 1;
 
 	return 0;
 }
@@ -1527,10 +1596,13 @@ static int virtio_media_dqbuf(struct file *file, void *priv_unused,
 	dqbuf = list_first_entry(buffer_queue, struct virtio_media_buffer,
 				 list);
 	list_del(&dqbuf->list);
-	mutex_unlock(&session->dqbufs_lock);
-
-	/* Clear the DONE flag as the buffer is now being dequeued. */
+	/*
+	 * Clear the DONE flag as the buffer is now being dequeued -- under
+	 * dqbufs_lock, since the event work reads these flags under it to
+	 * decide whether an event is deliverable (D46).
+	 */
 	dqbuf->buffer.flags &= ~V4L2_BUF_FLAG_DONE;
+	mutex_unlock(&session->dqbufs_lock);
 
 	if (is_multiplanar) {
 		size_t nb_planes = min(b->length, (u32)VIDEO_MAX_PLANES);

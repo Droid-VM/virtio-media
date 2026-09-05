@@ -1776,6 +1776,75 @@ fn controls_are_enumerated_from_the_capabilities() {
 /// Getting, setting and trying controls, and what is refused: the rules `v4l2-compliance`'s
 /// `testSimpleControls` / `testExtendedControls` check (`v4l2-test-controls.cpp:434-589`,
 /// `:846-1109`) -- clamping, ERANGE / EINVAL on menus, EACCES on read-only and write-only,
+/// D42: the extended controls check the access flags before they look at what the control is,
+/// as the kernel does -- `v4l2_g_ext_ctrls_common` refuses every `WRITE_ONLY` control after
+/// `prepare_ext_ctrls`, `validate_ctrls` refuses every `READ_ONLY` one. A class marker carries
+/// **both** flags, so it is `EACCES` through `G/S/TRY_EXT_CTRLS` even though `G_CTRL`/`S_CTRL`
+/// answer it `EINVAL` (`v4l2_g_ctrl` tests `is_int` first). `v4l2-compliance` walks the class
+/// control before any other and failed `g_ext_ctrls did not check the write-only flag`
+/// (`v4l2-test-controls.cpp:903`) while this answered `EINVAL`.
+#[test]
+fn a_class_control_is_eacces_through_the_extended_controls() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+
+    for class in [
+        bindings::V4L2_CID_USER_CLASS,
+        bindings::V4L2_CID_CODEC_CLASS,
+    ] {
+        let mut ctrls = ext_controls(0, 1);
+        let mut arr = vec![ext_control(class, 0)];
+        assert_eq!(
+            r.device
+                .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![])
+                .err(),
+            Some(libc::EACCES),
+            "{:#x} is write-only",
+            class
+        );
+        assert_eq!(ctrls.error_idx, 1, "a get names `count`");
+        assert_eq!(
+            r.device
+                .try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![])
+                .err(),
+            Some(libc::EACCES),
+            "{:#x} is read-only",
+            class
+        );
+        assert_eq!(ctrls.error_idx, 0, "a try names the control");
+        assert_eq!(
+            r.device
+                .s_ext_ctrls(&mut s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![])
+                .err(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(ctrls.error_idx, 1, "a set fails as a whole");
+    }
+
+    // The old ioctls are unchanged: a class marker is not an integer, which the kernel checks
+    // before the flags there.
+    assert_eq!(
+        r.device.g_ctrl(&s, bindings::V4L2_CID_CODEC_CLASS).err(),
+        Some(libc::EINVAL)
+    );
+    assert_eq!(
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_CODEC_CLASS, 0)
+            .err(),
+        Some(libc::EINVAL)
+    );
+    // And a read-only value control still answers `EACCES` on the write side only.
+    let mut ctrls = ext_controls(0, 1);
+    let mut arr = vec![ext_control(CID_MIN_OUT, 0)];
+    assert!(r
+        .device
+        .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![])
+        .is_ok());
+    assert_eq!(ext_value(&arr[0]), 4);
+
+    close(&mut r.device, s);
+}
+
 /// EINVAL on a class or an unknown id, `error_idx` per ioctl, `which` handling, and a set that
 /// fails leaving nothing applied.
 #[test]

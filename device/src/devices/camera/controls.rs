@@ -1021,6 +1021,19 @@ impl Controls {
             .find(|d| d.id > after && if d.is_compound() { compound } else { regular })
     }
 
+    /// The control an id names for the four ioctls the kernel resolves the old-style
+    /// `V4L2_CID_PRIVATE_BASE + n` alias in -- `QUERYCTRL`, `QUERYMENU`, `G_CTRL` and `S_CTRL`,
+    /// the four `find_private_ref` names (`v4l2-ctrls-core.c`). `find_ref` branches to it
+    /// before it hashes, so all four agree; the extended controls do not (`prepare_ext_ctrls`
+    /// refuses a private id outright).
+    pub fn find_legacy(&self, id: u32) -> Option<&ControlDesc> {
+        if id >= V4L2_CID_PRIVATE_BASE {
+            self.private_alias(id)
+        } else {
+            self.find(id)
+        }
+    }
+
     /// The old-style `V4L2_CID_PRIVATE_BASE + n` alias: the n-th private USER-class control that
     /// `G_CTRL` could carry, as the kernel resolves it.
     pub fn private_alias(&self, id: u32) -> Option<&ControlDesc> {
@@ -1125,8 +1138,10 @@ impl Controls {
 
     /// `QUERYMENU`: item `index` of menu `id`; `EINVAL` for a non-menu, an index out of range, or
     /// an item the camera lacks.
+    /// `id` may be an old-style private alias; the answer carries the id as asked, the way
+    /// `v4l2_querymenu` leaves `qm->id` alone (D33).
     pub fn menu_item(&self, id: u32, index: u32) -> Result<v4l2_querymenu, i32> {
-        let desc = self.find(id).ok_or(libc::EINVAL)?;
+        let desc = self.find_legacy(id).ok_or(libc::EINVAL)?;
         let mut qm = v4l2_querymenu {
             id,
             index,

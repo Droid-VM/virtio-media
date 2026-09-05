@@ -1037,11 +1037,8 @@ where
                 .next(id, regular, compound)
                 .ok_or(libc::EINVAL)?;
             Ok((desc, desc.id))
-        } else if id >= controls::V4L2_CID_PRIVATE_BASE {
-            let desc = self.controls.private_alias(id).ok_or(libc::EINVAL)?;
-            Ok((desc, id))
         } else {
-            let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+            let desc = self.controls.find_legacy(id).ok_or(libc::EINVAL)?;
             Ok((desc, id))
         }
     }
@@ -2076,16 +2073,17 @@ where
     }
 
     /// `G_CTRL`: the plain controls only, as the kernel's `is_int`; a write-only one is
-    /// `EACCES`.
+    /// `EACCES`. An old-style `V4L2_CID_PRIVATE_BASE + n` id names its control here too, and
+    /// the answer carries the id as asked (D33).
     fn g_ctrl(&mut self, _session: &Self::Session, id: u32) -> IoctlResult<v4l2_control> {
-        let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+        let desc = self.controls.find_legacy(id).ok_or(libc::EINVAL)?;
         if !desc.is_int() {
             return Err(libc::EINVAL);
         }
         if desc.is_write_only() {
             return Err(libc::EACCES);
         }
-        let value = self.controls.current(id).map(Value::int).unwrap_or(0);
+        let value = self.controls.current(desc.id).map(Value::int).unwrap_or(0);
         Ok(v4l2_control {
             id,
             value: value as i32,
@@ -2093,23 +2091,25 @@ where
     }
 
     /// `S_CTRL`: validated against the range, stored, sent to the camera and announced, like a
-    /// one-control `S_EXT_CTRLS`.
+    /// one-control `S_EXT_CTRLS`. Resolves an old-style private alias, as `G_CTRL` does (D33);
+    /// the control is set under its real id and the answer carries the id as asked.
     fn s_ctrl(
         &mut self,
         session: &mut Self::Session,
         id: u32,
         value: i32,
     ) -> IoctlResult<v4l2_control> {
-        let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+        let desc = self.controls.find_legacy(id).ok_or(libc::EINVAL)?;
         if !desc.is_int() {
             return Err(libc::EINVAL);
         }
         if desc.is_read_only() {
             return Err(libc::EACCES);
         }
+        let real_id = desc.id;
         let value = self.controls.validate(desc, &Value::Int(value as i64))?;
         let reply = value.int() as i32;
-        self.commit_controls(session.id, vec![(id, value)])?;
+        self.commit_controls(session.id, vec![(real_id, value)])?;
         Ok(v4l2_control { id, value: reply })
     }
 
@@ -2262,8 +2262,10 @@ mod tests {
     use super::*;
     use crate::ioctl::ffmpeg_wire;
     use crate::poll::SessionPoller;
+    use crate::protocol::VIRTIO_MEDIA_CMD_IOCTL;
     use crate::protocol::VIRTIO_MEDIA_CMD_OPEN;
     use crate::MemFdAllocator;
+    use crate::RespHeader;
     use crate::VirtioMediaDeviceRunner;
 
     /// Collects the events the device sends.
@@ -5299,6 +5301,259 @@ mod tests {
         );
 
         close(&mut r.device, s);
+    }
+
+    /// D33: every ioctl the kernel resolves an old-style `V4L2_CID_PRIVATE_BASE + n` id in --
+    /// `QUERYCTRL`, `QUERY_EXT_CTRL`, `QUERYMENU`, `G_CTRL` and `S_CTRL`, the five
+    /// `find_private_ref` serves through `find_ref` -- resolves it here too, so a menu control
+    /// reached through its alias has items and a value.
+    ///
+    /// `v4l2-compliance` walks the aliases with `QUERY_EXT_CTRL` from `PRIVATE_BASE` up and runs
+    /// `checkQCtrl` on each; for a menu that is a `QUERYMENU(minimum..=maximum + 1)` walk which
+    /// must find at least one item, an item at the default value, `EINVAL` past the maximum, and
+    /// the id and index it asked for (`v4l2-test-controls.cpp:145-172`, then `:301-315`). This
+    /// test is that walk. Before the fix every one of those `QUERYMENU`s was `EINVAL`, which is
+    /// `no menu items found` at `:171` and `invalid control 08000000` at `:315`.
+    #[test]
+    fn the_private_aliases_answer_every_old_style_ioctl() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let base = controls::V4L2_CID_PRIVATE_BASE;
+
+        // The alias walk, stopping at the first `EINVAL` as compliance does.
+        let mut aliases = Vec::new();
+        let mut id = base;
+        while let Ok(qc) = r.device.query_ext_ctrl_raw(&s, id) {
+            assert_eq!(qc.id, id, "the alias answers under the alias id");
+            aliases.push(qc);
+            id += 1;
+        }
+        assert_eq!(
+            aliases.iter().map(qc_name).collect::<Vec<_>>(),
+            vec!["Active Physical Camera", "Auto Exposure, State"],
+            "the two private USER-class integer controls, in order"
+        );
+
+        // `checkQCtrl`'s menu walk, for each alias.
+        for qc in &aliases {
+            assert!(
+                qc.type_ == bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU
+                    || qc.type_ == bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER_MENU
+            );
+            let mut items = 0;
+            let mut have_default = false;
+            for index in 0..=(qc.maximum as u32 + 1) {
+                match r.device.querymenu(&s, qc.id, index) {
+                    Ok(qm) => {
+                        assert!(
+                            index <= qc.maximum as u32,
+                            "menu item for an out-of-range index"
+                        );
+                        assert_eq!((qm.id, qm.index), (qc.id, index), "id or index changed");
+                        assert_eq!({ qm.reserved }, 0, "reserved is non-zero");
+                        items += 1;
+                        have_default |= index as i64 == qc.default_value;
+                    }
+                    Err(e) => assert_eq!(e, libc::EINVAL, "invalid QUERYMENU return code"),
+                }
+            }
+            assert_ne!(items, 0, "no menu items found ({})", qc_name(qc));
+            assert!(have_default, "no item at the default value");
+        }
+
+        // The alias and the real id name one control: the same menu items and the same value.
+        assert_eq!(
+            menu_name(&r.device.querymenu(&s, base + 1, 2).unwrap()),
+            menu_name(&r.device.querymenu(&s, VCAM_CID_AE_STATE, 2).unwrap()),
+        );
+        assert_eq!(
+            menu_value(&r.device.querymenu(&s, base, 1).unwrap()),
+            menu_value(
+                &r.device
+                    .querymenu(&s, VCAM_CID_ACTIVE_PHYSICAL_ID, 1)
+                    .unwrap()
+            ),
+        );
+        let by_alias = r.device.g_ctrl(&s, base).unwrap();
+        let by_id = r.device.g_ctrl(&s, VCAM_CID_ACTIVE_PHYSICAL_ID).unwrap();
+        assert_eq!(by_alias.value, by_id.value);
+        assert_eq!(by_alias.id, base, "the answer carries the id as asked");
+        // Both are read-only, so a set through the alias is `EACCES` -- the control was found.
+        assert_eq!(r.device.s_ctrl(&mut s, base, 0).err(), Some(libc::EACCES));
+        assert_eq!(
+            r.device.s_ctrl(&mut s, base + 1, 0).err(),
+            Some(libc::EACCES)
+        );
+
+        // The compound controls have no alias, in any of the five (a payload cannot travel in
+        // a `v4l2_control`), and the walk therefore ends at `+2`.
+        assert_eq!(
+            r.device.query_ext_ctrl_raw(&s, base + 2).err(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            r.device.queryctrl_raw(&s, base + 2).err(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            r.device.querymenu(&s, base + 2, 0).err(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(r.device.g_ctrl(&s, base + 2).err(), Some(libc::EINVAL));
+        assert_eq!(
+            r.device.s_ctrl(&mut s, base + 2, 0).err(),
+            Some(libc::EINVAL)
+        );
+        // And a control that is not a menu still refuses `QUERYMENU`, by either name.
+        assert_eq!(
+            r.device
+                .querymenu(&s, bindings::V4L2_CID_ZOOM_ABSOLUTE, 0)
+                .err(),
+            Some(libc::EINVAL)
+        );
+
+        close(&mut r.device, s);
+    }
+
+    /// D37: a failed `G/S/TRY_EXT_CTRLS` writes the `v4l2_ext_controls` header back, so
+    /// `error_idx` reaches the guest.
+    ///
+    /// This is asserted on the wire, through the whole command path, because it is the response
+    /// *length* that decides it: `virtio_media_send_ext_controls_ioctl()` copies the header out
+    /// of the response only when the device wrote at least
+    /// `sizeof(virtio_media_resp_ioctl) + sizeof(v4l2_ext_controls)` bytes, and skips it -- with
+    /// no error and no log line -- when the response is shorter. So the test checks the exact
+    /// byte count of an error response and reads `error_idx` back out of it, and it pins the two
+    /// structure sizes the guest ABI depends on.
+    #[test]
+    fn a_failed_ext_ctrls_writes_the_header_back_with_error_idx() {
+        const RESP_HEADER: usize = std::mem::size_of::<RespHeader>();
+        const CTRLS: usize = std::mem::size_of::<v4l2_ext_controls>();
+        const CTRL: usize = std::mem::size_of::<v4l2_ext_control>();
+        assert_eq!((RESP_HEADER, CTRLS, CTRL), (8, 32, 20), "the guest ABI");
+
+        /// One `VIRTIO_MEDIA_CMD_IOCTL` for an ext-controls ioctl, as the driver builds it:
+        /// the command header, the ioctl header, the `v4l2_ext_controls` and its array. The
+        /// `error_idx` the guest sends is a sentinel, so the test can tell "the device wrote
+        /// the header" from "the header came back untouched".
+        fn command(code: V4l2Ioctl, which: u32, sentinel: u32, values: &[(u32, i32)]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend(VIRTIO_MEDIA_CMD_IOCTL.to_le_bytes());
+            out.extend(0u32.to_le_bytes());
+            out.extend(0u32.to_le_bytes()); // session id
+            out.extend((code as u32).to_le_bytes());
+            out.extend(which.to_le_bytes());
+            out.extend((values.len() as u32).to_le_bytes());
+            out.extend(sentinel.to_le_bytes());
+            out.extend(0u32.to_le_bytes()); // request_fd
+            out.extend(0u32.to_le_bytes()); // reserved[0]
+            out.extend(0u32.to_le_bytes()); // padding before the pointer
+            out.extend(0u64.to_le_bytes()); // controls, nulled by the driver
+            for (id, value) in values {
+                out.extend(id.to_le_bytes());
+                out.extend(0u32.to_le_bytes()); // size: a plain control
+                out.extend(0u32.to_le_bytes()); // reserved2[0]
+                out.extend(value.to_le_bytes());
+                out.extend(0u32.to_le_bytes()); // the rest of the union
+            }
+            out
+        }
+
+        const SENTINEL: u32 = 0xbeef;
+        let refused = &[
+            (bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE, 1),
+            (bindings::V4L2_CID_ZOOM_ABSOLUTE, 2001),
+        ];
+        let unknown = &[(bindings::V4L2_CID_BRIGHTNESS, 0)];
+        // Every command is built before the runner: the reader type is part of the runner's own
+        // type, so these bytes must outlive it.
+        let commands: Vec<(&str, Vec<u8>, usize, (i32, u32))> = vec![
+            // A try names the control it refused; a set fails as a whole, so `count`.
+            (
+                "TRY out of range",
+                command(V4l2Ioctl::VIDIOC_TRY_EXT_CTRLS, 0, SENTINEL, refused),
+                2,
+                (libc::ERANGE, 1),
+            ),
+            (
+                "S out of range",
+                command(V4l2Ioctl::VIDIOC_S_EXT_CTRLS, 0, SENTINEL, refused),
+                2,
+                (libc::ERANGE, 2),
+            ),
+            // A get that fails: `error_idx` is `count`, as the kernel leaves it for a get.
+            (
+                "G unknown id",
+                command(V4l2Ioctl::VIDIOC_G_EXT_CTRLS, 0, SENTINEL, unknown),
+                1,
+                (libc::EINVAL, 1),
+            ),
+            // A write-only control read: `EACCES` and `error_idx = count`, both of which
+            // `v4l2-test-controls.cpp:901-905` checks.
+            (
+                "G write-only",
+                command(
+                    V4l2Ioctl::VIDIOC_G_EXT_CTRLS,
+                    0,
+                    SENTINEL,
+                    &[(bindings::V4L2_CID_AUTO_FOCUS_START, 0)],
+                ),
+                1,
+                (libc::EACCES, 1),
+            ),
+            // A `which` word no control set can be named under is refused before the device is
+            // asked at all -- and still carries the header.
+            (
+                "G which=MIN_VAL",
+                command(
+                    V4l2Ioctl::VIDIOC_G_EXT_CTRLS,
+                    bindings::V4L2_CTRL_WHICH_MIN_VAL,
+                    SENTINEL,
+                    unknown,
+                ),
+                1,
+                (libc::EINVAL, 1),
+            ),
+            // And a set that succeeds answers the same shape, with `error_idx` at `count`.
+            (
+                "S accepted",
+                command(
+                    V4l2Ioctl::VIDIOC_S_EXT_CTRLS,
+                    0,
+                    SENTINEL,
+                    &[(bindings::V4L2_CID_ZOOM_ABSOLUTE, 200)],
+                ),
+                1,
+                (0, 1),
+            ),
+        ];
+
+        let r = rig();
+        let poller = FakePoller::default();
+        let open: Vec<u8> = VIRTIO_MEDIA_CMD_OPEN
+            .to_le_bytes()
+            .into_iter()
+            .chain(0u32.to_le_bytes())
+            .collect();
+        let mut runner: VirtioMediaDeviceRunner<&[u8], Vec<u8>, Device, FakePoller> =
+            VirtioMediaDeviceRunner::new(r.device, poller.clone());
+        let mut writer: Vec<u8> = Vec::new();
+        runner.handle_command(&mut open.as_slice(), &mut writer);
+        assert_eq!(runner.sessions.len(), 1);
+
+        for (what, cmd, count, expected) in &commands {
+            let mut writer: Vec<u8> = Vec::new();
+            runner.handle_command(&mut cmd.as_slice(), &mut writer);
+            assert_eq!(
+                writer.len(),
+                RESP_HEADER + CTRLS + count * CTRL,
+                "{}: the header and the array must both come back",
+                what
+            );
+            let errno = i32::from_le_bytes(writer[0..4].try_into().unwrap());
+            let error_idx = u32::from_le_bytes(writer[16..20].try_into().unwrap());
+            assert_eq!((errno, error_idx), *expected, "{}", what);
+        }
     }
 
     /// The autofocus buttons reach the camera every time they are pressed, and what the camera

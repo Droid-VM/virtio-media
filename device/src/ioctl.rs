@@ -908,6 +908,30 @@ fn invalid_ioctl<W: WriteToDescriptorChain>(code: V4l2Ioctl, writer: &mut W) -> 
     })
 }
 
+/// The response of `VIDIOC_G/S/TRY_EXT_CTRLS`, success or failure.
+///
+/// The `v4l2_ext_controls` header and its array of controls are written back **on both paths**.
+/// V4L2 requires it: the header carries `error_idx`, "the index of the control causing the
+/// error" (`vidioc-g-ext-ctrls.rst`), and it is only ever set on a failure. The driver reads
+/// the header back out of the response only when the device wrote enough of one --
+/// `virtio_media_send_ext_controls_ioctl()` guards its error branch with
+/// `resp_len >= sizeof(resp_ioctl) + sizeof(*ctrls)` -- so a short error response silently
+/// loses `error_idx`, which is defect D37. Every error of these three ioctls therefore goes
+/// through here, including the ones raised before the device is called at all.
+fn ext_ctrls_response(
+    ctrls: v4l2_ext_controls,
+    ctrl_array: Vec<v4l2_ext_control>,
+    result: IoctlResult<()>,
+) -> Result<
+    (v4l2_ext_controls, Vec<v4l2_ext_control>),
+    (i32, Option<(v4l2_ext_controls, Vec<v4l2_ext_control>)>),
+> {
+    match result {
+        Ok(()) => Ok((ctrls, ctrl_array)),
+        Err(e) => Err((e, Some((ctrls, ctrl_array)))),
+    }
+}
+
 /// Implements a `WR` ioctl for which errors may also carry a payload.
 ///
 /// * `Reader` is the reader to the device-readable part of the descriptor chain,
@@ -1223,15 +1247,22 @@ where
             reader,
             writer,
             |(mut ctrls, mut ctrl_array, user_regions)| {
-                let which = CtrlWhich::try_from(&ctrls).map_err(|()| (libc::EINVAL, None))?;
-
-                match handler.g_ext_ctrls(session, which, &mut ctrls, &mut ctrl_array, user_regions)
-                {
-                    Ok(()) => Ok((ctrls, ctrl_array)),
-                    // It is very important what we write back the updated input in case
-                    // of error as it contains extra information.
-                    Err(e) => Err((e, Some((ctrls, ctrl_array)))),
-                }
+                let result = match CtrlWhich::try_from(&ctrls) {
+                    Ok(which) => handler.g_ext_ctrls(
+                        session,
+                        which,
+                        &mut ctrls,
+                        &mut ctrl_array,
+                        user_regions,
+                    ),
+                    // A `which` no control set can be read under: `error_idx` is `count` for a
+                    // get, as `v4l2_g_ext_ctrls_common` leaves it after `prepare_ext_ctrls`.
+                    Err(()) => {
+                        ctrls.error_idx = ctrls.count;
+                        Err(libc::EINVAL)
+                    }
+                };
+                ext_ctrls_response(ctrls, ctrl_array, result)
             },
         ),
         VIDIOC_S_EXT_CTRLS => wr_ioctl_with_err_payload(
@@ -1239,15 +1270,22 @@ where
             reader,
             writer,
             |(mut ctrls, mut ctrl_array, user_regions)| {
-                let which = CtrlWhich::try_from(&ctrls).map_err(|()| (libc::EINVAL, None))?;
-
-                match handler.s_ext_ctrls(session, which, &mut ctrls, &mut ctrl_array, user_regions)
-                {
-                    Ok(()) => Ok((ctrls, ctrl_array)),
-                    // It is very important what we write back the updated input in case
-                    // of error as it contains extra information.
-                    Err(e) => Err((e, Some((ctrls, ctrl_array)))),
-                }
+                let result = match CtrlWhich::try_from(&ctrls) {
+                    Ok(which) => handler.s_ext_ctrls(
+                        session,
+                        which,
+                        &mut ctrls,
+                        &mut ctrl_array,
+                        user_regions,
+                    ),
+                    // `error_idx` is `count` for a refused set (`try_set_ext_ctrls_common`
+                    // puts it back to `count` whenever `set` failed).
+                    Err(()) => {
+                        ctrls.error_idx = ctrls.count;
+                        Err(libc::EINVAL)
+                    }
+                };
+                ext_ctrls_response(ctrls, ctrl_array, result)
             },
         ),
         VIDIOC_TRY_EXT_CTRLS => wr_ioctl_with_err_payload(
@@ -1255,20 +1293,21 @@ where
             reader,
             writer,
             |(mut ctrls, mut ctrl_array, user_regions)| {
-                let which = CtrlWhich::try_from(&ctrls).map_err(|()| (libc::EINVAL, None))?;
-
-                match handler.try_ext_ctrls(
-                    session,
-                    which,
-                    &mut ctrls,
-                    &mut ctrl_array,
-                    user_regions,
-                ) {
-                    Ok(()) => Ok((ctrls, ctrl_array)),
-                    // It is very important what we write back the updated input in case
-                    // of error as it contains extra information.
-                    Err(e) => Err((e, Some((ctrls, ctrl_array)))),
-                }
+                let result = match CtrlWhich::try_from(&ctrls) {
+                    Ok(which) => handler.try_ext_ctrls(
+                        session,
+                        which,
+                        &mut ctrls,
+                        &mut ctrl_array,
+                        user_regions,
+                    ),
+                    // A try names the control it stopped at, and it stopped at the first.
+                    Err(()) => {
+                        ctrls.error_idx = 0;
+                        Err(libc::EINVAL)
+                    }
+                };
+                ext_ctrls_response(ctrls, ctrl_array, result)
             },
         ),
         VIDIOC_ENUM_FRAMESIZES => {
@@ -1570,9 +1609,15 @@ mod tests {
     /// exists", then fails when the well-formed call answers `ENOTTY` (defect D6).
     #[test]
     fn an_unimplemented_ioctl_is_enotty_for_a_malformed_payload_too() {
-        assert_eq!(dispatch_prepare_buf(&mplane_buffer_bytes(0, 4096)), libc::ENOTTY);
+        assert_eq!(
+            dispatch_prepare_buf(&mplane_buffer_bytes(0, 4096)),
+            libc::ENOTTY
+        );
         // `bytesused > length`: refused by `V4l2Buffer`'s invariants, sanitised by the reader.
-        assert_eq!(dispatch_prepare_buf(&mplane_buffer_bytes(4097, 4096)), libc::ENOTTY);
+        assert_eq!(
+            dispatch_prepare_buf(&mplane_buffer_bytes(4097, 4096)),
+            libc::ENOTTY
+        );
         // A buffer that is not addressable at all is still `EINVAL`: there is no ioctl to run.
         let mut broken = mplane_buffer_bytes(0, 4096);
         broken[4..8].copy_from_slice(&0xdead_beefu32.to_le_bytes()); // `type_`

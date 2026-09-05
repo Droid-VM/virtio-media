@@ -1526,6 +1526,25 @@ where
             if class.is_some_and(|c| ctrl_class(id) != c) {
                 return Err((libc::EINVAL, fail_idx(i)));
             }
+            // The access flags are checked before anything looks at what the control is, as the
+            // kernel does: `v4l2_g_ext_ctrls_common` refuses every `WRITE_ONLY` control with
+            // `EACCES` after `prepare_ext_ctrls`, and `validate_ctrls` refuses every
+            // `READ_ONLY` one, both ahead of the type. A class marker carries *both* flags, so
+            // it is `EACCES` either way here even though `G_CTRL`/`S_CTRL` answer it `EINVAL`
+            // (`v4l2_g_ctrl` tests `is_int` first). Answering `EINVAL` instead was D42:
+            // `v4l2-compliance` fails `g_ext_ctrls did not check the write-only flag`
+            // (`v4l2-test-controls.cpp:903`) on the first control it walks, the class one.
+            let flags = match self.control_index(id) {
+                Some(index) => self.controls[index].flags(),
+                None => return Err((libc::EINVAL, fail_idx(i))),
+            };
+            let refused = match op {
+                ExtCtrlOp::Get => flags & bindings::V4L2_CTRL_FLAG_WRITE_ONLY != 0,
+                ExtCtrlOp::Try | ExtCtrlOp::Set => flags & bindings::V4L2_CTRL_FLAG_READ_ONLY != 0,
+            };
+            if refused {
+                return Err((libc::EACCES, fail_idx(i)));
+            }
             let anon = ctrl.__bindgen_anon_1;
             // SAFETY: the union's `value` member is the one a plain (payload-less) control
             // carries.

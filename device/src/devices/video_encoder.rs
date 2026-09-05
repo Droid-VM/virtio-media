@@ -115,7 +115,14 @@ use v4l2r::QueueType;
 use crate::guest_mapping_errno;
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
+use crate::ioctl::PayloadValidity;
 use crate::ioctl::VirtioMediaIoctlHandler;
+
+/// Planes per buffer in every format these queues have. `QBUF` and `PREPARE_BUF` judge the
+/// guest's payload description on these slots only: the rest of the plane array it sends is
+/// scratch space it may leave dirty, which is what ffmpeg does (defect D21; the rule is
+/// [`PayloadValidity::is_accepted_by`]).
+const NUM_PLANES: usize = 1;
 use crate::mmap::MmapMappingManager;
 use crate::mmap::RetiredBuffers;
 use crate::protocol::DequeueBufferEvent;
@@ -2473,7 +2480,7 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
         let queue_type = buffer.queue();
         let direction = queue_type.direction_or_einval()?;
@@ -2488,9 +2495,12 @@ where
             return Err(libc::EINVAL);
         }
         // A prepared buffer keeps the payload description `PREPARE_BUF` accepted; V4L2 says this
-        // call's own `bytesused`/`data_offset` are ignored.
+        // call's own `bytesused`/`data_offset` are ignored. Otherwise it is the queue's own plane
+        // count that decides which of the guest's slots are a description at all, and an `MMAP`
+        // capture buffer has no guest description to check: the device reports the payload (D21,
+        // `ioctl::PayloadValidity`).
         let prepared = entry.prepared;
-        if prepared.is_none() && !payload_valid {
+        if prepared.is_none() && !payload.is_accepted_by(direction, buffer.memory(), NUM_PLANES) {
             return Err(libc::EINVAL);
         }
         // A guest-supplied MPLANE buffer may carry no plane at all; the first plane is asked for,
@@ -2583,13 +2593,14 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         _guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
-        if !payload_valid {
-            return Err(libc::EINVAL);
-        }
         let queue_type = buffer.queue();
         let direction = queue_type.direction_or_einval()?;
+        // The same rule `qbuf` applies, with no prepared description to fall back on.
+        if !payload.is_accepted_by(direction, buffer.memory(), NUM_PLANES) {
+            return Err(libc::EINVAL);
+        }
         let sizeimage = session.sizeimage(direction);
         let q = session.queue_mut(queue_type)?;
         let entry = q

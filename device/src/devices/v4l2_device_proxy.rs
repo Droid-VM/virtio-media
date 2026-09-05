@@ -82,6 +82,7 @@ use v4l2r::QueueType;
 
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
+use crate::ioctl::PayloadValidity;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::mmap::MmapMappingManager;
 use crate::protocol::DequeueBufferEvent;
@@ -727,12 +728,21 @@ where
         session: &mut Self::Session,
         guest_buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
         // The payload fields were zeroed to make the buffer representable, so forwarding it to
         // the host device would queue something the guest did not ask for. The host driver would
         // have answered `EINVAL` for an unprepared buffer anyway.
-        if !payload_valid {
+        //
+        // How many planes the proxied queue's format has is the host driver's to say, so every
+        // slot the guest sent is judged here; what is taken from V4L2's rule is that an `MMAP`
+        // capture buffer has no guest payload at all, which is the case ffmpeg sends dirty
+        // (D21). Whatever passes, the host driver validates again.
+        if !payload.is_accepted_by(
+            guest_buffer.queue().direction(),
+            guest_buffer.memory(),
+            v4l2r::bindings::VIDEO_MAX_PLANES as usize,
+        ) {
             return Err(libc::EINVAL);
         }
         // Proactively dequeue output buffers we are done with. Errors can be ignored in
@@ -1124,10 +1134,15 @@ where
         session: &mut Self::Session,
         guest_buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
-        // `PREPARE_BUF` is where the payload description is checked, never ignored.
-        if !payload_valid {
+        // `PREPARE_BUF` is where the payload description is checked, never ignored; the plane
+        // count is the host driver's, as in `qbuf`.
+        if !payload.is_accepted_by(
+            guest_buffer.queue().direction(),
+            guest_buffer.memory(),
+            v4l2r::bindings::VIDEO_MAX_PLANES as usize,
+        ) {
             return Err(libc::EINVAL);
         }
         let (host_buffer, guest_resources) =

@@ -36,6 +36,7 @@ use v4l2r::QueueType;
 use crate::guest_mapping_errno;
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
+use crate::ioctl::PayloadValidity;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::mmap::MmapMappingManager;
 use crate::mmap::RetiredBuffers;
@@ -626,11 +627,12 @@ where
         session: &mut Self::Session,
         buffer: v4l2r::ioctl::V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<v4l2r::ioctl::V4l2Buffer> {
         // This device has no `PREPARE_BUF`, so a payload description that does not fit the
-        // buffer is always the guest's mistake.
-        if !payload_valid {
+        // buffer is always the guest's mistake -- but only on the plane slots its one-plane
+        // capture format uses, and V4L2 ignores those on an `MMAP` capture buffer anyway (D21).
+        if !payload.is_accepted_by(QueueType::VideoCapture.direction(), buffer.memory(), 1) {
             return Err(libc::EINVAL);
         }
         if buffer.queue() != QueueType::VideoCapture {

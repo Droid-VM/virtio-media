@@ -51,7 +51,14 @@ use v4l2r::QueueType;
 use crate::guest_mapping_errno;
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
+use crate::ioctl::PayloadValidity;
 use crate::ioctl::VirtioMediaIoctlHandler;
+
+/// Planes per buffer in every format these queues have. `QBUF` and `PREPARE_BUF` judge the
+/// guest's payload description on these slots only: the rest of the plane array it sends is
+/// scratch space it may leave dirty, which is what ffmpeg does (defect D21; the rule is
+/// [`PayloadValidity::is_accepted_by`]).
+const NUM_PLANES: usize = 1;
 use crate::mmap::MmapMappingManager;
 use crate::mmap::RetiredBuffers;
 use crate::protocol::DequeueBufferEvent;
@@ -1043,7 +1050,7 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
         let queue_type = buffer.queue();
         let direction = queue_type.direction();
@@ -1057,9 +1064,12 @@ where
         }
         // A prepared buffer keeps the payload description `PREPARE_BUF` accepted, and V4L2 says
         // this call's own `bytesused` / `data_offset` are ignored -- including the nonsense the
-        // dispatcher had to zero to make the buffer representable at all.
+        // dispatcher had to zero to make the buffer representable at all. Otherwise it is the
+        // queue's own plane count that decides which of the guest's slots are a description at
+        // all, and an `MMAP` capture buffer has no guest description to check: the device reports
+        // the payload (D21, `ioctl::PayloadValidity`).
         let prepared = entry.prepared;
-        if prepared.is_none() && !payload_valid {
+        if prepared.is_none() && !payload.is_accepted_by(direction, buffer.memory(), NUM_PLANES) {
             return Err(libc::EINVAL);
         }
 
@@ -1164,14 +1174,15 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         _guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
-        // Unlike `QBUF`, this is the call that checks the payload description.
-        if !payload_valid {
-            return Err(libc::EINVAL);
-        }
         let queue_type = buffer.queue();
         let direction = queue_type.direction();
+        // Unlike `QBUF`, this is the call that checks the payload description: there is no
+        // prepared one to fall back on. Same rule, same plane count.
+        if !payload.is_accepted_by(direction, buffer.memory(), NUM_PLANES) {
+            return Err(libc::EINVAL);
+        }
         let queue = session.queue_mut(queue_type)?;
         let entry = queue
             .buffers
@@ -1350,6 +1361,7 @@ mod tests {
     use v4l2r::ioctl::UncheckedV4l2Buffer;
 
     use super::*;
+    use crate::ioctl::ffmpeg_wire;
     use crate::MemFdAllocator;
 
     /// Collects the events the device sends.
@@ -1690,7 +1702,10 @@ mod tests {
 
         // CAPTURE first: nothing happens until an OUTPUT buffer arrives.
         let cap = mmap_buffer(QueueType::VideoCaptureMplane, 0, size);
-        let reply = r.device.qbuf(&mut s, cap, vec![], true).unwrap();
+        let reply = r
+            .device
+            .qbuf(&mut s, cap, vec![], PayloadValidity::ALL)
+            .unwrap();
         assert!(reply.flags().contains(BufferFlags::QUEUED));
         assert!(r.events.borrow().is_empty());
 
@@ -1700,7 +1715,10 @@ mod tests {
             tv_sec: 12,
             tv_usec: 34,
         });
-        let reply = r.device.qbuf(&mut s, out, sgs, true).unwrap();
+        let reply = r
+            .device
+            .qbuf(&mut s, out, sgs, PayloadValidity::ALL)
+            .unwrap();
         // The reply is our view of the queued buffer, userptr preserved.
         assert_eq!(reply.index(), 1);
         assert_eq!(reply.memory(), MemoryType::UserPtr);
@@ -1746,14 +1764,24 @@ mod tests {
 
         // Requeueing a dequeued buffer works, requeueing a queued one does not.
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
-        r.device.qbuf(&mut s, out, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, out, sgs, PayloadValidity::ALL)
+            .unwrap();
         assert_eq!(*r.guest.live_mappings.borrow(), 1, "held while queued");
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
-        assert_eq!(r.device.qbuf(&mut s, out, sgs, true).err(), Some(libc::EINVAL));
+        assert_eq!(
+            r.device.qbuf(&mut s, out, sgs, PayloadValidity::ALL).err(),
+            Some(libc::EINVAL)
+        );
         // A memory type other than the one REQBUFS chose is refused.
         assert_eq!(
             r.device
-                .qbuf(&mut s, mmap_buffer(QueueType::VideoOutputMplane, 1, size), vec![], true)
+                .qbuf(
+                    &mut s,
+                    mmap_buffer(QueueType::VideoOutputMplane, 1, size),
+                    vec![],
+                    PayloadValidity::ALL
+                )
                 .err(),
             Some(libc::EINVAL)
         );
@@ -1801,12 +1829,16 @@ mod tests {
 
         // bytesused == 0 means the whole buffer; the CAPTURE buffer is 100 bytes shorter.
         let out = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
-        r.device.qbuf(&mut s, out, vec![], true).unwrap();
+        r.device
+            .qbuf(&mut s, out, vec![], PayloadValidity::ALL)
+            .unwrap();
         assert!(r.events.borrow().is_empty());
 
         let gpa = 8 * 0x1000u64;
         let (cap, sgs) = userptr_buffer(QueueType::VideoCaptureMplane, 0, gpa, size - 100);
-        r.device.qbuf(&mut s, cap, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, cap, sgs, PayloadValidity::ALL)
+            .unwrap();
         // A CAPTURE buffer is the one direction the device writes, so it is mapped writable.
         assert_eq!(*r.guest.directions.borrow(), vec![true]);
 
@@ -1984,10 +2016,79 @@ mod tests {
         close(&mut r.device, other);
     }
 
+    /// D21 -- the exact `QBUF` `ffmpeg -f v4l2` sends, replayed on the wire, on both queues.
+    ///
+    /// ffmpeg declares `length = VIDEO_MAX_PLANES` and fills only `planes[0]` from `QUERYBUF`;
+    /// `planes[1..8]` are its own stack (`logs/vpu_wp/B5-acceptance.md` §4.3). Judging all eight
+    /// slots refused every buffer it queued. These formats have one plane, and vb2 looks at
+    /// `vb->num_planes` entries only -- but plane 0 on an output queue is the payload length,
+    /// and that one is still checked.
+    #[test]
+    fn ffmpegs_dirty_plane_array_is_judged_on_the_planes_the_format_has() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let size = s.output.format.sizeimage();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoCaptureMplane, MemoryType::Mmap, 2)
+            .unwrap();
+        r.device
+            .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::Mmap, 2)
+            .unwrap();
+
+        // CAPTURE, `MMAP`: accepted, and the payload that comes back is the device's own.
+        let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(
+            QueueType::VideoCaptureMplane,
+            MemoryType::Mmap,
+            0,
+            (0, size),
+        );
+        assert_eq!(
+            ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes),
+            0,
+            "ffmpeg's plane array was refused on the capture queue (D21)"
+        );
+        assert!(s.capture.buffers[0].queued);
+
+        // OUTPUT with the same dirty tail and a sane plane 0: accepted, and the length the guest
+        // declared is the one the device keeps.
+        let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(
+            QueueType::VideoOutputMplane,
+            MemoryType::Mmap,
+            0,
+            (size, size),
+        );
+        assert_eq!(ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes), 0);
+        assert_eq!(
+            *s.output.buffers[0].v4l2_buffer.get_first_plane().bytesused,
+            size
+        );
+
+        // OUTPUT with the garbage in plane 0 instead: `bytesused > length` is the one thing
+        // `__verify_length` does check on an output queue, so this is still `EINVAL`.
+        let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(
+            QueueType::VideoOutputMplane,
+            MemoryType::Mmap,
+            1,
+            (size + 1, size),
+        );
+        assert_eq!(
+            ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes),
+            libc::EINVAL,
+            "a bitstream length the buffer cannot hold was accepted"
+        );
+        assert!(!s.output.buffers[1].queued);
+
+        close(&mut r.device, s);
+    }
+
     /// A guest can send an MPLANE `v4l2_buffer` that carries no plane at all: v4l2r only refuses
-    /// `length >= VIDEO_MAX_PLANES`, so `QBUF` sees a buffer whose `planes_iter()` is empty.
+    /// `length > VIDEO_MAX_PLANES`, so `QBUF` sees a buffer whose `planes_iter()` is empty.
     /// Reading its first plane used to panic, and this VMM aborts on panic -- the whole VM died
     /// with it. The device must answer `EINVAL` and keep working.
+    ///
+    /// The reader now refuses such a buffer before any device sees it
+    /// (`ioctl::a_multiplanar_buffer_with_no_plane_is_refused_by_the_reader`); this is the guard
+    /// behind it, and it is called directly, the way review-batch1 B1 asked for.
     #[test]
     fn qbuf_of_a_planeless_mplane_buffer_is_refused() {
         let mut r = rig();
@@ -2012,7 +2113,9 @@ mod tests {
         assert_eq!(planeless.planes_iter().count(), 0);
 
         assert_eq!(
-            r.device.qbuf(&mut s, planeless, vec![], true).err(),
+            r.device
+                .qbuf(&mut s, planeless, vec![], PayloadValidity::ALL)
+                .err(),
             Some(libc::EINVAL)
         );
         assert!(r.events.borrow().is_empty(), "nothing was dequeued");
@@ -2022,8 +2125,12 @@ mod tests {
         let gpa = 4 * 0x1000u64;
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
         let cap = mmap_buffer(QueueType::VideoCaptureMplane, 0, size);
-        r.device.qbuf(&mut s, cap, vec![], true).unwrap();
-        r.device.qbuf(&mut s, out, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, cap, vec![], PayloadValidity::ALL)
+            .unwrap();
+        r.device
+            .qbuf(&mut s, out, sgs, PayloadValidity::ALL)
+            .unwrap();
         assert_eq!(dequeued(&r.events.borrow()).len(), 2);
 
         close(&mut r.device, s);
@@ -2046,16 +2153,25 @@ mod tests {
 
         let gpa = 4 * 0x1000u64;
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size + 1);
-        assert_eq!(r.device.qbuf(&mut s, out, sgs, true).err(), Some(libc::EINVAL));
+        assert_eq!(
+            r.device.qbuf(&mut s, out, sgs, PayloadValidity::ALL).err(),
+            Some(libc::EINVAL)
+        );
         assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
 
         // Zero-length is refused too, and exactly `sizeimage` is accepted.
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, 0);
-        assert_eq!(r.device.qbuf(&mut s, out, sgs, true).err(), Some(libc::EINVAL));
+        assert_eq!(
+            r.device.qbuf(&mut s, out, sgs, PayloadValidity::ALL).err(),
+            Some(libc::EINVAL)
+        );
         let (mut out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
         // `bytesused` beyond the plane's own length is clamped to it, never trusted.
         *out.get_first_plane_mut().bytesused = size;
-        let reply = r.device.qbuf(&mut s, out, sgs, true).unwrap();
+        let reply = r
+            .device
+            .qbuf(&mut s, out, sgs, PayloadValidity::ALL)
+            .unwrap();
         assert_eq!(*reply.get_first_plane().bytesused, size);
         assert_eq!(*r.guest.live_mappings.borrow(), 1);
 
@@ -2082,7 +2198,10 @@ mod tests {
 
         let (mut out, _) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, size);
         *out.get_first_plane_mut().bytesused = size;
-        let reply = r.device.prepare_buf(&mut s, out, vec![], true).unwrap();
+        let reply = r
+            .device
+            .prepare_buf(&mut s, out, vec![], PayloadValidity::ALL)
+            .unwrap();
         assert!(reply.flags().contains(BufferFlags::PREPARED));
         assert_eq!(*reply.get_first_plane().bytesused, size);
         assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing mapped yet");
@@ -2090,7 +2209,7 @@ mod tests {
         // The blocker: a plane the guest has shrunk under a buffer prepared at full size.
         let (out, sgs) = userptr_buffer(QueueType::VideoOutputMplane, 0, gpa, 8);
         assert_eq!(
-            r.device.qbuf(&mut s, out, sgs, true).err(),
+            r.device.qbuf(&mut s, out, sgs, PayloadValidity::ALL).err(),
             Some(libc::EINVAL)
         );
         assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
@@ -2100,7 +2219,10 @@ mod tests {
         // ... and a `length` that says one thing while the list covers another: the mapping is
         // what `capacity()` believes, so no copy can run off the end of it.
         let (out, sgs) = userptr_buffer_sized(QueueType::VideoOutputMplane, 0, gpa, size, 8);
-        let reply = r.device.qbuf(&mut s, out, sgs, false).unwrap();
+        let reply = r
+            .device
+            .qbuf(&mut s, out, sgs, PayloadValidity::ALL.without(0))
+            .unwrap();
         assert_eq!(s.output.buffers[0].capacity(), 8);
         assert_eq!(
             *reply.get_first_plane().bytesused,
@@ -2147,7 +2269,7 @@ mod tests {
             .reqbufs(&mut s, QueueType::VideoOutputMplane, MemoryType::Mmap, 2)
             .unwrap();
 
-        // A payload that does not fit is the dispatcher's `payload_valid == false`: refused here,
+        // A payload that does not fit is a plane the dispatcher had to zero: refused here,
         // because `PREPARE_BUF` is the call that validates it.
         assert_eq!(
             r.device
@@ -2155,7 +2277,7 @@ mod tests {
                     &mut s,
                     mmap_buffer(QueueType::VideoOutputMplane, 0, size),
                     vec![],
-                    false,
+                    PayloadValidity::ALL.without(0),
                 )
                 .err(),
             Some(libc::EINVAL)
@@ -2163,7 +2285,10 @@ mod tests {
 
         let mut buf = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
         *buf.get_first_plane_mut().bytesused = size;
-        let reply = r.device.prepare_buf(&mut s, buf, vec![], true).unwrap();
+        let reply = r
+            .device
+            .prepare_buf(&mut s, buf, vec![], PayloadValidity::ALL)
+            .unwrap();
         // Prepared, and neither queued nor done; no timestamp or sequence yet.
         assert_eq!(
             (reply.flags() & (BufferFlags::QUEUED | BufferFlags::PREPARED | BufferFlags::DONE))
@@ -2187,7 +2312,7 @@ mod tests {
                     &mut s,
                     mmap_buffer(QueueType::VideoOutputMplane, 0, size),
                     vec![],
-                    true,
+                    PayloadValidity::ALL,
                 )
                 .err(),
             Some(libc::EINVAL)
@@ -2196,7 +2321,10 @@ mod tests {
         // The guest now queues the same buffer with a payload the dispatcher had to zero.
         // Because the buffer is prepared, the numbers `PREPARE_BUF` accepted are kept.
         let queued = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
-        let reply = r.device.qbuf(&mut s, queued, vec![], false).unwrap();
+        let reply = r
+            .device
+            .qbuf(&mut s, queued, vec![], PayloadValidity::ALL.without(0))
+            .unwrap();
         assert!(reply.flags().contains(BufferFlags::QUEUED));
         assert!(!reply.flags().contains(BufferFlags::PREPARED));
         assert_eq!(*reply.get_first_plane().bytesused, size);
@@ -2209,7 +2337,7 @@ mod tests {
                     &mut s,
                     mmap_buffer(QueueType::VideoOutputMplane, 1, size),
                     vec![],
-                    false,
+                    PayloadValidity::ALL.without(0),
                 )
                 .err(),
             Some(libc::EINVAL)
@@ -2221,7 +2349,7 @@ mod tests {
                     &mut s,
                     mmap_buffer(QueueType::VideoOutputMplane, 0, size),
                     vec![],
-                    true,
+                    PayloadValidity::ALL,
                 )
                 .err(),
             Some(libc::EINVAL)
@@ -2466,7 +2594,9 @@ mod tests {
             .unwrap();
         for index in 0..count {
             let cap = mmap_buffer(QueueType::VideoCaptureMplane, index, size);
-            r.device.qbuf(&mut s, cap, vec![], true).unwrap();
+            r.device
+                .qbuf(&mut s, cap, vec![], PayloadValidity::ALL)
+                .unwrap();
         }
         (r, s)
     }
@@ -2516,7 +2646,7 @@ mod tests {
                 &mut s,
                 mmap_buffer(QueueType::VideoCaptureMplane, 0, size),
                 vec![],
-                true,
+                PayloadValidity::ALL,
             )
             .unwrap();
         r.device.decoder_cmd(&mut s, dec_stop()).unwrap();
@@ -2535,7 +2665,9 @@ mod tests {
         // One OUTPUT buffer queued: the pair is copied straight away, before any STOP.
         let mut out = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
         *out.get_first_plane_mut().bytesused = size;
-        r.device.qbuf(&mut s, out, vec![], true).unwrap();
+        r.device
+            .qbuf(&mut s, out, vec![], PayloadValidity::ALL)
+            .unwrap();
         let events = dequeued(&r.events.borrow());
         assert_eq!(events.len(), 2, "one DQBUF per queue, no drain yet");
         assert!(!events[1].flags().contains(BufferFlags::LAST));
@@ -2574,7 +2706,9 @@ mod tests {
         // OUTPUT queued with no CAPTURE buffer to copy into yet.
         let mut out = mmap_buffer(QueueType::VideoOutputMplane, 0, size);
         *out.get_first_plane_mut().bytesused = size;
-        r.device.qbuf(&mut s, out, vec![], true).unwrap();
+        r.device
+            .qbuf(&mut s, out, vec![], PayloadValidity::ALL)
+            .unwrap();
         assert!(dequeued(&r.events.borrow()).is_empty());
 
         // STOP now: nothing may be returned, the input is still owed a frame.
@@ -2583,7 +2717,9 @@ mod tests {
 
         // The CAPTURE buffer that completes it carries the data *and* the flag.
         let cap = mmap_buffer(QueueType::VideoCaptureMplane, 0, size);
-        r.device.qbuf(&mut s, cap, vec![], true).unwrap();
+        r.device
+            .qbuf(&mut s, cap, vec![], PayloadValidity::ALL)
+            .unwrap();
         let events = dequeued(&r.events.borrow());
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].queue(), QueueType::VideoCaptureMplane);

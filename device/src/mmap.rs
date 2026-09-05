@@ -135,14 +135,24 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
         offset: Option<u32>,
         size: u32,
     ) -> Result<u32, RegisterBufferError> {
-        let offset = offset.unwrap_or_else(|| {
-            self.buffers
-                .last()
+        let offset = match offset {
+            Some(offset) => offset,
+            None => match self.buffers.last() {
                 // Align the start offset to the next page, or `register_buffer_by_offset` will
-                // fail.
-                .map(|b| ((b.offset + 1).next_multiple_of(PAGE_SIZE)))
-                .unwrap_or(0)
-        });
+                // fail. Checked, not `+ 1` and `next_multiple_of`: both panic on overflow, and
+                // this VMM is built with `panic = 'abort'`, so a full 32-bit MMAP range would
+                // take the whole VM down instead of failing one `REQBUFS`. It takes about a
+                // million live buffers to get there, and the offsets are the device's own
+                // rather than the guest's, but it is the same abort-on-arithmetic shape as
+                // defect D18 (`logs/vpu_wp/F6.md` §10).
+                Some(b) => b
+                    .offset
+                    .checked_add(1)
+                    .and_then(|o| o.checked_next_multiple_of(PAGE_SIZE))
+                    .ok_or(RegisterBufferError::NoFreeSpace)?,
+                None => 0,
+            },
+        };
 
         self.register_buffer_by_offset(offset, size)
             .map(|()| offset)
@@ -673,6 +683,25 @@ mod tests {
                 MmapBuffer::new(0x7000, 0x2000),
             ]
         );
+    }
+
+    /// The end of the 32-bit MMAP range is a full range, not an abort. Allocating the next
+    /// offset is `(last + 1).next_multiple_of(PAGE_SIZE)`, and both halves of that panic on
+    /// overflow -- in a VMM built with `panic = 'abort'`, that is the whole VM for one
+    /// `REQBUFS` (`logs/vpu_wp/F6.md` §10, the same shape as defect D18).
+    #[test]
+    fn an_offset_at_the_end_of_the_range_is_out_of_space_not_an_abort() {
+        let mut mm = MmapMappingManager::from(DummyHostMemoryMapper);
+        assert_eq!(
+            mm.register_buffer(Some(0xffff_f000), 0x1000),
+            Ok(0xffff_f000)
+        );
+        assert_eq!(
+            mm.register_buffer(None, 0x1000),
+            Err(RegisterBufferError::NoFreeSpace)
+        );
+        // An explicit offset is unaffected, and so is a range that still has room.
+        assert_eq!(mm.register_buffer(Some(0x0), 0x1000), Ok(0x0));
     }
 
     #[test]

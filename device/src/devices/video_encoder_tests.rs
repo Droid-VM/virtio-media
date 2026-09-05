@@ -26,6 +26,7 @@ use v4l2r::controls::codec::VideoHEVCLevel;
 use v4l2r::controls::codec::VideoHEVCProfile;
 
 use super::*;
+use crate::ioctl::ffmpeg_wire;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::MemFdAllocator;
 
@@ -874,7 +875,7 @@ fn queue_frame(r: &mut Rig, s: &mut Session, index: u32, luma: u8, n: i64) {
     fill_mmap_output(s, index as usize, luma);
     let mut ob = mmap_buffer(OUTPUT, index, RAW_SIZEIMAGE);
     ob.set_timestamp(ts(n));
-    r.device.qbuf(s, ob, vec![], true).unwrap();
+    r.device.qbuf(s, ob, vec![], PayloadValidity::ALL).unwrap();
 }
 
 /// A timestamp that carries `n` so a CAPTURE buffer can be matched to the OUTPUT buffer it came
@@ -1102,7 +1103,12 @@ fn start_streaming(r: &mut Rig, s: &mut Session) -> u32 {
     r.device.reqbufs(s, CAPTURE, MemoryType::Mmap, 4).unwrap();
     for i in 0..4 {
         r.device
-            .qbuf(s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true)
+            .qbuf(
+                s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
             .unwrap();
     }
     r.device.streamon(s, OUTPUT).unwrap();
@@ -2120,7 +2126,12 @@ fn ffmpeg_h264_v4l2m2m_encode_sequence() {
     assert_eq!(config.visible_rect, v4l2r::Rect::new(0, 0, SIZE.0, SIZE.1));
     for i in 0..4 {
         r.device
-            .qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true)
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
             .unwrap();
     }
     // Three more frames; the fourth is an I picture again (FORCE_KEY_FRAME).
@@ -2195,7 +2206,12 @@ fn ffmpeg_h264_v4l2m2m_encode_sequence() {
         .encoder_cmd(&mut s, enc_cmd(bindings::V4L2_ENC_CMD_STOP))
         .unwrap();
     r.device
-        .qbuf(&mut s, mmap_buffer(CAPTURE, free, sizeimage), vec![], true)
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, free, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
         .unwrap();
     collect_capture(&mut r, &mut s, 5);
     let last = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
@@ -2316,7 +2332,12 @@ fn gstreamer_v4l2h264enc_sequence() {
         .unwrap();
     for i in 0..4 {
         r.device
-            .qbuf(&mut s, mmap_buffer(CAPTURE, i, max_sizeimage), vec![], true)
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, max_sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
             .unwrap();
     }
     r.device.streamon(&mut s, CAPTURE).unwrap();
@@ -2523,6 +2544,68 @@ fn runtime_bitrate_and_force_keyframe_reach_the_session() {
     close(&mut r.device, s);
 }
 
+/// D21 -- the exact `QBUF` `ffmpeg -f v4l2` sends, replayed on the wire, on both queues.
+///
+/// ffmpeg declares `length = VIDEO_MAX_PLANES` and fills only `planes[0]` from `QUERYBUF`;
+/// `planes[1..8]` are its own stack (`logs/vpu_wp/B5-acceptance.md` §4.3). Judging all eight
+/// slots refused every buffer it queued. These formats have one plane, and vb2 looks at
+/// `vb->num_planes` entries only (`__verify_length`, `videobuf2-v4l2.c:105`) -- but plane 0 on
+/// an output queue is the payload length, and that one is still checked.
+#[test]
+fn ffmpegs_dirty_plane_array_is_judged_on_the_planes_the_format_has() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device
+        .s_fmt(&mut s, CAPTURE, capture_format(H264, 0))
+        .unwrap();
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(NV12, SIZE.0, SIZE.1))
+        .unwrap();
+    r.device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2)
+        .unwrap();
+
+    // OUTPUT (the raw frame) with a sane plane 0 under the dirty tail: queued, and the length
+    // the guest declared is kept.
+    let bytes =
+        ffmpeg_wire::ffmpeg_qbuf_bytes(OUTPUT, MemoryType::Mmap, 0, (RAW_SIZEIMAGE, RAW_SIZEIMAGE));
+    assert_eq!(
+        ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes),
+        0,
+        "ffmpeg's plane array was refused on the output queue (D21)"
+    );
+    assert_eq!(
+        *s.input.buffers[0].v4l2_buffer.get_first_plane().bytesused,
+        RAW_SIZEIMAGE
+    );
+
+    // The same array with the garbage in plane 0: still `EINVAL`.
+    let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(
+        OUTPUT,
+        MemoryType::Mmap,
+        1,
+        (RAW_SIZEIMAGE + 1, RAW_SIZEIMAGE),
+    );
+    assert_eq!(
+        ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes),
+        libc::EINVAL,
+        "a payload the buffer cannot hold was accepted"
+    );
+    assert!(!s.input.buffers[1].queued);
+
+    // CAPTURE, `MMAP`: the bitstream is this device's to write, so the guest's payload is
+    // ignored.
+    let bitstream = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2)
+        .unwrap();
+    let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(CAPTURE, MemoryType::Mmap, 0, (0, bitstream));
+    assert_eq!(ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes), 0);
+    assert!(s.output.buffers[0].queued);
+
+    close(&mut r.device, s);
+}
+
 /// Guest-owned buffers (`driver_owned_queues=output`, the DroidVM default, and `all`): the raw
 /// frame is a read-only guest mapping held until `InputBufferDone`, the bitstream lands in a
 /// writable guest mapping dropped before the DQBUF event; a buffer too short for the queue's
@@ -2552,12 +2635,16 @@ fn userptr_raw_input_and_bitstream_output_go_through_guest_mappings() {
     // Too short on either queue: refused, nothing mapped.
     let (short, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, RAW_SIZEIMAGE - 1, RAW_SIZEIMAGE - 1);
     assert_eq!(
-        r.device.qbuf(&mut s, short, sgs, true).err(),
+        r.device
+            .qbuf(&mut s, short, sgs, PayloadValidity::ALL)
+            .err(),
         Some(libc::EINVAL)
     );
     let (short, sgs) = userptr_buffer(CAPTURE, 0, 0x100000, bitstream - 1, 0);
     assert_eq!(
-        r.device.qbuf(&mut s, short, sgs, true).err(),
+        r.device
+            .qbuf(&mut s, short, sgs, PayloadValidity::ALL)
+            .err(),
         Some(libc::EINVAL)
     );
     // A scatter list shorter than the declared length: refused too.
@@ -2565,20 +2652,22 @@ fn userptr_raw_input_and_bitstream_output_go_through_guest_mappings() {
     *lying.get_first_plane_mut().length = RAW_SIZEIMAGE;
     let sgs = vec![vec![SgEntry::new(0x1000, 4096)]];
     assert_eq!(
-        r.device.qbuf(&mut s, lying, sgs, true).err(),
+        r.device
+            .qbuf(&mut s, lying, sgs, PayloadValidity::ALL)
+            .err(),
         Some(libc::EINVAL)
     );
     // Prepared at full length, then queued with an 8-byte list: refused, still prepared.
     let (pb, _) = userptr_buffer(OUTPUT, 1, 0x1000, RAW_SIZEIMAGE, RAW_SIZEIMAGE);
     assert!(r
         .device
-        .prepare_buf(&mut s, pb, vec![], true)
+        .prepare_buf(&mut s, pb, vec![], PayloadValidity::ALL)
         .unwrap()
         .flags()
         .contains(BufferFlags::PREPARED));
     let (qb, sgs) = userptr_buffer(OUTPUT, 1, 0x1000, 8, 8);
     assert_eq!(
-        r.device.qbuf(&mut s, qb, sgs, true).err(),
+        r.device.qbuf(&mut s, qb, sgs, PayloadValidity::ALL).err(),
         Some(libc::EINVAL)
     );
     assert!(s.input.buffers[1].prepared.is_some());
@@ -2594,7 +2683,9 @@ fn userptr_raw_input_and_bitstream_output_go_through_guest_mappings() {
     let (ob, sgs) = userptr_buffer(OUTPUT, 0, raw_gpa, RAW_SIZEIMAGE, RAW_SIZEIMAGE);
     let mut ob = ob;
     ob.set_timestamp(ts(9));
-    r.device.qbuf(&mut s, ob, sgs, true).unwrap();
+    r.device
+        .qbuf(&mut s, ob, sgs, PayloadValidity::ALL)
+        .unwrap();
     assert_eq!(
         *r.guest.live_mappings.borrow(),
         1,
@@ -2602,7 +2693,9 @@ fn userptr_raw_input_and_bitstream_output_go_through_guest_mappings() {
     );
     let cap_gpa = 0x200000u64;
     let (cb, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, bitstream, 0);
-    r.device.qbuf(&mut s, cb, sgs, true).unwrap();
+    r.device
+        .qbuf(&mut s, cb, sgs, PayloadValidity::ALL)
+        .unwrap();
     assert_eq!(
         *r.guest.live_mappings.borrow(),
         2,
@@ -2670,7 +2763,12 @@ fn streamoff_output_pauses_and_streamoff_capture_resets_the_codec() {
     assert_eq!(r.log.lock().unwrap().started.len(), 1, "no second codec");
     for i in 0..4 {
         r.device
-            .qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true)
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
             .unwrap();
     }
     queue_frame(&mut r, &mut s, 1, 0x65, 5);
@@ -2730,7 +2828,12 @@ fn streamoff_output_pauses_and_streamoff_capture_resets_the_codec() {
     // A fresh codec: headers again, frame 9 first, as a keyframe of the new stream.
     for i in 0..4 {
         r.device
-            .qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true)
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
             .unwrap();
     }
     r.device.streamon(&mut s, CAPTURE).unwrap();
@@ -2809,7 +2912,12 @@ fn lifecycle_invariants_join_the_backend_before_freeing() {
         .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2)
         .unwrap();
     r.device
-        .qbuf(&mut s, mmap_buffer(CAPTURE, 0, sizeimage), vec![], true)
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 0, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
         .unwrap();
     r.device.streamon(&mut s, CAPTURE).unwrap();
     assert_eq!(r.log.lock().unwrap().started.len(), 2);
@@ -2964,7 +3072,12 @@ fn encoder_cmd_matches_the_compliance_probe() {
         Some(libc::EBUSY)
     );
     r.device
-        .qbuf(&mut s, mmap_buffer(CAPTURE, 0, sizeimage), vec![], true)
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 0, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
         .unwrap();
     collect_capture(&mut r, &mut s, 1);
     let last = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
@@ -2977,7 +3090,12 @@ fn encoder_cmd_matches_the_compliance_probe() {
     );
     // A CAPTURE buffer queued after the LAST one is held, not lent, until START.
     r.device
-        .qbuf(&mut s, mmap_buffer(CAPTURE, 1, sizeimage), vec![], true)
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 1, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
         .unwrap();
     assert!(!s.output.buffers[1].lent);
     assert!(
@@ -3000,7 +3118,12 @@ fn encoder_cmd_matches_the_compliance_probe() {
     r.device.streamon(&mut s, OUTPUT).unwrap();
     r.device.streamon(&mut s, CAPTURE).unwrap();
     r.device
-        .qbuf(&mut s, mmap_buffer(CAPTURE, 0, sizeimage), vec![], true)
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 0, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
         .unwrap();
     assert!(r
         .device
@@ -3071,12 +3194,18 @@ fn create_bufs_refuses_a_set_too_small_and_prepare_buf_keeps_its_payload() {
         .reqbufs(&mut s, OUTPUT, MemoryType::UserPtr, 1)
         .unwrap();
     let (pb, _) = userptr_buffer(OUTPUT, 0, 0x4000, RAW_SIZEIMAGE, RAW_SIZEIMAGE);
-    let prepared = r.device.prepare_buf(&mut s, pb, vec![], true).unwrap();
+    let prepared = r
+        .device
+        .prepare_buf(&mut s, pb, vec![], PayloadValidity::ALL)
+        .unwrap();
     assert!(prepared.flags().contains(BufferFlags::PREPARED));
     assert_eq!(*prepared.get_first_plane().bytesused, RAW_SIZEIMAGE);
     let (mut qb, sgs) = userptr_buffer(OUTPUT, 0, 0x4000, RAW_SIZEIMAGE, 0xdead_beef);
     *qb.get_first_plane_mut().bytesused = 0xdead_beef;
-    let queued = r.device.qbuf(&mut s, qb, sgs, true).unwrap();
+    let queued = r
+        .device
+        .qbuf(&mut s, qb, sgs, PayloadValidity::ALL)
+        .unwrap();
     assert!(queued.flags().contains(BufferFlags::QUEUED));
     assert_eq!(
         *queued.get_first_plane().bytesused,
@@ -3086,7 +3215,9 @@ fn create_bufs_refuses_a_set_too_small_and_prepare_buf_keeps_its_payload() {
     // Preparing a queued buffer, or twice, is refused.
     let (pb, _) = userptr_buffer(OUTPUT, 0, 0x4000, RAW_SIZEIMAGE, RAW_SIZEIMAGE);
     assert_eq!(
-        r.device.prepare_buf(&mut s, pb, vec![], true).err(),
+        r.device
+            .prepare_buf(&mut s, pb, vec![], PayloadValidity::ALL)
+            .err(),
         Some(libc::EINVAL)
     );
 
@@ -3202,7 +3333,12 @@ fn a_codec_error_ends_the_session() {
     fill_mmap_output(&mut s, 0, 0x01);
     assert_eq!(
         r.device
-            .qbuf(&mut s, mmap_buffer(OUTPUT, 0, RAW_SIZEIMAGE), vec![], true)
+            .qbuf(
+                &mut s,
+                mmap_buffer(OUTPUT, 0, RAW_SIZEIMAGE),
+                vec![],
+                PayloadValidity::ALL
+            )
             .err(),
         Some(libc::ENODEV)
     );

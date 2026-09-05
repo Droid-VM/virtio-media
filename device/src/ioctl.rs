@@ -123,19 +123,93 @@ where
     }
 }
 
+/// Which slots of the plane array a guest sent describe a payload -- `bytesused` and
+/// `data_offset` -- that the buffer can actually hold.
+///
+/// They are the two fields of a queued buffer a guest can make nonsensical without making the
+/// buffer itself unusable, and the reader cannot decide what that means: it does not know how
+/// many planes the queue's format has, and V4L2 does not treat the pair the same way everywhere.
+/// So the reader zeroes the slots it could not represent, records them here, and the device
+/// applies its own queue's rule.
+///
+/// The rule is vb2's `__verify_length`
+/// (`GKI_6.18-2026-06_r11/drivers/media/common/videobuf2/videobuf2-v4l2.c:95-129`), and it has
+/// three parts:
+///
+/// * it looks at `vb->num_planes` entries only, never at `b->length` -- `length` is the size of
+///   the caller's plane *array*, and the slots past the format's plane count are scratch space a
+///   caller may legally leave dirty. ffmpeg does exactly that: it sends
+///   `length = VIDEO_MAX_PLANES` with an uninitialised `v4l2_plane[8]` on the stack and fills
+///   only `planes[0]` from `QUERYBUF`, so judging all eight slots refused every `QBUF` it made
+///   and `ffmpeg -f v4l2 -i /dev/videoN` could not capture a single frame (defect D21,
+///   `logs/vpu_wp/B5-acceptance.md` §4.3 and §6);
+/// * on a **capture** queue it returns 0 before looking at anything (`:101-102`): the payload is
+///   the device's to report, not the caller's to declare;
+/// * on an **output** queue every one of those planes must satisfy `bytesused <= length` and
+///   `data_offset < bytesused`, which for these devices is the bitstream length.
+///
+/// [`Self::is_accepted_by`] is that rule. The devices here take the capture half only for `MMAP`
+/// buffers, which is D21's case; on a `USERPTR` capture buffer the guest's own description is
+/// the only thing the device has to check, and nothing needs it relaxed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayloadValidity(u8);
+
+// One bit per plane slot, so the mask must have as many bits as a `v4l2_buffer` has slots.
+const _: () = assert!(v4l2r::bindings::VIDEO_MAX_PLANES == u8::BITS);
+
+impl PayloadValidity {
+    /// Every slot describes a payload the buffer can hold -- nothing was sanitised.
+    pub const ALL: Self = Self(u8::MAX);
+
+    /// The same, with the payload of `plane` marked as zeroed by the reader.
+    pub const fn without(self, plane: usize) -> Self {
+        if plane >= u8::BITS as usize {
+            self
+        } else {
+            Self(self.0 & !(1u8 << plane))
+        }
+    }
+
+    /// Whether the guest's payload description for `plane` was taken as sent.
+    pub const fn plane_is_valid(self, plane: usize) -> bool {
+        plane < u8::BITS as usize && (self.0 & (1u8 << plane)) != 0
+    }
+
+    /// Whether the first `num_planes` slots -- the ones a format with `num_planes` planes
+    /// actually uses -- were all taken as sent. A count larger than a plane array is never
+    /// valid.
+    pub fn planes_are_valid(self, num_planes: usize) -> bool {
+        (0..num_planes).all(|plane| self.plane_is_valid(plane))
+    }
+
+    /// Whether a queue of `num_planes` planes, in `direction` and `memory` mode, may take this
+    /// payload description: vb2's `__verify_length` rule, as the type doc describes it.
+    pub fn is_accepted_by(
+        self,
+        direction: QueueDirection,
+        memory: MemoryType,
+        num_planes: usize,
+    ) -> bool {
+        match (direction, memory) {
+            // The device fills the buffer and reports what it wrote, so V4L2 ignores whatever
+            // the guest declared here -- including the dirty stack ffmpeg sends (D21).
+            (QueueDirection::Capture, MemoryType::Mmap) => true,
+            _ => self.planes_are_valid(num_planes),
+        }
+    }
+}
+
 /// A `v4l2_buffer` as the guest sent it, together with the SG lists of its `USERPTR` planes.
 ///
-/// `payload_valid` says whether the guest's `bytesused` and `data_offset` describe a payload the
-/// buffer can actually hold. They are the two fields of a queued buffer a guest can make
-/// nonsensical without making the buffer itself unusable, and V4L2 does not treat them the same
-/// way everywhere: `QBUF` **ignores** both once `PREPARE_BUF` has taken the buffer, so only the
-/// device knows whether an inconsistent pair is an error. When it is not, the fields have been
-/// zeroed here so that the rest of the buffer -- index, memory type, plane backing, SG lists --
-/// is still there to be used.
+/// `payload` says which of the plane slots' `bytesused` / `data_offset` the reader could take as
+/// sent; the rest have been zeroed here so that the buffer -- index, memory type, plane backing,
+/// SG lists -- is still there to be used. `QBUF` **ignores** both fields once `PREPARE_BUF` has
+/// taken the buffer, and a capture queue ignores them always, so only the device knows whether
+/// an inconsistent pair is an error: see [`PayloadValidity`].
 pub struct GuestV4l2Buffer {
     pub buffer: V4l2Buffer,
     pub guest_regions: Vec<Vec<SgEntry>>,
-    pub payload_valid: bool,
+    pub payload: PayloadValidity,
 }
 
 /// Implementation to easily read a `v4l2_buffer` of `USERPTR` memory type and its associated
@@ -151,8 +225,14 @@ impl FromDescriptorChain for GuestV4l2Buffer {
             None => return Err(std::io::ErrorKind::InvalidData.into()),
         };
 
-        let v4l2_planes = if queue.is_multiplanar() && v4l2_buffer.length > 0 {
-            if v4l2_buffer.length > v4l2r::bindings::VIDEO_MAX_PLANES {
+        let v4l2_planes = if queue.is_multiplanar() {
+            // `length` is the size of the caller's plane array, and vb2 takes
+            // `num_planes <= length <= VB2_MAX_PLANES` (`__verify_planes_array`,
+            // `videobuf2-v4l2.c:76`). A format has at least one plane, so an array of none is
+            // not a buffer any queue could use -- and `V4l2Buffer::get_first_plane` would
+            // `unwrap` an empty iterator on it, which aborts this VMM. Refused here, where the
+            // buffer is built, rather than left for each device to trip over.
+            if v4l2_buffer.length == 0 || v4l2_buffer.length > v4l2r::bindings::VIDEO_MAX_PLANES {
                 return Err(std::io::ErrorKind::InvalidData.into());
             }
 
@@ -173,8 +253,16 @@ impl FromDescriptorChain for GuestV4l2Buffer {
 
         // A `v4l2_buffer` whose `bytesused` overflows its `length`, or whose `data_offset` is not
         // inside its payload, is refused by `V4l2Buffer`'s invariants -- but it is a legal thing
-        // for a guest to send on a prepared buffer, where V4L2 says both fields are ignored. Zero
-        // them and try again, and let the device decide (`payload_valid` below).
+        // for a guest to send: V4L2 ignores both fields on a buffer `PREPARE_BUF` has taken and
+        // on every capture queue, and the slots past the format's plane count are scratch space
+        // a caller may leave dirty. Zero the offending slot, remember which one it was, and let
+        // the device apply its own queue's rule (`PayloadValidity`).
+        //
+        // One slot at a time, not the whole array: judging all eight of them at once is what
+        // refused every `QBUF` ffmpeg made, which sends `length = VIDEO_MAX_PLANES` with planes
+        // 1..7 uninitialised (defect D21, `logs/vpu_wp/B5-acceptance.md` §4.3). Zeroing the
+        // whole array would also have destroyed plane 0's `bytesused` -- the bitstream length an
+        // output queue must still validate -- on a buffer whose only fault was in the scratch.
         //
         // The third way this conversion used to fail was `InvalidNumberOfPlanes` for a `length`
         // of exactly `VIDEO_MAX_PLANES`, which is the plane array size ffmpeg puts on every
@@ -184,26 +272,39 @@ impl FromDescriptorChain for GuestV4l2Buffer {
         // the two above it is not a field a device could reinterpret, and letting it through
         // with the plane array clamped would have hidden a real out-of-range `length` too. It is
         // why `ffmpeg -f v4l2 -i /dev/video0` could not queue a single buffer (D17).
-        let (v4l2_buffer, payload_valid) =
-            match V4l2Buffer::try_from(UncheckedV4l2Buffer(v4l2_buffer, v4l2_planes)) {
-                Ok(buffer) => (buffer, true),
-                Err(V4l2BufferFromError::PlaneSizeOverflow(..))
-                | Err(V4l2BufferFromError::InvalidDataOffset(..)) => {
-                    let mut zeroed = v4l2_buffer;
-                    zeroed.bytesused = 0;
-                    let v4l2_planes = v4l2_planes.map(|mut planes| {
-                        for plane in planes.iter_mut() {
-                            plane.bytesused = 0;
-                            plane.data_offset = 0;
-                        }
-                        planes
-                    });
-                    let buffer = V4l2Buffer::try_from(UncheckedV4l2Buffer(zeroed, v4l2_planes))
-                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-                    (buffer, false)
+        let mut unchecked_buffer = v4l2_buffer;
+        let mut unchecked_planes = v4l2_planes;
+        let mut payload = PayloadValidity::ALL;
+        let v4l2_buffer = loop {
+            let attempt =
+                V4l2Buffer::try_from(UncheckedV4l2Buffer(unchecked_buffer, unchecked_planes));
+            match attempt {
+                Ok(buffer) => break buffer,
+                Err(V4l2BufferFromError::PlaneSizeOverflow(plane, ..))
+                | Err(V4l2BufferFromError::InvalidDataOffset(plane, ..)) => {
+                    // Zeroing a slot makes it representable, so the same slot cannot come back:
+                    // if it does, the conversion is failing for a reason this loop cannot fix
+                    // and the buffer is not addressable at all.
+                    if !payload.plane_is_valid(plane) {
+                        return Err(std::io::ErrorKind::InvalidData.into());
+                    }
+                    payload = payload.without(plane);
+                    match unchecked_planes.as_mut() {
+                        Some(planes) => match planes.get_mut(plane) {
+                            Some(slot) => {
+                                slot.bytesused = 0;
+                                slot.data_offset = 0;
+                            }
+                            None => return Err(std::io::ErrorKind::InvalidData.into()),
+                        },
+                        // Single-planar: the payload is on the buffer itself, and the only
+                        // plane v4l2r can name is 0.
+                        None => unchecked_buffer.bytesused = 0,
+                    }
                 }
                 Err(_) => return Err(std::io::ErrorKind::InvalidData.into()),
-            };
+            }
+        };
 
         // Read the `MemRegion`s of all planes if the buffer is `USERPTR`.
         let guest_regions = if let V4l2PlanesWithBacking::UserPtr(planes) =
@@ -223,7 +324,7 @@ impl FromDescriptorChain for GuestV4l2Buffer {
         Ok(GuestV4l2Buffer {
             buffer: v4l2_buffer,
             guest_regions,
-            payload_valid,
+            payload,
         })
     }
 }
@@ -373,16 +474,18 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    /// `payload_valid` is `false` when the guest's `bytesused` / `data_offset` did not describe a
-    /// payload the buffer can hold and were zeroed by the dispatcher. V4L2 ignores both fields on
-    /// a buffer `PREPARE_BUF` has already taken, so a device that implements `prepare_buf` may
-    /// accept such a buffer; every other device must answer `EINVAL`.
+    /// `payload` names the plane slots whose `bytesused` / `data_offset` the guest described in a
+    /// way the buffer can hold; the rest were zeroed by the dispatcher. Only the device knows
+    /// which slots its queue's format uses and which are the caller's scratch, so it is the
+    /// device that judges them -- [`PayloadValidity::is_accepted_by`] is the rule vb2 applies.
+    /// V4L2 ignores both fields on a buffer `PREPARE_BUF` has already taken, so a device that
+    /// implements `prepare_buf` may accept any description on a prepared buffer.
     fn qbuf(
         &mut self,
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
         unhandled_ioctl!()
     }
@@ -680,8 +783,9 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    /// `payload_valid` is as in [`Self::qbuf`], except that `PREPARE_BUF` is the ioctl that
-    /// *validates* the payload, so an implementation must always refuse `false`.
+    /// `payload` is as in [`Self::qbuf`], except that `PREPARE_BUF` is the ioctl that
+    /// *validates* the payload, so an implementation must refuse a description its queue cannot
+    /// take -- there is no earlier call to have accepted one.
     ///
     /// The default is `ENOTTY` whatever the guest sent, which is what makes "this device has no
     /// `PREPARE_BUF`" a single answer: the dispatcher used to validate the payload first, so a
@@ -692,7 +796,7 @@ pub trait VirtioMediaIoctlHandler {
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
         unhandled_ioctl!()
     }
@@ -997,12 +1101,7 @@ where
             let num_planes = input.buffer.num_planes();
 
             handler
-                .qbuf(
-                    session,
-                    input.buffer,
-                    input.guest_regions,
-                    input.payload_valid,
-                )
+                .qbuf(session, input.buffer, input.guest_regions, input.payload)
                 .map(|guest_buffer| (guest_buffer, num_planes))
         }),
         // TODO implement EXPBUF.
@@ -1240,12 +1339,7 @@ where
             let num_planes = input.buffer.num_planes();
 
             handler
-                .prepare_buf(
-                    session,
-                    input.buffer,
-                    input.guest_regions,
-                    input.payload_valid,
-                )
+                .prepare_buf(session, input.buffer, input.guest_regions, input.payload)
                 .map(|out_buffer| (out_buffer, num_planes))
         }),
         VIDIOC_G_SELECTION => wr_ioctl(ioctl, reader, writer, |mut selection: v4l2_selection| {
@@ -1306,6 +1400,92 @@ where
         VIDIOC_QUERY_EXT_CTRL => wr_ioctl(ioctl, reader, writer, |ctrl: v4l2_query_ext_ctrl| {
             handler.query_ext_ctrl_raw(session, ctrl.id)
         }),
+    }
+}
+
+/// The wire bytes an ffmpeg-shaped client puts on a `QBUF`, shared by every device's tests.
+///
+/// It is one dump, replayed in five places, because the bug it pins (D21) was in the shared
+/// reader and hit all of them at once.
+#[cfg(test)]
+pub(crate) mod ffmpeg_wire {
+    use zerocopy::AsBytes;
+
+    use super::*;
+    use crate::io::VmediaType;
+
+    /// The dirty stack `ffmpeg -f v4l2` leaves in `planes[1..8]`, captured from the guest by an
+    /// `LD_PRELOAD` shim on 5566 (`logs/vpu_wp/B5-acceptance.md` §4.3, `scratch-b5/qbufspy.c`).
+    /// ffmpeg declares `length = VIDEO_MAX_PLANES` and fills `planes[0]` from `QUERYBUF`; the
+    /// rest is whatever was on its stack. The dump elided slots 5..7 as "likewise", so they
+    /// repeat the shape of 3 and 4.
+    ///
+    /// `(bytesused, length, data_offset)`. Slot 2's triple happens to be self-consistent, which
+    /// is exactly why the reader must judge the slots one at a time rather than as a block.
+    const FFMPEG_DIRTY_TAIL: [(u32, u32, u32); 7] = [
+        (1, 3425573041, 119),
+        (119, 3750202224, 1),
+        (3019899000, 912, 3133457408),
+        (2626962592, 44344, 4294967295),
+        (3019899000, 912, 3133457408),
+        (2626962592, 44344, 4294967295),
+        (3019899000, 912, 3133457408),
+    ];
+
+    /// One `QBUF` on the wire in ffmpeg's shape: `length = VIDEO_MAX_PLANES`, `planes[0]` as
+    /// `QUERYBUF` reported it, `planes[1..8]` uninitialised.
+    pub(crate) fn ffmpeg_qbuf_bytes(
+        queue: QueueType,
+        memory: MemoryType,
+        index: u32,
+        plane0: (u32, u32),
+    ) -> Vec<u8> {
+        let buffer = v4l2_buffer {
+            index,
+            type_: queue as u32,
+            memory: memory as u32,
+            length: v4l2r::bindings::VIDEO_MAX_PLANES,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(buffer.to_le().as_bytes());
+        let (bytesused, length) = plane0;
+        let mut planes = vec![v4l2_plane {
+            bytesused,
+            length,
+            ..Default::default()
+        }];
+        for &(bytesused, length, data_offset) in FFMPEG_DIRTY_TAIL.iter() {
+            planes.push(v4l2_plane {
+                bytesused,
+                length,
+                data_offset,
+                ..Default::default()
+            });
+        }
+        for plane in planes {
+            out.extend_from_slice(plane.to_le().as_bytes());
+        }
+        out
+    }
+
+    /// Runs one `QBUF` of those bytes through the shared reader into `handler`, and returns the
+    /// errno the guest would see (0 on success).
+    pub(crate) fn dispatch_qbuf<H: VirtioMediaIoctlHandler>(
+        handler: &mut H,
+        session: &mut H::Session,
+        bytes: &[u8],
+    ) -> i32 {
+        let mut out = Vec::new();
+        virtio_media_dispatch_ioctl(
+            handler,
+            session,
+            V4l2Ioctl::VIDIOC_QBUF,
+            &mut &bytes[..],
+            &mut out,
+        )
+        .unwrap();
+        i32::from_le_bytes(out[0..4].try_into().unwrap())
     }
 }
 
@@ -1447,6 +1627,114 @@ mod tests {
             )),
             libc::EINVAL
         );
+    }
+
+    /// The reader judges each plane slot on its own, so a device can apply its queue's plane
+    /// count to the answer.
+    ///
+    /// This is defect D21: ffmpeg sends `length = VIDEO_MAX_PLANES` with `planes[1..8]`
+    /// uninitialised, the reader called the whole payload invalid, and every device refused the
+    /// buffer -- so `ffmpeg -f v4l2 -i /dev/video0` could not queue one frame on a queue whose
+    /// format has a single plane (`logs/vpu_wp/B5-acceptance.md` §4.3 and §6). vb2 looks at
+    /// `vb->num_planes` entries and no further (`__verify_length`,
+    /// `GKI_6.18-2026-06_r11/drivers/media/common/videobuf2/videobuf2-v4l2.c:105`).
+    #[test]
+    fn each_plane_slot_is_judged_on_its_own() {
+        let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(
+            QueueType::VideoCaptureMplane,
+            MemoryType::Mmap,
+            0,
+            (0, 1382400),
+        );
+        let read = GuestV4l2Buffer::read_from_chain(&mut &bytes[..]).unwrap();
+
+        // The plane the format actually has was taken as sent, so a one-plane queue accepts it.
+        assert!(read.payload.plane_is_valid(0));
+        assert!(read.payload.planes_are_valid(1));
+        assert_eq!(*read.buffer.get_first_plane().length, 1382400);
+        // The dirty tail: slots 1, 3 and 4 (and 5..7, which repeat them) are not descriptions
+        // this buffer could hold, slot 2's triple happens to be self-consistent.
+        for plane in [1, 3, 4, 5, 6, 7] {
+            assert!(!read.payload.plane_is_valid(plane), "slot {plane}");
+        }
+        assert!(read.payload.plane_is_valid(2));
+        assert!(
+            !read.payload.planes_are_valid(2),
+            "slot 1 is in the first two"
+        );
+        assert_ne!(read.payload, PayloadValidity::ALL);
+
+        // Only the slots it could not represent were zeroed; plane 0's numbers survive, which is
+        // what an output queue validates as the bitstream length.
+        let planes = read.buffer.as_v4l2_planes();
+        assert_eq!((planes[0].bytesused, planes[0].length), (0, 1382400));
+        assert_eq!((planes[1].bytesused, planes[1].data_offset), (0, 0));
+        assert_eq!((planes[2].bytesused, planes[2].data_offset), (119, 1));
+        assert_eq!((planes[3].bytesused, planes[3].data_offset), (0, 0));
+
+        // Garbage in plane 0 is the one an output queue must still refuse.
+        let bad = ffmpeg_wire::ffmpeg_qbuf_bytes(
+            QueueType::VideoOutputMplane,
+            MemoryType::Mmap,
+            0,
+            (4097, 4096),
+        );
+        let read = GuestV4l2Buffer::read_from_chain(&mut &bad[..]).unwrap();
+        assert!(!read.payload.plane_is_valid(0));
+        assert!(!read.payload.planes_are_valid(1));
+        assert_eq!(*read.buffer.get_first_plane().bytesused, 0);
+    }
+
+    /// The rule the devices apply to what the reader reports, both halves of it.
+    #[test]
+    fn payload_validity_follows_verify_length() {
+        let dirty_tail = PayloadValidity::ALL.without(1).without(3);
+        // A one-plane format never looks past slot 0.
+        assert!(dirty_tail.is_accepted_by(QueueDirection::Output, MemoryType::UserPtr, 1));
+        assert!(!dirty_tail.is_accepted_by(QueueDirection::Output, MemoryType::UserPtr, 2));
+        // Plane 0 is the bitstream length on an output queue, whatever the memory type.
+        let bad_plane_0 = PayloadValidity::ALL.without(0);
+        for memory in [MemoryType::Mmap, MemoryType::UserPtr] {
+            assert!(!bad_plane_0.is_accepted_by(QueueDirection::Output, memory, 1));
+        }
+        // A capture `MMAP` buffer's payload is the device's to report, so the guest's is ignored
+        // (`__verify_length` returns before it looks, `videobuf2-v4l2.c:101`).
+        assert!(bad_plane_0.is_accepted_by(QueueDirection::Capture, MemoryType::Mmap, 1));
+        // A `USERPTR` capture buffer is held to the stricter rule these devices keep.
+        assert!(!bad_plane_0.is_accepted_by(QueueDirection::Capture, MemoryType::UserPtr, 1));
+        // A count no plane array could satisfy is never valid.
+        assert!(!PayloadValidity::ALL.is_accepted_by(QueueDirection::Output, MemoryType::Mmap, 9));
+    }
+
+    /// A multiplanar buffer with an empty plane array is not a buffer: vb2 wants
+    /// `num_planes <= length` and a format has at least one plane, and `V4l2Buffer`'s
+    /// `get_first_plane` would `unwrap` an empty iterator on it -- an abort, in a VMM built with
+    /// `panic = 'abort'` (`logs/vpu_wp/F6.md` §10). The reader refuses it before any device can
+    /// reach for a plane.
+    #[test]
+    fn a_multiplanar_buffer_with_no_plane_is_refused_by_the_reader() {
+        use zerocopy::AsBytes;
+        let buffer = v4l2_buffer {
+            index: 0,
+            type_: QueueType::VideoCaptureMplane as u32,
+            memory: MemoryType::Mmap as u32,
+            length: 0,
+            ..Default::default()
+        };
+        let bytes = buffer.to_le().as_bytes().to_vec();
+        assert!(GuestV4l2Buffer::read_from_chain(&mut &bytes[..]).is_err());
+        assert_eq!(dispatch_prepare_buf(&bytes), libc::EINVAL);
+
+        // A single-planar buffer has no plane array to be empty, and is unaffected.
+        let single = v4l2_buffer {
+            index: 0,
+            type_: QueueType::VideoCapture as u32,
+            memory: MemoryType::Mmap as u32,
+            length: 0,
+            ..Default::default()
+        };
+        let bytes = single.to_le().as_bytes().to_vec();
+        assert!(GuestV4l2Buffer::read_from_chain(&mut &bytes[..]).is_ok());
     }
 
     #[test]

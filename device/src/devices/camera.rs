@@ -103,6 +103,7 @@ use v4l2r::QueueType;
 use crate::guest_mapping_errno;
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
+use crate::ioctl::PayloadValidity;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::mmap::MmapMappingManager;
 use crate::mmap::RetiredBuffers;
@@ -163,6 +164,11 @@ pub const NV12: PixelFormat = PixelFormat::from_fourcc(b"NV12");
 pub const MAX_BUFFERS: usize = 32;
 /// The queue this device has.
 const QUEUE: QueueType = QueueType::VideoCaptureMplane;
+/// Planes per buffer in every format this queue has. `QBUF` and `PREPARE_BUF` judge the guest's
+/// payload description on these slots only: the rest of the plane array it sends is scratch
+/// space it may leave dirty, which is what ffmpeg does (defect D21; the rule is
+/// [`PayloadValidity::is_accepted_by`]).
+const NUM_PLANES: usize = 1;
 /// The frame rate a session starts at, when the camera offers it; also what an `S_PARM` asking
 /// for `0/0` (or any other fraction that is not a rate) falls back to.
 const DEFAULT_FPS: u32 = 30;
@@ -1530,6 +1536,15 @@ where
         Ok(to_v4l2(self.adjust_size(session, queue, &format)?))
     }
 
+    /// The format set here belongs to `session`, not to the device: virtio-media gives every
+    /// `open(2)` its own session, so a second `open` of the same node keeps its own format and
+    /// never sees this one. V4L2 says the format is a property of the *device*, and
+    /// `v4l2-compliance`'s `testGlobalFormat` asserts exactly that -- so this is one of the
+    /// three failures in the camera's 59 / 56 / 3 run, and it is **accepted, not a defect**
+    /// (D22, `logs/vpu_wp/B5-acceptance.md` §4.6 and §6; `VPU_DESIGN.md` §7.1's acceptance
+    /// paragraph lists all three). Moving the state up to the device would mean redesigning the
+    /// whole fork's session and stream lifetime, and the per-open session is what makes "every
+    /// format test is one `v4l2-ctl` invocation" work.
     fn s_fmt(
         &mut self,
         session: &mut Self::Session,
@@ -1718,7 +1733,7 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
         if buffer.queue() != QUEUE {
             return Err(libc::EINVAL);
@@ -1735,9 +1750,14 @@ where
             return Err(libc::EINVAL);
         }
         // A prepared buffer keeps the payload description `PREPARE_BUF` accepted, and V4L2 says
-        // this call's own `bytesused` / `data_offset` are ignored.
+        // this call's own `bytesused` / `data_offset` are ignored. Otherwise it is the queue's
+        // own plane count that decides which of the guest's slots are a description at all, and
+        // an `MMAP` capture buffer has no guest description to check: this device reports the
+        // payload (D21, `ioctl::PayloadValidity`).
         let prepared = entry.prepared;
-        if prepared.is_none() && !payload_valid {
+        if prepared.is_none()
+            && !payload.is_accepted_by(QUEUE.direction(), buffer.memory(), NUM_PLANES)
+        {
             return Err(libc::EINVAL);
         }
 
@@ -1821,9 +1841,10 @@ where
         session: &mut Self::Session,
         buffer: V4l2Buffer,
         _guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
+        payload: PayloadValidity,
     ) -> IoctlResult<V4l2Buffer> {
-        if !payload_valid {
+        // The same rule `qbuf` applies, with no prepared description to fall back on.
+        if !payload.is_accepted_by(QUEUE.direction(), buffer.memory(), NUM_PLANES) {
             return Err(libc::EINVAL);
         }
         if buffer.queue() != QUEUE {
@@ -2239,6 +2260,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::ioctl::ffmpeg_wire;
     use crate::poll::SessionPoller;
     use crate::protocol::VIRTIO_MEDIA_CMD_OPEN;
     use crate::MemFdAllocator;
@@ -3249,7 +3271,12 @@ mod tests {
         for index in [1, 0] {
             let reply = r
                 .device
-                .qbuf(&mut s, mmap_buffer(index, size), vec![], true)
+                .qbuf(
+                    &mut s,
+                    mmap_buffer(index, size),
+                    vec![],
+                    PayloadValidity::ALL,
+                )
                 .unwrap();
             assert!(reply.flags().contains(BufferFlags::QUEUED));
         }
@@ -3257,7 +3284,7 @@ mod tests {
         // Queueing a queued buffer is refused.
         assert_eq!(
             r.device
-                .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+                .qbuf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
                 .err(),
             Some(libc::EINVAL)
         );
@@ -3278,7 +3305,7 @@ mod tests {
 
         // The third buffer, queued while streaming, is lent straight away.
         r.device
-            .qbuf(&mut s, mmap_buffer(2, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(2, size), vec![], PayloadValidity::ALL)
             .unwrap();
 
         let frames = collect_frames(&mut r, &mut s, 3);
@@ -3321,7 +3348,7 @@ mod tests {
 
         // Requeue one: the next frame goes into it.
         r.device
-            .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
             .unwrap();
         let frames = collect_frames(&mut r, &mut s, 4);
         assert_eq!(frames[3].index(), 0);
@@ -3329,7 +3356,7 @@ mod tests {
 
         // STREAMOFF: the camera is closed (joined) first, then the buffers are given back.
         r.device
-            .qbuf(&mut s, mmap_buffer(1, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(1, size), vec![], PayloadValidity::ALL)
             .unwrap();
         r.device.streamoff(&mut s, QUEUE).unwrap();
         {
@@ -3350,7 +3377,7 @@ mod tests {
 
         // A second round starts a fresh stream with a fresh sequence.
         r.device
-            .qbuf(&mut s, mmap_buffer(2, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(2, size), vec![], PayloadValidity::ALL)
             .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         assert_eq!(r.log.lock().unwrap().opened.len(), 2);
@@ -3377,7 +3404,7 @@ mod tests {
             .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 2)
             .unwrap();
         r.device
-            .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
             .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         assert_eq!(
@@ -3407,7 +3434,7 @@ mod tests {
             .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 2)
             .unwrap();
         r.device
-            .qbuf(&mut s, mmap_buffer(1, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(1, size), vec![], PayloadValidity::ALL)
             .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         // A second session cannot take the camera meanwhile.
@@ -3453,19 +3480,26 @@ mod tests {
         // it is refused, and so are the lengths `QBUF` refuses.
         let (buf, _) = userptr_buffer(0, gpa, size);
         assert_eq!(
-            r.device.prepare_buf(&mut s, buf, vec![], false).err(),
+            r.device
+                .prepare_buf(&mut s, buf, vec![], PayloadValidity::ALL.without(0))
+                .err(),
             Some(libc::EINVAL)
         );
         for len in [size - 1, size + 1] {
             let (buf, _) = userptr_buffer(0, gpa, len);
             assert_eq!(
-                r.device.prepare_buf(&mut s, buf, vec![], true).err(),
+                r.device
+                    .prepare_buf(&mut s, buf, vec![], PayloadValidity::ALL)
+                    .err(),
                 Some(libc::EINVAL)
             );
         }
 
         let (buf, _) = userptr_buffer(0, gpa, size);
-        let reply = r.device.prepare_buf(&mut s, buf, vec![], true).unwrap();
+        let reply = r
+            .device
+            .prepare_buf(&mut s, buf, vec![], PayloadValidity::ALL)
+            .unwrap();
         assert_eq!(
             (reply.flags() & (BufferFlags::QUEUED | BufferFlags::PREPARED | BufferFlags::DONE))
                 .bits(),
@@ -3485,7 +3519,9 @@ mod tests {
         // Preparing it twice is refused.
         let (buf, _) = userptr_buffer(0, gpa, size);
         assert_eq!(
-            r.device.prepare_buf(&mut s, buf, vec![], true).err(),
+            r.device
+                .prepare_buf(&mut s, buf, vec![], PayloadValidity::ALL)
+                .err(),
             Some(libc::EINVAL)
         );
 
@@ -3494,7 +3530,7 @@ mod tests {
         // the scatter list was read against.
         let (buf, sgs) = userptr_buffer(0, gpa, 8);
         assert_eq!(
-            r.device.qbuf(&mut s, buf, sgs, true).err(),
+            r.device.qbuf(&mut s, buf, sgs, PayloadValidity::ALL).err(),
             Some(libc::EINVAL)
         );
         assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
@@ -3503,7 +3539,10 @@ mod tests {
 
         // Queued honestly it works, and the payload PREPARE_BUF accepted is what comes back.
         let (buf, sgs) = userptr_buffer(0, gpa, size);
-        let reply = r.device.qbuf(&mut s, buf, sgs, false).unwrap();
+        let reply = r
+            .device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL.without(0))
+            .unwrap();
         assert!(reply.flags().contains(BufferFlags::QUEUED));
         assert!(!reply.flags().contains(BufferFlags::PREPARED));
         assert_eq!(*reply.get_first_plane().length, size);
@@ -3512,6 +3551,66 @@ mod tests {
         r.device.streamon(&mut s, QUEUE).unwrap();
         let frames = collect_frames(&mut r, &mut s, 1);
         assert_eq!(frames[0].index(), 0);
+        close(&mut r.device, s);
+    }
+
+    /// D21 -- the exact `QBUF` `ffmpeg -f v4l2` sends, replayed on the wire.
+    ///
+    /// ffmpeg declares `length = VIDEO_MAX_PLANES` and fills only `planes[0]` from `QUERYBUF`;
+    /// `planes[1..8]` are its own stack (`logs/vpu_wp/B5-acceptance.md` §4.3). Judging all eight
+    /// slots refused every capture buffer it queued, so `ffmpeg -f v4l2 -i /dev/video0 -t 5`
+    /// produced no file at all. This queue's format has one plane, and vb2 looks at
+    /// `vb->num_planes` entries only.
+    #[test]
+    fn ffmpegs_dirty_plane_array_queues_a_capture_buffer() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(1280, 720)).unwrap();
+        let sizeimage = s.sizeimage();
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 2)
+            .unwrap();
+
+        let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(QUEUE, MemoryType::Mmap, 0, (0, sizeimage));
+        assert_eq!(
+            ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes),
+            0,
+            "ffmpeg's plane array was refused (D21)"
+        );
+        assert!(s.buffers[0].queued);
+
+        // On an `MMAP` capture buffer the payload is this device's to report, so even a plane 0
+        // the guest made nonsensical is ignored rather than refused -- `__verify_length` returns
+        // before it looks (`videobuf2-v4l2.c:101`). What comes back is the device's own zero.
+        let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(QUEUE, MemoryType::Mmap, 1, (sizeimage + 1, 8));
+        assert_eq!(ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes), 0);
+        assert_eq!(
+            *s.buffers[1].v4l2_buffer.get_first_plane().bytesused,
+            0,
+            "the device reports the payload, not the guest"
+        );
+
+        // A capture buffer whose pages the guest lends is held to the stricter rule this device
+        // keeps: there is no vb2 underneath to re-check the description it sent.
+        close(&mut r.device, s);
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = s.sizeimage();
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::UserPtr, 1)
+            .unwrap();
+        let (buf, sgs) = userptr_buffer(0, 4 * 0x1000, size);
+        assert_eq!(
+            r.device
+                .qbuf(&mut s, buf, sgs, PayloadValidity::ALL.without(0))
+                .err(),
+            Some(libc::EINVAL)
+        );
+        // The slots past the one plane the format has are still scratch, even there.
+        let (buf, sgs) = userptr_buffer(0, 4 * 0x1000, size);
+        r.device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL.without(1).without(7))
+            .unwrap();
         close(&mut r.device, s);
     }
 
@@ -3534,9 +3633,13 @@ mod tests {
 
         // A well-formed `length` over a scatter list that covers a quarter of it.
         let (buf, sgs) = userptr_buffer_sized(1, gpa + 0x1_0000, size, size / 4);
-        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+            .unwrap();
         let (buf, sgs) = userptr_buffer(0, gpa, size);
-        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+            .unwrap();
         assert_eq!(s.queued, VecDeque::from([1, 0]));
 
         assert_eq!(r.device.streamon(&mut s, QUEUE).err(), Some(libc::EIO));
@@ -3554,7 +3657,9 @@ mod tests {
         r.device.streamoff(&mut s, QUEUE).unwrap();
         for index in 0..2u32 {
             let (buf, sgs) = userptr_buffer(index, gpa + index as u64 * 0x1_0000, size);
-            r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+            r.device
+                .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+                .unwrap();
         }
         r.device.streamon(&mut s, QUEUE).unwrap();
         let _ = collect_frames(&mut r, &mut s, 2);
@@ -3562,7 +3667,10 @@ mod tests {
 
         // Now the same short mapping while the queue streams: the session ends.
         let (buf, sgs) = userptr_buffer_sized(1, gpa + 0x1_0000, size, size / 4);
-        assert_eq!(r.device.qbuf(&mut s, buf, sgs, true).err(), Some(libc::EIO));
+        assert_eq!(
+            r.device.qbuf(&mut s, buf, sgs, PayloadValidity::ALL).err(),
+            Some(libc::EIO)
+        );
         assert!(s.dead);
         assert!(s.stream.is_none());
         assert_eq!(errors(&r.events.borrow()), 1);
@@ -3591,7 +3699,9 @@ mod tests {
         let gpa = 4 * 0x1000u64;
         for index in 0..2u32 {
             let (buf, sgs) = userptr_buffer(index, gpa + index as u64 * 0x1_0000, size);
-            r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+            r.device
+                .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+                .unwrap();
         }
         r.device.streamon(&mut s, QUEUE).unwrap();
         // The capture thread has written into a lent buffer and is still running: nothing
@@ -3648,7 +3758,7 @@ mod tests {
             for index in 0..2 {
                 runner
                     .device
-                    .qbuf(s, mmap_buffer(index, size), vec![], true)
+                    .qbuf(s, mmap_buffer(index, size), vec![], PayloadValidity::ALL)
                     .unwrap();
             }
             runner.device.streamon(s, QUEUE).unwrap();
@@ -3688,7 +3798,7 @@ mod tests {
         for len in [size - 1, size + 1] {
             let (buf, sgs) = userptr_buffer(0, gpa, len);
             assert_eq!(
-                r.device.qbuf(&mut s, buf, sgs, true).err(),
+                r.device.qbuf(&mut s, buf, sgs, PayloadValidity::ALL).err(),
                 Some(libc::EINVAL)
             );
         }
@@ -3696,13 +3806,15 @@ mod tests {
         // The memory type is fixed by REQBUFS.
         assert_eq!(
             r.device
-                .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+                .qbuf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
                 .err(),
             Some(libc::EINVAL)
         );
 
         let (buf, sgs) = userptr_buffer(0, gpa, size);
-        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+            .unwrap();
         assert_eq!(*r.guest.live_mappings.borrow(), 1, "held while queued");
         r.device.streamon(&mut s, QUEUE).unwrap();
 
@@ -3730,10 +3842,14 @@ mod tests {
 
         // A buffer still lent at STREAMOFF has its mapping released only after the join.
         let (buf, sgs) = userptr_buffer(1, gpa + 0x10000, size);
-        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+            .unwrap();
         let _ = collect_frames(&mut r, &mut s, 2);
         let (buf, sgs) = userptr_buffer(0, gpa, size);
-        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+            .unwrap();
         r.device.streamoff(&mut s, QUEUE).unwrap();
         assert_eq!(r.log.lock().unwrap().closed, 1);
         assert_eq!(*r.guest.live_mappings.borrow(), 0);
@@ -3758,7 +3874,12 @@ mod tests {
             .unwrap();
         for index in 0..3 {
             r.device
-                .qbuf(&mut s, mmap_buffer(index, size), vec![], true)
+                .qbuf(
+                    &mut s,
+                    mmap_buffer(index, size),
+                    vec![],
+                    PayloadValidity::ALL,
+                )
                 .unwrap();
         }
         r.device.streamon(&mut s, QUEUE).unwrap();
@@ -3777,7 +3898,7 @@ mod tests {
 
         assert_eq!(
             r.device
-                .qbuf(&mut s, mmap_buffer(2, size), vec![], true)
+                .qbuf(&mut s, mmap_buffer(2, size), vec![], PayloadValidity::ALL)
                 .err(),
             Some(libc::ENODEV)
         );
@@ -3811,7 +3932,9 @@ mod tests {
         let gpa = 4 * 0x1000u64;
         for index in 0..2u32 {
             let (buf, sgs) = userptr_buffer(index, gpa + index as u64 * 0x1_0000, size);
-            r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+            r.device
+                .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+                .unwrap();
         }
         assert_eq!(*r.guest.live_mappings.borrow(), 2);
         r.device.streamon(&mut s, QUEUE).unwrap();
@@ -3847,7 +3970,7 @@ mod tests {
             .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
             .unwrap();
         r.device
-            .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
             .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         while errors(&r.events.borrow()) == 0 {
@@ -3872,7 +3995,7 @@ mod tests {
         );
         assert_eq!(
             r.device
-                .prepare_buf(&mut s, mmap_buffer(0, size), vec![], true)
+                .prepare_buf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
                 .err(),
             Some(libc::ENODEV)
         );
@@ -3949,12 +4072,14 @@ mod tests {
         for len in [size - 1, big + 1] {
             let (buf, sgs) = userptr_buffer(1, gpa, len);
             assert_eq!(
-                r.device.qbuf(&mut s, buf, sgs, true).err(),
+                r.device.qbuf(&mut s, buf, sgs, PayloadValidity::ALL).err(),
                 Some(libc::EINVAL)
             );
         }
         let (buf, sgs) = userptr_buffer(1, gpa, big);
-        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, buf, sgs, PayloadValidity::ALL)
+            .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         let frames = collect_frames(&mut r, &mut s, 1);
         assert_eq!(frames[0].index(), 1);
@@ -3979,7 +4104,7 @@ mod tests {
             .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 2)
             .unwrap();
         r.device
-            .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
             .unwrap();
 
         assert_eq!(r.device.streamon(&mut s, QUEUE).err(), Some(libc::EBUSY));
@@ -4942,7 +5067,7 @@ mod tests {
             .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
             .unwrap();
         r.device
-            .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+            .qbuf(&mut s, mmap_buffer(0, size), vec![], PayloadValidity::ALL)
             .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         {
@@ -5198,7 +5323,12 @@ mod tests {
             .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
             .unwrap();
         r.device
-            .qbuf(&mut s, mmap_buffer(0, 64 * 48 * 3 / 2), vec![], true)
+            .qbuf(
+                &mut s,
+                mmap_buffer(0, 64 * 48 * 3 / 2),
+                vec![],
+                PayloadValidity::ALL,
+            )
             .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         let _ = collect_frames(&mut r, &mut s, 1);

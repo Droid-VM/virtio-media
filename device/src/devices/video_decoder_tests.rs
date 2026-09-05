@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use std::thread;
 
 use super::*;
+use crate::ioctl::ffmpeg_wire;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::MemFdAllocator;
 
@@ -978,7 +979,9 @@ fn ffmpeg_v4l2m2m_decode_sequence() {
     poke_mmap_output(&mut s, 0, 0x01);
     let mut ob = mmap_buffer(OUTPUT, 0, 1 << 20);
     ob.set_timestamp(ts(1));
-    r.device.qbuf(&mut s, ob, vec![], true).unwrap();
+    r.device
+        .qbuf(&mut s, ob, vec![], PayloadValidity::ALL)
+        .unwrap();
     r.device.streamon(&mut s, OUTPUT).unwrap();
     assert_eq!(r.log.lock().unwrap().started.len(), 1, "codec started at STREAMON(OUTPUT)");
 
@@ -1003,7 +1006,14 @@ fn ffmpeg_v4l2m2m_decode_sequence() {
 
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
     for i in 0..4 {
-        r.device.qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true).unwrap();
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
     }
     r.device.streamon(&mut s, CAPTURE).unwrap();
 
@@ -1013,7 +1023,9 @@ fn ffmpeg_v4l2m2m_decode_sequence() {
         poke_mmap_output(&mut s, i as usize, 0x10 + i as u8);
         let mut ob = mmap_buffer(OUTPUT, i, 1 << 20);
         ob.set_timestamp(ts(i as i64 + 1));
-        r.device.qbuf(&mut s, ob, vec![], true).unwrap();
+        r.device
+            .qbuf(&mut s, ob, vec![], PayloadValidity::ALL)
+            .unwrap();
     }
     collect_capture(&mut r, &mut s, 3);
     let frames = dequeued_on(&r.events.borrow(), CAPTURE);
@@ -1082,7 +1094,9 @@ fn gstreamer_v4l2videodec_sequence() {
     poke_mmap_output(&mut s, 0, 0x22);
     let mut ob = mmap_buffer(OUTPUT, 0, 1 << 20);
     ob.set_timestamp(ts(7));
-    r.device.qbuf(&mut s, ob, vec![], true).unwrap();
+    r.device
+        .qbuf(&mut s, ob, vec![], PayloadValidity::ALL)
+        .unwrap();
     r.device.streamon(&mut s, OUTPUT).unwrap();
 
     // wait_for_src_ch: poll capture for the SOURCE_CHANGE.
@@ -1111,7 +1125,14 @@ fn gstreamer_v4l2videodec_sequence() {
     // capture pool: REQBUFS(CAPTURE, min), QBUF, STREAMON.
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, min.value as u32).unwrap();
     for i in 0..min.value as u32 {
-        r.device.qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true).unwrap();
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
     }
     r.device.streamon(&mut s, CAPTURE).unwrap();
 
@@ -1134,7 +1155,14 @@ fn seek_streamoff_output_flushes_and_keeps_the_codec() {
 
     // Decode one frame so we know the codec is running.
     poke_mmap_output(&mut s, 0, 0x05);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     collect_capture(&mut r, &mut s, 1);
 
     // Seek: STREAMOFF(OUTPUT). The backend flushes; the codec is not torn down.
@@ -1149,8 +1177,22 @@ fn seek_streamoff_output_flushes_and_keeps_the_codec() {
     r.device.streamon(&mut s, OUTPUT).unwrap();
     assert_eq!(r.log.lock().unwrap().started.len(), 1, "the codec is not recreated");
     poke_mmap_output(&mut s, 1, 0x06);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
-    r.device.qbuf(&mut s, mmap_buffer(CAPTURE, 0, sizeimage), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 1, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 0, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     collect_capture(&mut r, &mut s, 2);
 
     close(&mut r.device, s);
@@ -1169,13 +1211,27 @@ fn dynamic_resolution_change_reconfigures_capture() {
 
     // A frame at the first resolution.
     poke_mmap_output(&mut s, 0, 0x08);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     collect_capture(&mut r, &mut s, 1);
     let before = source_changes(&r.events.borrow());
 
     // A magic OUTPUT buffer triggers a mid-stream resolution change to 160x120.
     poke_mmap_output(&mut s, 1, DRC_MAGIC);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 1, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     while source_changes(&r.events.borrow()) == before {
         assert!(wait_ready(&s), "no second SOURCE_CHANGE within 2s");
         process(&mut r.device, &mut s);
@@ -1193,13 +1249,27 @@ fn dynamic_resolution_change_reconfigures_capture() {
     assert!(s.output.buffers.is_empty());
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
     for i in 0..4 {
-        r.device.qbuf(&mut s, mmap_buffer(CAPTURE, i, new_sizeimage), vec![], true).unwrap();
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, new_sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
     }
     r.device.streamon(&mut s, CAPTURE).unwrap();
 
     // A frame at the new resolution.
     poke_mmap_output(&mut s, 2, 0x09);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 2, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 2, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     let already = dequeued_on(&r.events.borrow(), CAPTURE).len();
     while dequeued_on(&r.events.borrow(), CAPTURE).len() <= already {
         assert!(wait_ready(&s), "no post-DRC frame within 2s");
@@ -1233,8 +1303,14 @@ fn userptr_output_and_capture_go_through_guest_mappings() {
     let out_gpa = 0x1000u64;
     r.guest.memory.borrow_mut()[out_gpa as usize] = 0x44;
     let (ob, sgs) = userptr_buffer(OUTPUT, 0, out_gpa, 1 << 20, 4096);
-    r.device.qbuf(&mut s, ob, sgs, true).unwrap();
-    assert_eq!(*r.guest.live_mappings.borrow(), 1, "OUTPUT mapping held while queued");
+    r.device
+        .qbuf(&mut s, ob, sgs, PayloadValidity::ALL)
+        .unwrap();
+    assert_eq!(
+        *r.guest.live_mappings.borrow(),
+        1,
+        "OUTPUT mapping held while queued"
+    );
     r.device.streamon(&mut s, OUTPUT).unwrap();
 
     // SOURCE_CHANGE, then the OUTPUT buffer's mapping is dropped when InputBufferDone arrives.
@@ -1250,13 +1326,24 @@ fn userptr_output_and_capture_go_through_guest_mappings() {
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::UserPtr, 2).unwrap();
     // A buffer whose length cannot hold a frame is refused, nothing mapped.
     let (small, sgs) = userptr_buffer(CAPTURE, 0, 0x200000, sizeimage - 1, sizeimage - 1);
-    assert_eq!(r.device.qbuf(&mut s, small, sgs, true).err(), Some(libc::EINVAL));
+    assert_eq!(
+        r.device
+            .qbuf(&mut s, small, sgs, PayloadValidity::ALL)
+            .err(),
+        Some(libc::EINVAL)
+    );
     assert_eq!(*r.guest.live_mappings.borrow(), 0);
 
     let cap_gpa = 0x200000u64;
     let (cb, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, sizeimage, sizeimage);
-    r.device.qbuf(&mut s, cb, sgs, true).unwrap();
-    assert_eq!(*r.guest.live_mappings.borrow(), 1, "CAPTURE mapping held while lent");
+    r.device
+        .qbuf(&mut s, cb, sgs, PayloadValidity::ALL)
+        .unwrap();
+    assert_eq!(
+        *r.guest.live_mappings.borrow(),
+        1,
+        "CAPTURE mapping held while lent"
+    );
     r.device.streamon(&mut s, CAPTURE).unwrap();
 
     // The frame lands in the guest pages, then its mapping is dropped before the DQBUF event.
@@ -1282,7 +1369,14 @@ fn lifecycle_invariants_join_the_backend_before_freeing() {
     // Decode a couple of frames.
     for i in 0..2u32 {
         poke_mmap_output(&mut s, i as usize, 0x30 + i as u8);
-        r.device.qbuf(&mut s, mmap_buffer(OUTPUT, i, 1 << 20), vec![], true).unwrap();
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(OUTPUT, i, 1 << 20),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
     }
     // Requeue capture buffers as they come back.
     collect_capture(&mut r, &mut s, 2);
@@ -1295,8 +1389,17 @@ fn lifecycle_invariants_join_the_backend_before_freeing() {
     assert_eq!(*r.log.lock().unwrap().released_while_capture_active.borrow(), 0);
 
     // Rebuild capture, then close the whole session: stop() joins, then buffers are freed.
-    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).unwrap();
-    r.device.qbuf(&mut s, mmap_buffer(CAPTURE, 0, sizeimage), vec![], true).unwrap();
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2)
+        .unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 0, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     close(&mut r.device, s);
     assert_eq!(r.log.lock().unwrap().stops, 1, "close joined the backend exactly once");
     assert_eq!(*r.log.lock().unwrap().released_while_capture_active.borrow(), 0);
@@ -1342,7 +1445,14 @@ fn reqbufs_on_a_streaming_queue_is_busy() {
         .unwrap();
     assert_eq!((created.index, created.count), (4, 2));
     assert_eq!(s.output.buffers.len(), 6);
-    r.device.qbuf(&mut s, mmap_buffer(CAPTURE, 4, sizeimage), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 4, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
 
     // REQBUFS(0) joins the backend first, then frees everything.
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
@@ -1370,7 +1480,14 @@ fn a_dropped_session_joins_the_backend_before_its_buffers() {
         .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
         .unwrap();
     poke_mmap_output(&mut s, 0, 0x21);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     r.device.streamon(&mut s, OUTPUT).unwrap();
     while source_changes(&r.events.borrow()) == 0 {
         assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
@@ -1383,7 +1500,9 @@ fn a_dropped_session_joins_the_backend_before_its_buffers() {
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::UserPtr, 2).unwrap();
     for i in 0..2u32 {
         let (cb, sgs) = userptr_buffer(CAPTURE, i, 0x200000 + i as u64 * 0x40000, sizeimage, 0);
-        r.device.qbuf(&mut s, cb, sgs, true).unwrap();
+        r.device
+            .qbuf(&mut s, cb, sgs, PayloadValidity::ALL)
+            .unwrap();
     }
     r.device.streamon(&mut s, CAPTURE).unwrap();
     collect_capture(&mut r, &mut s, 1);
@@ -1414,25 +1533,43 @@ fn prepare_buf_does_not_let_qbuf_shrink_the_mapping() {
 
     // OUTPUT: prepared at a full-length plane, nothing mapped yet.
     let (pb, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, bitstream, 4096);
-    let prepared = r.device.prepare_buf(&mut s, pb, sgs, true).unwrap();
+    let prepared = r
+        .device
+        .prepare_buf(&mut s, pb, sgs, PayloadValidity::ALL)
+        .unwrap();
     assert!(prepared.flags().contains(BufferFlags::PREPARED));
     assert_eq!(*r.guest.live_mappings.borrow(), 0, "PREPARE_BUF maps nothing");
 
     // The same buffer queued over an eight-byte scatter list: refused, still prepared.
     let (short, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, 8, 8);
-    assert_eq!(r.device.qbuf(&mut s, short, sgs, true).err(), Some(libc::EINVAL));
+    assert_eq!(
+        r.device
+            .qbuf(&mut s, short, sgs, PayloadValidity::ALL)
+            .err(),
+        Some(libc::EINVAL)
+    );
     assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
     assert!(s.input.buffers[0].prepared.is_some(), "the buffer is still prepared");
     assert!(!s.input.buffers[0].queued);
 
     // A plane longer than the buffer was allocated for is refused too.
     let (big, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, bitstream + 1, 4096);
-    assert_eq!(r.device.qbuf(&mut s, big, sgs, true).err(), Some(libc::EINVAL));
+    assert_eq!(
+        r.device.qbuf(&mut s, big, sgs, PayloadValidity::ALL).err(),
+        Some(libc::EINVAL)
+    );
 
     // The honest QBUF maps the full list and keeps PREPARE_BUF's payload.
     let (ok, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, bitstream, 0);
-    let queued = r.device.qbuf(&mut s, ok, sgs, true).unwrap();
-    assert_eq!(*queued.get_first_plane().bytesused, 4096, "the prepared payload survived");
+    let queued = r
+        .device
+        .qbuf(&mut s, ok, sgs, PayloadValidity::ALL)
+        .unwrap();
+    assert_eq!(
+        *queued.get_first_plane().bytesused,
+        4096,
+        "the prepared payload survived"
+    );
     assert_eq!(*r.guest.live_mappings.borrow(), 1);
 
     // CAPTURE: the same, over a frame-sized plane.
@@ -1440,19 +1577,41 @@ fn prepare_buf_does_not_let_qbuf_shrink_the_mapping() {
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::UserPtr, 1).unwrap();
     let cap_gpa = 0x300000u64;
     let (pb, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, sizeimage, 0);
-    r.device.prepare_buf(&mut s, pb, sgs, true).unwrap();
+    r.device
+        .prepare_buf(&mut s, pb, sgs, PayloadValidity::ALL)
+        .unwrap();
     let (short, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, 8, 0);
-    assert_eq!(r.device.qbuf(&mut s, short, sgs, true).err(), Some(libc::EINVAL));
-    assert_eq!(*r.guest.live_mappings.borrow(), 1, "still only the OUTPUT mapping");
+    assert_eq!(
+        r.device
+            .qbuf(&mut s, short, sgs, PayloadValidity::ALL)
+            .err(),
+        Some(libc::EINVAL)
+    );
+    assert_eq!(
+        *r.guest.live_mappings.borrow(),
+        1,
+        "still only the OUTPUT mapping"
+    );
     // A full-length plane whose scatter list is short is caught by the backstop.
     let (mut lying, _) = userptr_buffer(CAPTURE, 0, cap_gpa, sizeimage, 0);
     *lying.get_first_plane_mut().length = sizeimage;
     let short_sgs = vec![vec![SgEntry::new(cap_gpa, sizeimage - 1)]];
-    assert_eq!(r.device.qbuf(&mut s, lying, short_sgs, true).err(), Some(libc::EINVAL));
-    assert_eq!(*r.guest.live_mappings.borrow(), 1, "the short mapping was dropped");
+    assert_eq!(
+        r.device
+            .qbuf(&mut s, lying, short_sgs, PayloadValidity::ALL)
+            .err(),
+        Some(libc::EINVAL)
+    );
+    assert_eq!(
+        *r.guest.live_mappings.borrow(),
+        1,
+        "the short mapping was dropped"
+    );
 
     let (ok, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, sizeimage, 0);
-    r.device.qbuf(&mut s, ok, sgs, true).unwrap();
+    r.device
+        .qbuf(&mut s, ok, sgs, PayloadValidity::ALL)
+        .unwrap();
     assert_eq!(*r.guest.live_mappings.borrow(), 2);
 
     close(&mut r.device, s);
@@ -1476,11 +1635,25 @@ fn a_resolution_change_marks_its_last_buffer_and_sends_no_eos() {
 
     // A frame at the first resolution, then the change.
     poke_mmap_output(&mut s, 0, 0x08);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     collect_capture(&mut r, &mut s, 1);
     let before = source_changes(&r.events.borrow());
     poke_mmap_output(&mut s, 1, DRC_LAST_MAGIC);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 1, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     while source_changes(&r.events.borrow()) == before {
         assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
         process(&mut r.device, &mut s);
@@ -1510,7 +1683,12 @@ fn a_resolution_change_marks_its_last_buffer_and_sends_no_eos() {
     let index = last.index() as usize;
     let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
     r.device
-        .qbuf(&mut s, mmap_buffer(CAPTURE, index as u32, sizeimage), vec![], true)
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, index as u32, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
         .unwrap();
     assert_eq!(s.output.pending.len(), 1, "not lent while the decoder is stopped");
     assert!(!s.output.buffers[index].lent);
@@ -1534,12 +1712,26 @@ fn a_resolution_change_stops_the_decoder_even_when_nothing_is_marked() {
     let mut s = session(&mut r.device);
     start_streaming_320x240(&mut r, &mut s);
     poke_mmap_output(&mut s, 0, 0x08);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     collect_capture(&mut r, &mut s, 1);
     let before = source_changes(&r.events.borrow());
 
     poke_mmap_output(&mut s, 1, DRC_MAGIC);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 1, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     while source_changes(&r.events.borrow()) == before {
         assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
         process(&mut r.device, &mut s);
@@ -1558,7 +1750,12 @@ fn a_resolution_change_stops_the_decoder_even_when_nothing_is_marked() {
     let index = 0usize;
     let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
     r.device
-        .qbuf(&mut s, mmap_buffer(CAPTURE, index as u32, sizeimage), vec![], true)
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, index as u32, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
         .unwrap();
     assert!(!s.output.buffers[index].lent, "not lent while the decoder is stopped");
     r.device.decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START)).unwrap();
@@ -1586,12 +1783,26 @@ fn a_capture_buffer_too_small_for_the_canvas_is_reported_once() {
     assert_eq!(placeholder, 160 * 120 * 3 / 2);
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).unwrap();
     for i in 0..2 {
-        r.device.qbuf(&mut s, mmap_buffer(CAPTURE, i, placeholder), vec![], true).unwrap();
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, placeholder),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
     }
 
     // The stream turns out to be 320x240: those buffers hold a quarter of a frame.
     poke_mmap_output(&mut s, 0, 0x03);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     r.device.streamon(&mut s, OUTPUT).unwrap();
     while source_changes(&r.events.borrow()) == 0 {
         assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
@@ -1616,11 +1827,25 @@ fn a_capture_buffer_too_small_for_the_canvas_is_reported_once() {
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
     r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).unwrap();
     for i in 0..2 {
-        r.device.qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true).unwrap();
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
     }
     r.device.streamon(&mut s, CAPTURE).unwrap();
     poke_mmap_output(&mut s, 1, 0x04);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 1, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     collect_capture(&mut r, &mut s, 1);
     let frame = dequeued_on(&r.events.borrow(), CAPTURE).remove(0);
     assert_eq!(*frame.get_first_plane().bytesused, sizeimage);
@@ -1666,7 +1891,14 @@ fn a_codec_that_will_not_start_fails_streamon() {
     r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
     r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2).unwrap();
     poke_mmap_output(&mut s, 0, 0x01);
-    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     assert_eq!(r.device.streamon(&mut s, OUTPUT).err(), Some(libc::EBUSY));
     assert!(!s.state.output_streaming);
     assert!(s.input.buffers[0].queued, "the buffer stays queued for a retry");
@@ -1741,6 +1973,51 @@ fn create_bufs_refuses_a_set_too_small() {
     close(&mut r.device, s);
 }
 
+/// D21 -- the exact `QBUF` `ffmpeg -f v4l2` sends, replayed on the wire, on both queues.
+///
+/// ffmpeg declares `length = VIDEO_MAX_PLANES` and fills only `planes[0]` from `QUERYBUF`;
+/// `planes[1..8]` are its own stack (`logs/vpu_wp/B5-acceptance.md` §4.3). Judging all eight
+/// slots refused every buffer it queued. These formats have one plane, and vb2 looks at
+/// `vb->num_planes` entries only (`__verify_length`, `videobuf2-v4l2.c:105`) -- but plane 0 on
+/// an output queue is the payload length, and that one is still checked.
+#[test]
+fn ffmpegs_dirty_plane_array_is_judged_on_the_planes_the_format_has() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2).unwrap();
+
+    // OUTPUT (the bitstream) with a sane plane 0 under the dirty tail: queued, and the length
+    // the guest declared is kept.
+    let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(OUTPUT, MemoryType::Mmap, 0, (4096, 1 << 20));
+    assert_eq!(
+        ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes),
+        0,
+        "ffmpeg's plane array was refused on the output queue (D21)"
+    );
+    assert_eq!(*s.input.buffers[0].v4l2_buffer.get_first_plane().bytesused, 4096);
+
+    // The same array with the garbage in plane 0: `bytesused > length` is what
+    // `__verify_length` does check on an output queue, so this is still `EINVAL`.
+    let bytes =
+        ffmpeg_wire::ffmpeg_qbuf_bytes(OUTPUT, MemoryType::Mmap, 1, ((1 << 20) + 1, 1 << 20));
+    assert_eq!(
+        ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes),
+        libc::EINVAL,
+        "a bitstream length the buffer cannot hold was accepted"
+    );
+    assert!(!s.input.buffers[1].queued);
+
+    // CAPTURE, `MMAP`: the frame is this device's to fill, so the guest's payload is ignored.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).unwrap();
+    let bytes = ffmpeg_wire::ffmpeg_qbuf_bytes(CAPTURE, MemoryType::Mmap, 0, (0, sizeimage));
+    assert_eq!(ffmpeg_wire::dispatch_qbuf(&mut r.device, &mut s, &bytes), 0);
+    assert!(s.output.buffers[0].queued);
+
+    close(&mut r.device, s);
+}
+
 /// `PREPARE_BUF` validates a payload without queueing, and the `QBUF` that follows keeps the
 /// prepared description and ignores its own (D6.1), for a guest-owned buffer.
 #[test]
@@ -1752,14 +2029,20 @@ fn prepare_buf_then_qbuf_keeps_the_prepared_payload() {
 
     let out_gpa = 0x4000u64;
     let (pb, _sgs) = userptr_buffer(OUTPUT, 0, out_gpa, 1 << 20, 5000);
-    let prepared = r.device.prepare_buf(&mut s, pb, vec![], true).unwrap();
+    let prepared = r
+        .device
+        .prepare_buf(&mut s, pb, vec![], PayloadValidity::ALL)
+        .unwrap();
     assert!(prepared.flags().contains(BufferFlags::PREPARED));
     assert_eq!(*prepared.get_first_plane().bytesused, 5000);
 
     // A following QBUF with nonsense payload keeps the prepared description.
     let (mut qb, sgs) = userptr_buffer(OUTPUT, 0, out_gpa, 1 << 20, 0xdead_beef);
     *qb.get_first_plane_mut().bytesused = 0xdead_beef;
-    let queued = r.device.qbuf(&mut s, qb, sgs, true).unwrap();
+    let queued = r
+        .device
+        .qbuf(&mut s, qb, sgs, PayloadValidity::ALL)
+        .unwrap();
     assert!(queued.flags().contains(BufferFlags::QUEUED));
     assert_eq!(*queued.get_first_plane().bytesused, 5000, "the prepared bytesused survived");
 
@@ -1804,7 +2087,14 @@ fn a_codec_error_ends_the_session() {
 
     poke_mmap_output(&mut s, 0, 0x01);
     assert_eq!(
-        r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).err(),
+        r.device
+            .qbuf(
+                &mut s,
+                mmap_buffer(OUTPUT, 0, 1 << 20),
+                vec![],
+                PayloadValidity::ALL
+            )
+            .err(),
         Some(libc::ENODEV)
     );
     assert_eq!(r.device.streamon(&mut s, OUTPUT).err(), Some(libc::ENODEV));
@@ -1837,7 +2127,14 @@ fn start_streaming_320x240(r: &mut Rig, s: &mut Session) -> u32 {
         .unwrap();
     // One OUTPUT buffer + STREAMON(OUTPUT) makes the backend parse and raise SOURCE_CHANGE.
     poke_mmap_output(s, 0, 0x01);
-    r.device.qbuf(s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device
+        .qbuf(
+            s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
     r.device.streamon(s, OUTPUT).unwrap();
     while source_changes(&r.events.borrow()) == 0 {
         assert!(wait_ready(s), "no SOURCE_CHANGE within 2s");
@@ -1846,7 +2143,14 @@ fn start_streaming_320x240(r: &mut Rig, s: &mut Session) -> u32 {
     let sizeimage = pix(&r.device.g_fmt(s, CAPTURE).unwrap()).sizeimage;
     r.device.reqbufs(s, CAPTURE, MemoryType::Mmap, 4).unwrap();
     for i in 0..4 {
-        r.device.qbuf(s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true).unwrap();
+        r.device
+            .qbuf(
+                s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
     }
     r.device.streamon(s, CAPTURE).unwrap();
     let _ = drain_events; // silence dead-code in builds where it is unused

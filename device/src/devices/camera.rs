@@ -5425,6 +5425,14 @@ mod tests {
     /// no error and no log line -- when the response is shorter. So the test checks the exact
     /// byte count of an error response and reads `error_idx` back out of it, and it pins the two
     /// structure sizes the guest ABI depends on.
+    ///
+    /// **D37 itself is closed as a test artefact of the guest-side Python client** and this test
+    /// is now a regression guard, not an open investigation: on hardware a C client reads the
+    /// device's `error_idx` back on all seven refusals, including the `TRY_EXT_CTRLS` this
+    /// device fails at index 1 in `try_ext_ctrls`, while CPython's `fcntl.ioctl` reads `0`
+    /// for the same calls because it writes its argument buffer back only when the ioctl returns
+    /// >= 0 (`logs/vpu_wp/B10-acceptance.md` §7). The client that settles it is checked in as
+    /// `deploy/vpu/tests/ext_ctrls_error_idx.c`.
     #[test]
     fn a_failed_ext_ctrls_writes_the_header_back_with_error_idx() {
         const RESP_HEADER: usize = std::mem::size_of::<RespHeader>();

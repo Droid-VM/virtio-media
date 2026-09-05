@@ -915,9 +915,18 @@ fn invalid_ioctl<W: WriteToDescriptorChain>(code: V4l2Ioctl, writer: &mut W) -> 
 /// error" (`vidioc-g-ext-ctrls.rst`), and it is only ever set on a failure. The driver reads
 /// the header back out of the response only when the device wrote enough of one --
 /// `virtio_media_send_ext_controls_ioctl()` guards its error branch with
-/// `resp_len >= sizeof(resp_ioctl) + sizeof(*ctrls)` -- so a short error response silently
-/// loses `error_idx`, which is defect D37. Every error of these three ioctls therefore goes
-/// through here, including the ones raised before the device is called at all.
+/// `resp_len >= sizeof(resp_ioctl) + sizeof(*ctrls)` -- so a short error response would silently
+/// lose `error_idx`. Every error of these three ioctls therefore goes through here, including the
+/// ones raised before the device is called at all.
+///
+/// **Defect D37 is closed: it was a test artefact of the Python client, not this path.** A C
+/// client that passes its own `struct v4l2_ext_controls` straight to `ioctl(2)` reads the
+/// device's `error_idx` back on all seven refusals measured on hardware, the decisive one being
+/// a `TRY_EXT_CTRLS` the camera fails at index 1; the same seven calls through CPython's
+/// `fcntl.ioctl` read `0`, because it copies its argument buffer back only when the ioctl
+/// returns >= 0. Device, this reply path, the driver's guard and the guest kernel are all
+/// correct (`logs/vpu_wp/B10-acceptance.md` §7, `F12-ledger.md` §3.1). Read `error_idx` from C,
+/// or from a client that is known to write back on the error path.
 fn ext_ctrls_response(
     ctrls: v4l2_ext_controls,
     ctrl_array: Vec<v4l2_ext_control>,
@@ -929,16 +938,24 @@ fn ext_ctrls_response(
     match result {
         Ok(()) => Ok((ctrls, ctrl_array)),
         Err(e) => {
-            // The D37 instrument (B9-acceptance §8, follow-up 5). Every error reply of these
-            // three ioctls passes here, so this line is the byte count the driver's guard is
-            // about to be compared against, next to the `error_idx` the guest is supposed to
-            // read out of it. `wr_ioctl_with_err_payload` writes a `RespHeader` and then this
-            // pair, and `ToDescriptorChain` writes the header and one `v4l2_ext_control` per
-            // entry, so the reply is exactly the sum below -- the arithmetic
+            // The D37 instrument (B9-acceptance §8, follow-up 5), kept now that D37 is closed
+            // because it is the only place the reply's size and its `error_idx` are visible
+            // together. Every error reply of these three ioctls passes here, so this line is the
+            // byte count the driver's guard is about to be compared against, next to the
+            // `error_idx` the guest is supposed to read out of it.
+            // `wr_ioctl_with_err_payload` writes a `RespHeader` and then this pair, and
+            // `ToDescriptorChain` writes the header and one `v4l2_ext_control` per entry, so the
+            // reply is exactly the sum below -- the arithmetic
             // `a_failed_ext_ctrls_writes_the_header_back_with_error_idx` pins end to end
             // (M5b §4.2). A guest that reads `error_idx` back as the value it sent, against a
             // line that says the reply carried the device's value in >= threshold bytes, has
-            // lost it after the response, not in it.
+            // lost it after the response, not in it -- which is exactly what a Python client
+            // does, and all D37 ever was.
+            //
+            // This is `debug!`, so it only reaches a log when the helper was started at that
+            // level. It never fired on the phone during the D37 investigation because helpers
+            // were exec'd with no `--log-level` at all (defect D57, crosvm `device_helper.rs`,
+            // fixed there); run the VMM as `crosvm --log-level debug run ...` to see it.
             log::debug!(
                 "ext-controls error reply: errno {}, count {}, error_idx {}, {} control(s), \
                  {} + {} + {}x{} = {} bytes (the driver keeps the header only from {} bytes up)",

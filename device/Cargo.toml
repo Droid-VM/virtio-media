@@ -19,8 +19,9 @@ v4l2r = { version = "0.0.5", features = ["arch64"] }
 zerocopy = { version = "0.7.31", features = ["derive"] }
 
 [features]
-default = ["simple-device", "loopback-device", "camera-device", "video-decoder-device"]
+default = ["simple-device", "loopback-device", "camera-device", "video-decoder-device", "video-encoder-device"]
 simple-device = []
 loopback-device = []
 camera-device = []
 video-decoder-device = []
+video-encoder-device = []

@@ -32,6 +32,10 @@
 //! [camera] is a capture device over a host camera reached through the `CameraBackend` trait,
 //! so the V4L2 side is VMM- and platform-independent and the VMM supplies the camera
 //! (`VPU_DESIGN.md` §7.1).
+//!
+//! [video_decoder] and [video_encoder] are the stateful codec devices, the V4L2 halves of a
+//! decoder and an encoder over the `VideoDecoderBackend` / `VideoEncoderBackend` traits the VMM
+//! implements (`VPU_DESIGN.md` §7.2, §7.3).
 
 #[cfg(feature = "simple-device")]
 pub mod simple_device;
@@ -55,3 +59,8 @@ pub use v4l2_device_proxy::V4l2ProxyDevice;
 pub mod video_decoder;
 #[cfg(feature = "video-decoder-device")]
 pub use video_decoder::VideoDecoder;
+
+#[cfg(feature = "video-encoder-device")]
+pub mod video_encoder;
+#[cfg(feature = "video-encoder-device")]
+pub use video_encoder::VideoEncoder;

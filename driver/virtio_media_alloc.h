@@ -170,4 +170,53 @@ int vmedia_queue_alloc_dbufs(struct virtio_media *vv,
  */
 void vmedia_queue_put_dbufs(struct virtio_media_queue_state *queue);
 
+/*
+ * Upper bound on one bounced ioctl payload (defect D34). Compound-control
+ * payloads are tens of bytes to a few KiB; anything approaching this is a
+ * corrupt size and is refused rather than allowed to drain the pool.
+ */
+#define VMEDIA_BOUNCE_MAX_SIZE (1 << 20)
+
+/**
+ * struct vmedia_bounce - Driver-owned bounce buffer for an ioctl payload.
+ *
+ * A pool-mode helper can only touch guest memory inside its access windows
+ * (the media pools); an arbitrary guest page -- like the user-space payload a
+ * compound v4l2_ext_control points to -- is EFAULT for it in both directions
+ * (defect D34). A bounce is one physically contiguous, driver-owned run the
+ * host may always touch: media_guest pool memory when the VMM built the pool,
+ * else a plain kernel buffer (without a pool the device runs in-VMM and reads
+ * all guest RAM).
+ *
+ * @vv: device the bounce was allocated on.
+ * @blocks: drm_buddy blocks, pool mode.
+ * @vaddr: kernel mapping, for copying user data in and out.
+ * @phys: guest-physical start of the run, what the host is told.
+ * @size: allocated size, page aligned in pool mode.
+ * @len: requested length, what goes on the wire.
+ * @pool: true when @blocks back the memory, false for a kernel buffer.
+ */
+struct vmedia_bounce {
+	struct virtio_media *vv;
+	struct list_head blocks;
+	void *vaddr;
+	phys_addr_t phys;
+	size_t size;
+	size_t len;
+	bool pool;
+};
+
+/**
+ * vmedia_bounce_alloc - Allocate a bounce buffer of @len bytes.
+ *
+ * Returns the buffer, or an ERR_PTR: -EINVAL for a zero or absurd @len,
+ * -ENOMEM when the memory is not there.
+ */
+struct vmedia_bounce *vmedia_bounce_alloc(struct virtio_media *vv, size_t len);
+
+/**
+ * vmedia_bounce_free - Release @bounce (NULL is allowed).
+ */
+void vmedia_bounce_free(struct vmedia_bounce *bounce);
+
 #endif // __VIRTIO_MEDIA_ALLOC_H

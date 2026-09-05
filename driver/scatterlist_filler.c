@@ -437,9 +437,35 @@ int scatterlist_filler_add_buffer_dbuf(struct scatterlist_filler *filler,
 	return 0;
 }
 
+/**
+ * Add the SG list of a driver-owned bounce buffer: one entry, since a bounce
+ * is physically contiguous. Same wire format as a pinned userptr payload
+ * (prepare_userptr_to_host()), but pointing at memory the host may touch in
+ * every configuration (defect D34).
+ */
+static int scatterlist_filler_add_bounce(struct scatterlist_filler *filler,
+					 const struct vmedia_bounce *bounce)
+{
+	struct virtio_media_sg_entry *sg_entry;
+
+	if (filler->shadow_buffer_pos + sizeof(*sg_entry) >
+	    filler->shadow_buffer_size)
+		return -ENOMEM;
+
+	sg_entry = filler->shadow_buffer + filler->shadow_buffer_pos;
+	filler->shadow_buffer_pos += sizeof(*sg_entry);
+
+	sg_entry->start = bounce->phys;
+	sg_entry->len = bounce->len;
+
+	return scatterlist_filler_add_data(filler, sg_entry,
+					   sizeof(*sg_entry));
+}
+
 int scatterlist_filler_add_ext_ctrls(struct scatterlist_filler *filler,
 				     struct v4l2_ext_controls *ctrls,
-				     bool add_userptrs)
+				     bool add_payloads,
+				     struct vmedia_bounce *const *bounces)
 {
 	int i;
 	int ret;
@@ -458,15 +484,20 @@ int scatterlist_filler_add_ext_ctrls(struct scatterlist_filler *filler,
 			return ret;
 	}
 
-	if (!add_userptrs)
+	if (!add_payloads)
 		return 0;
 
-	/* Pointers to user memory in individual controls */
+	/*
+	 * Payloads of individual controls, each through its driver-owned
+	 * bounce buffer: the caller copies the user data in and out (D34).
+	 */
 	for (i = 0; i < ctrls->count; i++) {
 		struct v4l2_ext_control *ctrl = &ctrls->controls[i];
 		if (ctrl->size > 0) {
-			ret = scatterlist_filler_add_userptr(
-				filler, (unsigned long)ctrl->ptr, ctrl->size);
+			if (!bounces || !bounces[i])
+				return -EINVAL;
+			ret = scatterlist_filler_add_bounce(filler,
+							    bounces[i]);
 			if (ret)
 				return ret;
 		}

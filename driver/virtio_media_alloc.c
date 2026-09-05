@@ -25,6 +25,7 @@
 
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -573,4 +574,106 @@ void vmedia_queue_put_dbufs(struct virtio_media_queue_state *queue)
 
 	for (i = 0; i < queue->allocated_bufs; i++)
 		vmedia_buffer_put_dbufs(&queue->buffers[i]);
+}
+
+/*
+ * Bounce buffers for ioctl payloads the host must touch directly (D34).
+ *
+ * Pool mode wants one physically contiguous run so a single SG entry
+ * describes it, and a kernel mapping to copy the user data through;
+ * memremap() gives the same cacheable view of the pool that
+ * vmedia_dbuf_mmap() gives user-space. Without a pool the device is in-VMM
+ * and reads all guest RAM, so a plain physically contiguous kernel buffer is
+ * enough.
+ */
+struct vmedia_bounce *vmedia_bounce_alloc(struct virtio_media *vv, size_t len)
+{
+	struct vmedia_bounce *bounce;
+	size_t size;
+	int ret;
+
+	if (len == 0 || len > VMEDIA_BOUNCE_MAX_SIZE)
+		return ERR_PTR(-EINVAL);
+
+	bounce = kzalloc(sizeof(*bounce), GFP_KERNEL);
+	if (!bounce)
+		return ERR_PTR(-ENOMEM);
+	bounce->vv = vv;
+	bounce->len = len;
+	INIT_LIST_HEAD(&bounce->blocks);
+
+	mutex_lock(&vv->guest_pool_lock);
+	if (vv->guest_pool_ready) {
+		struct drm_buddy_block *block;
+		u64 offset = U64_MAX;
+
+		size = PAGE_ALIGN(len);
+		ret = drm_buddy_alloc_blocks(&vv->guest_pool_mm, 0,
+					     vv->guest_pool_size, size,
+					     PAGE_SIZE, &bounce->blocks,
+					     DRM_BUDDY_CONTIGUOUS_ALLOCATION);
+		if (ret) {
+			mutex_unlock(&vv->guest_pool_lock);
+			kfree(bounce);
+			return ERR_PTR(-ENOMEM);
+		}
+		/*
+		 * A contiguous allocation may still come as several adjacent
+		 * blocks; the run starts at the lowest one.
+		 */
+		list_for_each_entry(block, &bounce->blocks, link)
+			offset = min(offset, drm_buddy_block_offset(block));
+		bounce->pool = true;
+		bounce->size = size;
+		bounce->phys = vv->guest_pool_base + offset;
+	}
+	mutex_unlock(&vv->guest_pool_lock);
+
+	if (bounce->pool) {
+		bounce->vaddr = memremap(bounce->phys, bounce->size,
+					 MEMREMAP_WB);
+		if (!bounce->vaddr)
+			goto err_backing;
+	} else {
+		bounce->size = len;
+		bounce->vaddr = kmalloc(len, GFP_KERNEL);
+		if (!bounce->vaddr)
+			goto err_backing;
+		bounce->phys = virt_to_phys(bounce->vaddr);
+	}
+
+	return bounce;
+
+err_backing:
+	if (bounce->pool) {
+		mutex_lock(&vv->guest_pool_lock);
+		if (vv->guest_pool_ready)
+			vmedia_drm_buddy_free_list(&vv->guest_pool_mm,
+						   &bounce->blocks);
+		mutex_unlock(&vv->guest_pool_lock);
+	}
+	kfree(bounce);
+	return ERR_PTR(-ENOMEM);
+}
+
+void vmedia_bounce_free(struct vmedia_bounce *bounce)
+{
+	struct virtio_media *vv;
+
+	if (!bounce)
+		return;
+	vv = bounce->vv;
+
+	if (bounce->pool) {
+		memunmap(bounce->vaddr);
+		mutex_lock(&vv->guest_pool_lock);
+		/* Same closed-gate rule as vmedia_dbuf_release(). */
+		if (vv->guest_pool_ready)
+			vmedia_drm_buddy_free_list(&vv->guest_pool_mm,
+						   &bounce->blocks);
+		mutex_unlock(&vv->guest_pool_lock);
+	} else {
+		kfree(bounce->vaddr);
+	}
+	kfree(bounce);
 }

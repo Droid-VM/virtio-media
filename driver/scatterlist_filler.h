@@ -14,6 +14,7 @@
 #include "session.h"
 
 struct vmedia_dbuf;
+struct vmedia_bounce;
 
 /**
  * struct scatterlist_filler - helper to fill a scatterlist from data.
@@ -106,11 +107,15 @@ int scatterlist_filler_add_buffer_dbuf(struct scatterlist_filler *filler,
  *
  * The controls will be either directly mapped, or copied into the shadow buffer to be mapped there.
  *
- * For controls with pointer data, the data is always directly mapped, not copied.
+ * When @add_payloads is true, the payload of every control with a size is
+ * added too, as the single SG entry of its bounce buffer in @bounces (indexed
+ * per control, defect D34): the payload pointer itself is an arbitrary guest
+ * user-space page, which a pool-mode host has no access window for.
  */
 int scatterlist_filler_add_ext_ctrls(struct scatterlist_filler *filler,
 				     struct v4l2_ext_controls *ctrls,
-				     bool add_userptrs);
+				     bool add_payloads,
+				     struct vmedia_bounce *const *bounces);
 
 /**
  * scatterlist_filler_retrieve_data - Retrieve data written by the device on the shadow buffer, if needed.

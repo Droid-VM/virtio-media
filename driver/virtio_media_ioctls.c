@@ -1721,6 +1721,23 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 	if (READ_ONCE(fh_to_session(vfh)->dead))
 		return -ENODEV;
 
+	/*
+	 * A blocking VIDIOC_DQEVENT sleeps in v4l2_event_dequeue() until an
+	 * event arrives. It never talks to the host -- it only reads the
+	 * v4l2 event queue under vdev->fh_lock, filled by
+	 * virtio_media_process_events() from the event work, which does not
+	 * take vlock either. Dispatch it without the device lock, the way
+	 * virtio_media_dqbuf() already drops vlock around its own wait:
+	 * holding vlock across the sleep wedged every other ioctl and every
+	 * open() of the node behind one waiter, including the very setter
+	 * that would have produced the awaited event (defect D35,
+	 * B7-controls §12.1). SUBSCRIBE/UNSUBSCRIBE_EVENT stay under vlock:
+	 * they only wait for the host's bounded command response, never for
+	 * guest-side activity.
+	 */
+	if (cmd == VIDIOC_DQEVENT)
+		return video_ioctl2(file, cmd, arg);
+
 	mutex_lock(&vv->vlock);
 
 	/*

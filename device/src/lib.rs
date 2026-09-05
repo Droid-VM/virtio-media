@@ -462,11 +462,38 @@ where
     Device: VirtioMediaDevice<Reader, Writer>,
     Poller: SessionPoller,
 {
+    /// Declared before `device`, and the order is load-bearing: a runner that is merely dropped
+    /// drops its sessions first, so a session that owns a thread of its own (the camera device's
+    /// capture thread) joins it before the device -- its buffer allocator, its host mappings, its
+    /// backend -- goes away underneath that thread. [`Drop`] below is the real mechanism; this is
+    /// the belt to its braces (`VPU_DESIGN.md` §2.5, review-m4 R1).
+    pub sessions: HashMap<u32, Device::Session>,
     pub device: Device,
     poller: Poller,
-    pub sessions: HashMap<u32, Device::Session>,
     // TODO: recycle session ids...
     session_id_counter: u32,
+}
+
+/// Closing the sessions is part of dropping the runner.
+///
+/// Only [`VirtioMediaDevice::close_session`] takes a session apart in the order `VPU_DESIGN.md`
+/// §2.5 requires -- stop whatever may still be writing into a buffer, *then* free the buffer --
+/// and the guest's `CLOSE` command is not the only way a session ends: a worker that returns on
+/// its kill event, a vhost-user `stop_queue` and a device `reset` all just drop the runner. Before
+/// this impl those sessions were dropped field by field, and after the device, so a camera whose
+/// capture thread was mid-frame wrote into a buffer that had already been unmapped and handed back
+/// to the allocator (review-m4 R1).
+impl<Reader, Writer, Device, Poller> Drop
+    for VirtioMediaDeviceRunner<Reader, Writer, Device, Poller>
+where
+    Reader: ReadFromDescriptorChain,
+    Writer: WriteToDescriptorChain,
+    Device: VirtioMediaDevice<Reader, Writer>,
+    Poller: SessionPoller,
+{
+    fn drop(&mut self) {
+        self.close_sessions();
+    }
 }
 
 impl<Reader, Writer, Device, Poller> VirtioMediaDeviceRunner<Reader, Writer, Device, Poller>
@@ -478,9 +505,9 @@ where
 {
     pub fn new(device: Device, poller: Poller) -> Self {
         Self {
+            sessions: Default::default(),
             device,
             poller,
-            sessions: Default::default(),
             session_id_counter: 0,
         }
     }
@@ -620,8 +647,34 @@ where
         }
     }
 
-    /// Returns the device this runner has been created from.
-    pub fn into_device(self) -> Device {
-        self.device
+    /// Close every session still open, through the device and in the order `VPU_DESIGN.md` §2.5
+    /// requires, and stop polling them. Idempotent; what [`Drop`] does.
+    fn close_sessions(&mut self) {
+        for (_, session) in self.sessions.drain() {
+            if let Some(fd) = session.poll_fd() {
+                self.poller.remove_session(fd);
+            }
+            self.device.close_session(session);
+        }
+    }
+
+    /// Returns the device this runner has been created from, closing every session it still
+    /// holds first -- a session cannot outlive its device, and only `close_session` takes one
+    /// apart in the right order (see [`Drop`]).
+    pub fn into_device(mut self) -> Device {
+        self.close_sessions();
+        // `Drop` must not also run: `device` is moved out below, and the sessions it would
+        // close are gone already.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: each field is read or dropped exactly once out of a `ManuallyDrop` that is
+        // never touched again, so nothing is dropped twice and nothing is leaked: `device` is
+        // moved to the caller, `sessions` (now empty) and `poller` are dropped here, and
+        // `session_id_counter` is a `u32`.
+        unsafe {
+            let device = std::ptr::read(&this.device);
+            std::ptr::drop_in_place(&mut this.sessions);
+            std::ptr::drop_in_place(&mut this.poller);
+            device
+        }
     }
 }

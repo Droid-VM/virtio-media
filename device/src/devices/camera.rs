@@ -477,11 +477,21 @@ pub struct CameraSession<GM, S> {
     fps: u32,
     /// Memory type the buffers were allocated with; `None` while there are none.
     memory: Option<MemoryType>,
+    /// The open stream; `Some` exactly while streaming.
+    ///
+    /// Declared before `buffers`, and the order is load-bearing: a session that is merely
+    /// dropped rather than closed drops its fields in declaration order, and a
+    /// [`CameraStream`] joins its capture thread when it goes. Putting it first means even a
+    /// bare drop joins before a single buffer -- a host buffer's mapping, or a guest mapping
+    /// whose `Drop` unmaps the guest's own pages -- is released underneath a thread that is
+    /// still writing a frame into it (`VPU_DESIGN.md` §2.5, review-m4 R1). A `Drop` impl
+    /// cannot do this job: freeing a host buffer needs the device's allocator, which the
+    /// session does not have; [`VirtioMediaDeviceRunner`]'s `Drop` calls `close_session` for
+    /// exactly that reason, and this order is what protects the session dropped any other way.
+    stream: Option<S>,
     buffers: Vec<Buffer<GM>>,
     /// Indices queued before `STREAMON`, in order; lent when the stream opens.
     queued: VecDeque<usize>,
-    /// The open stream; `Some` exactly while streaming.
-    stream: Option<S>,
     /// The camera went away or failed. The guest was sent an error event and treats the session
     /// as closed (the driver fails every further ioctl with `ENODEV`); so does this device for
     /// anything that would touch the stream, until the guest closes it.
@@ -783,9 +793,9 @@ where
             size,
             fps: DEFAULT_FPS,
             memory: None,
+            stream: None,
             buffers: Vec::new(),
             queued: VecDeque::new(),
-            stream: None,
             dead: false,
         })
     }
@@ -1499,13 +1509,17 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::rc::Rc;
     use std::sync::mpsc;
     use std::sync::Mutex;
     use std::thread;
 
     use super::*;
+    use crate::poll::SessionPoller;
+    use crate::protocol::VIRTIO_MEDIA_CMD_OPEN;
     use crate::MemFdAllocator;
+    use crate::VirtioMediaDeviceRunner;
 
     /// Collects the events the device sends.
     #[derive(Default)]
@@ -1524,6 +1538,9 @@ mod tests {
     struct FakeGuest {
         memory: Rc<RefCell<Vec<u8>>>,
         live_mappings: Rc<RefCell<usize>>,
+        /// The camera's log, so a mapping can say *when* it was released. See
+        /// [`FakeMapping::drop`].
+        log: SharedLog,
     }
 
     struct FakeMapping {
@@ -1560,8 +1577,26 @@ mod tests {
     }
 
     impl Drop for FakeMapping {
+        /// Dropping a guest mapping is what gives the guest's pages back (a real one unmaps an
+        /// arena, or writes a shadow buffer back into it), so it is one of the two events §2.5
+        /// orders against the capture thread -- the other being [`OrderedAllocator::release`],
+        /// which checks the same thing for host buffers. Releasing one while the fake camera is
+        /// still streaming *and* still holds this very buffer is the invariant broken
+        /// (review-m4 R1, R7); releasing one the camera has handed back is the ordinary
+        /// per-frame case `return_filled` does on purpose.
         fn drop(&mut self) {
+            let violated = match self.guest.log.lock() {
+                Ok(log) => log.streaming && log.holding.contains(&(self.as_ptr() as usize)),
+                Err(_) => false,
+            };
             *self.guest.live_mappings.borrow_mut() -= 1;
+            // A session holds several mappings and loses them all at once, so the second
+            // violation would panic while the first is unwinding -- which aborts the whole test
+            // binary instead of failing this one test.
+            assert!(
+                !violated || std::thread::panicking(),
+                "a guest mapping was released while the capture thread still held the buffer"
+            );
         }
     }
 
@@ -1579,6 +1614,25 @@ mod tests {
                 guest: self.clone(),
                 start,
             })
+        }
+    }
+
+    /// The worker's wait context, as far as [`VirtioMediaDeviceRunner`] can tell: it records the
+    /// session descriptors added to it and taken out of it.
+    #[derive(Clone, Default)]
+    struct FakePoller {
+        added: Rc<RefCell<Vec<i32>>>,
+        removed: Rc<RefCell<Vec<i32>>>,
+    }
+
+    impl SessionPoller for FakePoller {
+        fn add_session(&self, session: BorrowedFd, _session_id: u32) -> Result<(), i32> {
+            self.added.borrow_mut().push(session.as_raw_fd());
+            Ok(())
+        }
+
+        fn remove_session(&self, session: BorrowedFd) {
+            self.removed.borrow_mut().push(session.as_raw_fd());
         }
     }
 
@@ -1610,6 +1664,11 @@ mod tests {
         /// Host buffers the allocator was handed back while a stream was open -- the §2.5
         /// violation the ordering tests look for.
         released_while_streaming: usize,
+        /// The first byte of every buffer the stream has been lent and not yet handed back,
+        /// i.e. the memory the capture thread may be writing into right now. Filled in by
+        /// `give_empty` on the device thread and emptied by the capture thread just before it
+        /// returns the buffer, so it is exact at every point either side can observe.
+        holding: HashSet<usize>,
     }
 
     type SharedLog = Arc<Mutex<FakeLog>>;
@@ -1624,6 +1683,13 @@ mod tests {
         fail_open: Option<i32>,
         /// The camera "disconnects" after returning this many frames.
         disconnect_after: Option<u32>,
+        /// From this frame on the camera keeps every buffer it is lent instead of filling and
+        /// returning it, the way a real one holds the buffer it is writing into: the sink is
+        /// bumped so a test can tell the thread has taken it, and only the join ends that.
+        hold_from: Option<u32>,
+        /// The stream refuses the loans after this many (`give_empty` answers `EIO`), which is
+        /// what a backend whose capture thread has died looks like.
+        refuse_lend_after: Option<usize>,
     }
 
     enum FakeCommand {
@@ -1637,6 +1703,9 @@ mod tests {
         events: mpsc::Receiver<CameraEvent>,
         thread: Option<thread::JoinHandle<()>>,
         log: SharedLog,
+        /// Loans accepted so far, against [`FakeCamera::refuse_lend_after`].
+        lends: usize,
+        refuse_lend_after: Option<usize>,
     }
 
     /// Luma byte of frame `sequence`, so a filled buffer says which frame it holds.
@@ -1666,6 +1735,7 @@ mod tests {
             let log = Arc::clone(&self.log);
             let thread_log = Arc::clone(&self.log);
             let disconnect_after = self.disconnect_after;
+            let hold_from = self.hold_from;
             let (width, height) = (request.width, request.height);
             let thread = thread::spawn(move || {
                 let mut sequence = 0u32;
@@ -1679,6 +1749,12 @@ mod tests {
                         let _ = events_tx.send(CameraEvent::Disconnected);
                         sink.signal();
                         break;
+                    }
+                    if hold_from.is_some_and(|first| sequence >= first) {
+                        // Kept, not filled: the buffer stays in `log.holding` until the thread
+                        // is joined, which is what makes the ordering assertions bite.
+                        sink.signal();
+                        continue;
                     }
                     // The copy contract: `height` rows of luma, `height / 2` rows of chroma,
                     // `stride` bytes each, tightly packed.
@@ -1702,6 +1778,9 @@ mod tests {
                             )
                         };
                     }
+                    // Done with the bytes: the device may release what backs them from here
+                    // on, and the ordering assertions stop applying to this buffer.
+                    thread_log.lock().unwrap().holding.remove(&(dst as usize));
                     let _ = filled_tx.send(FilledBuffer {
                         index: buffer.index,
                         bytesused: buffer.len as u32,
@@ -1719,12 +1798,24 @@ mod tests {
                 events,
                 thread: Some(thread),
                 log,
+                lends: 0,
+                refuse_lend_after: self.refuse_lend_after,
             })
         }
     }
 
     impl CameraStream for FakeStream {
         fn give_empty(&mut self, buffer: EmptyBuffer) -> Result<(), i32> {
+            if self.refuse_lend_after.is_some_and(|n| self.lends >= n) {
+                return Err(libc::EIO);
+            }
+            self.lends += 1;
+            // From here the capture thread owns these bytes until it hands them back.
+            self.log
+                .lock()
+                .unwrap()
+                .holding
+                .insert(buffer.ptr.as_ptr() as usize);
             self.commands
                 .send(FakeCommand::Lend(buffer))
                 .map_err(|_| libc::EIO)
@@ -1747,14 +1838,32 @@ mod tests {
             Ok(())
         }
 
-        fn close(mut self) {
+        fn close(self) {
+            // Everything `close` has to do, `Drop` does; see [`FakeStream::stop`].
+        }
+    }
+
+    impl FakeStream {
+        /// Stop the capture thread and join it, marking the stream closed only once the thread
+        /// is really gone -- what `AndroidCameraStream` does in *its* `Drop`
+        /// (`android_camera_backend/android.rs`). Idempotent.
+        fn stop(&mut self) {
             let _ = self.commands.send(FakeCommand::Stop);
             if let Some(thread) = self.thread.take() {
                 thread.join().unwrap();
+                let mut log = self.log.lock().unwrap();
+                log.closed += 1;
+                log.streaming = false;
             }
-            let mut log = self.log.lock().unwrap();
-            log.closed += 1;
-            log.streaming = false;
+        }
+    }
+
+    /// The real backend joins its capture thread when the stream is dropped, not only when
+    /// `close` is called, and that is what makes a session's field order matter (review-m4 R1).
+    /// The fake would hide the bug without this.
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.stop();
         }
     }
 
@@ -1825,12 +1934,13 @@ mod tests {
     fn rig_with(camera: FakeCamera) -> Rig {
         let events = EventLog::default();
         let events_log = Rc::clone(&events.0);
+        let log = Arc::clone(&camera.log);
         let guest = FakeGuest {
             memory: Rc::new(RefCell::new(vec![0u8; GUEST_MEMORY])),
             live_mappings: Rc::new(RefCell::new(0)),
+            log: Arc::clone(&log),
         };
         let released = Rc::new(RefCell::new(0));
-        let log = Arc::clone(&camera.log);
         let device = CameraDevice::new(
             camera,
             events,
@@ -1852,12 +1962,20 @@ mod tests {
     }
 
     fn rig() -> Rig {
-        rig_with(FakeCamera {
+        rig_with(camera())
+    }
+
+    /// A camera that does everything right: opens, fills every buffer it is lent, never goes
+    /// away. Tests that want one of the failure modes set the knob they need.
+    fn camera() -> FakeCamera {
+        FakeCamera {
             info: info(),
             log: Default::default(),
             fail_open: None,
             disconnect_after: None,
-        })
+            hold_from: None,
+            refuse_lend_after: None,
+        }
     }
 
     fn session(device: &mut Device) -> Session {
@@ -2392,6 +2510,103 @@ mod tests {
         close(&mut r.device, other);
     }
 
+    /// §2.5 on the path that is not an ioctl: a session that is merely *dropped* -- which is what
+    /// becomes of every session the guest has not closed when the worker thread ends -- must
+    /// still join the capture thread before the buffers it was lent, and the guest mappings
+    /// behind them, go away. `FakeMapping::drop` makes the assertion; `CameraSession`'s field
+    /// order is what makes it hold (review-m4 R1).
+    #[test]
+    fn a_dropped_session_joins_the_stream_before_its_buffers() {
+        // The camera keeps the buffers it is lent, as one writing a frame does.
+        let mut r = rig_with(FakeCamera {
+            hold_from: Some(0),
+            ..camera()
+        });
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::UserPtr, 2)
+            .unwrap();
+        let gpa = 4 * 0x1000u64;
+        for index in 0..2u32 {
+            let (buf, sgs) = userptr_buffer(index, gpa + index as u64 * 0x1_0000, size);
+            r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        }
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        // The capture thread has written into a lent buffer and is still running: nothing
+        // collects the frames, which is the state a killed worker leaves behind.
+        assert!(wait_ready(&s), "no frame within 2s");
+        assert_eq!(*r.guest.live_mappings.borrow(), 2);
+        assert!(r.log.lock().unwrap().streaming);
+
+        drop(s);
+
+        {
+            let log = r.log.lock().unwrap();
+            assert_eq!(log.closed, 1, "dropping the session joined the stream");
+            assert!(!log.streaming);
+        }
+        assert_eq!(*r.guest.live_mappings.borrow(), 0);
+    }
+
+    /// The same invariant one level up: the worker never sends `CLOSE` when it ends on its kill
+    /// event, on `stop_queue` or on `reset` -- it drops the runner. `VirtioMediaDeviceRunner`'s
+    /// `Drop` closes whatever sessions are left through the device, so the stream is joined, the
+    /// buffers go back to the allocator and the session's descriptor leaves the wait context;
+    /// with the device dropped first none of that happened (review-m4 R1).
+    #[test]
+    fn a_dropped_runner_closes_its_sessions() {
+        let r = rig_with(FakeCamera {
+            hold_from: Some(0),
+            ..camera()
+        });
+        let poller = FakePoller::default();
+        // OPEN, as the worker would dispatch it. Declared before the runner: the reader type is
+        // part of the runner's own type, so these bytes must outlive it.
+        let cmd: Vec<u8> = VIRTIO_MEDIA_CMD_OPEN
+            .to_le_bytes()
+            .into_iter()
+            .chain(0u32.to_le_bytes())
+            .collect();
+        let mut writer: Vec<u8> = Vec::new();
+        let mut runner: VirtioMediaDeviceRunner<&[u8], Vec<u8>, Device, FakePoller> =
+            VirtioMediaDeviceRunner::new(r.device, poller.clone());
+
+        runner.handle_command(&mut cmd.as_slice(), &mut writer);
+        assert_eq!(runner.sessions.len(), 1);
+        assert_eq!(poller.added.borrow().len(), 1, "the session is polled");
+
+        let size = 64 * 48 * 3 / 2;
+        {
+            let s = runner.sessions.get_mut(&0).unwrap();
+            runner.device.s_fmt(s, QUEUE, format(64, 48)).unwrap();
+            runner
+                .device
+                .reqbufs(s, QUEUE, MemoryType::Mmap, 2)
+                .unwrap();
+            for index in 0..2 {
+                runner
+                    .device
+                    .qbuf(s, mmap_buffer(index, size), vec![], true)
+                    .unwrap();
+            }
+            runner.device.streamon(s, QUEUE).unwrap();
+            assert!(wait_ready(s), "no frame within 2s");
+        }
+        assert!(r.log.lock().unwrap().streaming);
+
+        drop(runner);
+
+        {
+            let log = r.log.lock().unwrap();
+            assert_eq!(log.closed, 1, "dropping the runner joined the stream");
+            assert_eq!(log.released_while_streaming, 0);
+        }
+        assert_eq!(*r.released.borrow(), 2, "the buffers went back");
+        assert_eq!(poller.removed.borrow().len(), 1, "and stopped being polled");
+    }
+
     /// Guest-owned CAPTURE buffers (`driver_owned_queues=all`): the frame lands in the guest's
     /// pages through a writable mapping held while the buffer is lent and dropped before the
     /// `DQBUF` event; a buffer that cannot hold a frame is refused.
@@ -2472,10 +2687,8 @@ mod tests {
     #[test]
     fn a_camera_that_dies_ends_the_session_with_an_error_event() {
         let mut r = rig_with(FakeCamera {
-            info: info(),
-            log: Default::default(),
-            fail_open: None,
             disconnect_after: Some(2),
+            ..camera()
         });
         let mut s = session(&mut r.device);
         r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
@@ -2523,10 +2736,8 @@ mod tests {
     #[test]
     fn a_stream_that_cannot_open_fails_streamon_and_keeps_the_buffers_queued() {
         let mut r = rig_with(FakeCamera {
-            info: info(),
-            log: Default::default(),
             fail_open: Some(libc::EBUSY),
-            disconnect_after: None,
+            ..camera()
         });
         let mut s = session(&mut r.device);
         r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();

@@ -669,31 +669,80 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 	poll_wait(file, &session->fh.wait, wait);
 
 	mutex_lock(&session->dqbufs_lock);
-	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
-		if (!capture_queue->streaming ||
-		    (capture_queue->queued_bufs == 0 &&
-		     list_empty(&capture_queue->pending_dqbufs)))
+	if (fh->vdev->vfl_dir == VFL_DIR_M2M &&
+	    (req_events &
+	     (EPOLLIN | EPOLLRDNORM | EPOLLOUT | EPOLLWRNORM))) {
+		/*
+		 * m2m nodes follow v4l2_m2m_poll_for_data()
+		 * (v4l2-mem2mem.c:912-949), not vb2_core_poll(): EPOLLERR
+		 * only when *neither* queue can make progress, because a
+		 * client is expected to poll the CAPTURE side while only
+		 * OUTPUT is streaming yet (GStreamer prerolls exactly like
+		 * that, waiting for SOURCE_CHANGE before it allocates
+		 * CAPTURE buffers -- reporting EPOLLERR there was defect
+		 * D26/D40). A queue can make progress when it is streaming
+		 * and holds a buffer either at the host (queued_bufs, vb2's
+		 * @queued_list) or ready to dequeue (@pending_dqbufs, vb2's
+		 * @done_list); a CAPTURE queue whose LAST buffer was
+		 * dequeued reports EPOLLIN so the client hears the -EPIPE
+		 * (v4l2-mem2mem.c:940-945).
+		 */
+		bool out_usable = output_queue->streaming &&
+				  (output_queue->queued_bufs > 0 ||
+				   !list_empty(&output_queue->pending_dqbufs));
+		bool cap_usable = capture_queue->streaming &&
+				  (capture_queue->queued_bufs > 0 ||
+				   !list_empty(&capture_queue->pending_dqbufs) ||
+				   capture_queue->is_capture_last);
+
+		if (!out_usable && !cap_usable) {
 			rc |= EPOLLERR;
-		else if (!list_empty(&capture_queue->pending_dqbufs))
-			rc |= EPOLLIN | EPOLLRDNORM;
-	}
-	/*
-	 * EPOLLOUT on an OUTPUT queue means a buffer is ready to be *dequeued*,
-	 * not that a free slot is ready to be queued into: vb2_core_poll()
-	 * reports a free slot only for queues that emulate write() (VB2_WRITE),
-	 * which virtio-media does not offer. Reporting a free slot invited a
-	 * blocking DQBUF that could never complete (defect D10, B3 acceptance
-	 * §5.3). Mirror vb2: not streaming or no buffers -> EPOLLERR, otherwise
-	 * EPOLLOUT only for a buffer waiting in @pending_dqbufs (vb2's
-	 * @done_list); vb2's waiting_for_buffers quirk is capture-only, so an
-	 * idle-but-streaming OUTPUT queue reports nothing at all.
-	 */
-	if (req_events & (EPOLLOUT | EPOLLWRNORM)) {
-		if (!output_queue->streaming ||
-		    output_queue->allocated_bufs == 0)
-			rc |= EPOLLERR;
-		else if (!list_empty(&output_queue->pending_dqbufs))
-			rc |= EPOLLOUT | EPOLLWRNORM;
+		} else {
+			if (!list_empty(&output_queue->pending_dqbufs))
+				rc |= EPOLLOUT | EPOLLWRNORM;
+			if (!list_empty(&capture_queue->pending_dqbufs) ||
+			    capture_queue->is_capture_last)
+				rc |= EPOLLIN | EPOLLRDNORM;
+		}
+	} else if (fh->vdev->vfl_dir != VFL_DIR_M2M) {
+		if (req_events & (EPOLLIN | EPOLLRDNORM)) {
+			/*
+			 * Mirror vb2_core_poll(): not streaming or nothing to
+			 * wait for -> EPOLLERR (the waiting_for_buffers
+			 * quirk); an empty done list whose LAST buffer was
+			 * already dequeued -> EPOLLIN, so the client issues
+			 * the DQBUF that answers -EPIPE and ends its drain
+			 * (videobuf2-core.c:2769-2776).
+			 */
+			if (!capture_queue->streaming ||
+			    (capture_queue->queued_bufs == 0 &&
+			     list_empty(&capture_queue->pending_dqbufs) &&
+			     !capture_queue->is_capture_last))
+				rc |= EPOLLERR;
+			else if (!list_empty(&capture_queue->pending_dqbufs) ||
+				 capture_queue->is_capture_last)
+				rc |= EPOLLIN | EPOLLRDNORM;
+		}
+		/*
+		 * EPOLLOUT on an OUTPUT queue means a buffer is ready to be
+		 * *dequeued*, not that a free slot is ready to be queued
+		 * into: vb2_core_poll() reports a free slot only for queues
+		 * that emulate write() (VB2_WRITE), which virtio-media does
+		 * not offer. Reporting a free slot invited a blocking DQBUF
+		 * that could never complete (defect D10, B3 acceptance
+		 * §5.3). Mirror vb2: not streaming or no buffers ->
+		 * EPOLLERR, otherwise EPOLLOUT only for a buffer waiting in
+		 * @pending_dqbufs (vb2's @done_list); vb2's
+		 * waiting_for_buffers quirk is capture-only, so an
+		 * idle-but-streaming OUTPUT queue reports nothing at all.
+		 */
+		if (req_events & (EPOLLOUT | EPOLLWRNORM)) {
+			if (!output_queue->streaming ||
+			    output_queue->allocated_bufs == 0)
+				rc |= EPOLLERR;
+			else if (!list_empty(&output_queue->pending_dqbufs))
+				rc |= EPOLLOUT | EPOLLWRNORM;
+		}
 	}
 	mutex_unlock(&session->dqbufs_lock);
 

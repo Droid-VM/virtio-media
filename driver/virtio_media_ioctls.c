@@ -578,7 +578,6 @@ SIMPLE_W_IOCTL(s_modulator, VIDIOC_S_MODULATOR, const struct v4l2_modulator)
 SIMPLE_WR_IOCTL(g_selection, VIDIOC_G_SELECTION, struct v4l2_selection)
 SIMPLE_WR_IOCTL(s_selection, VIDIOC_S_SELECTION, struct v4l2_selection)
 SIMPLE_R_IOCTL(g_enc_index, VIDIOC_G_ENC_INDEX, struct v4l2_enc_idx)
-SIMPLE_WR_IOCTL(encoder_cmd, VIDIOC_ENCODER_CMD, struct v4l2_encoder_cmd)
 SIMPLE_WR_IOCTL(try_encoder_cmd, VIDIOC_TRY_ENCODER_CMD,
 		struct v4l2_encoder_cmd)
 SIMPLE_WR_IOCTL(try_decoder_cmd, VIDIOC_TRY_DECODER_CMD,
@@ -764,6 +763,12 @@ static int virtio_media_streamon(struct file *file, void *priv_unused,
 		return ret;
 
 	session->queues[i].streaming = true;
+	/*
+	 * STREAMON ends the EPIPE-after-LAST drain state alongside
+	 * STREAMOFF and the *_CMD_START commands (dev-decoder.rst "Drain":
+	 * "until the client issues any of the following operations"), D27b.
+	 */
+	session->queues[i].is_capture_last = false;
 
 	return 0;
 }
@@ -1484,6 +1489,40 @@ static int virtio_media_decoder_cmd(struct file *file, void *priv_unused,
 
 	/* A START command makes the CAPTURE queue able to dequeue again. */
 	if (cmd->cmd == V4L2_DEC_CMD_START) {
+		session->queues[V4L2_BUF_TYPE_VIDEO_CAPTURE].is_capture_last =
+			false;
+		session->queues[V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE]
+			.is_capture_last = false;
+	}
+
+	return 0;
+}
+
+/*
+ * encoder_cmd affects the CAPTURE queue the same way (dev-encoder.rst
+ * "Drain": ENC_CMD_START resumes a queue parked by a dequeued LAST buffer);
+ * without this the driver kept answering -EPIPE after an encoder drain until
+ * STREAMOFF, stalling clients that restart with ENC_CMD_START (D27b's
+ * encoder-side twin, D40/D43 root).
+ */
+static int virtio_media_encoder_cmd(struct file *file, void *priv_unused,
+				    struct v4l2_encoder_cmd *cmd)
+{
+	struct v4l2_fh *fh = file->private_data;
+	struct virtio_media_session *session;
+	int ret;
+
+	if (!fh)
+		return -ENODEV;
+	session = fh_to_session(fh);
+
+	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_ENCODER_CMD, cmd,
+					 sizeof(*cmd), sizeof(*cmd));
+	if (ret)
+		return ret;
+
+	/* A START command makes the CAPTURE queue able to dequeue again. */
+	if (cmd->cmd == V4L2_ENC_CMD_START) {
 		session->queues[V4L2_BUF_TYPE_VIDEO_CAPTURE].is_capture_last =
 			false;
 		session->queues[V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE]

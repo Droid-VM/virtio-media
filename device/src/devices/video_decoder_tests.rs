@@ -17,6 +17,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 use super::*;
 use crate::ioctl::ffmpeg_wire;
@@ -211,13 +213,20 @@ const DRC_LAST_MAGIC: u8 = 0xfe;
 /// the kernel's decoder interface documents, and the one GStreamer and ffmpeg both poll for
 /// (`POLLPRI` before `POLLIN`).
 const DRC_LAST_AFTER_MAGIC: u8 = 0xfd;
-/// A bitstream buffer the backend consumes without being able to announce a format: it returns
-/// the OUTPUT buffer (`InputBufferDone`) but emits no `SOURCE_CHANGE`, and produces no frame. This
-/// models the MediaCodec backend releasing a held `InputBufferDone` when the codec asks for more
-/// input than the buffer carried (D48, `android.rs` -- the first packet of an mp4 our own encoder
-/// wrote is a 31-byte header the codec cannot announce from). A one-buffer-in-flight client must
-/// still get this buffer back, or it never queues the next.
+/// A bitstream buffer the backend consumes without being able to announce a format: it produces
+/// no `SOURCE_CHANGE` and no frame, and its `InputBufferDone` is **held** until either a later
+/// buffer announces a format or the [`FakeBackend::grace`] ceiling passes -- modelling the
+/// MediaCodec backend's hold (`android.rs` `note_input_done` / `ANNOUNCE_GRACE`, D55/D56: the
+/// first packet of an mp4 our own encoder wrote is a 31-byte header the codec cannot announce
+/// from). A one-buffer-in-flight client must still get this buffer back within the grace, or it
+/// deadlocks; but it must NOT get it before the `SOURCE_CHANGE` a client that keeps waiting is
+/// owed, or that client's OUTPUT queue empties and its poll takes `POLLPRI|POLLERR` (D55).
 const NO_ANNOUNCE_MAGIC: u8 = 0xfc;
+/// A parameter-set-only buffer fed mid-stream (after the format is announced) that raises a
+/// resolution change: the backend holds its `InputBufferDone` until the second `SOURCE_CHANGE`
+/// (or the grace), modelling `android.rs` setting `awaiting_drc` on a `CODEC_CONFIG` buffer so a
+/// GStreamer client waiting in `wait_for_src_ch` for the change is not emptied (D55, at a DRC).
+const DRC_RACE_MAGIC: u8 = 0xfb;
 /// The resolution the fake "parses" out of the stream, whatever coded size the client set as a
 /// placeholder on `S_FMT(OUTPUT)`. A real decoder reads this from the bitstream.
 const FAKE_STREAM_SIZE: (u32, u32) = (320, 240);
@@ -232,6 +241,10 @@ struct FakeBackend {
     log: SharedLog,
     /// `start` fails with this errno.
     fail_start: Option<i32>,
+    /// How long a held `InputBufferDone` (a buffer the fake cannot yet announce a format from) is
+    /// kept before it is returned anyway, modelling `android.rs`'s `ANNOUNCE_GRACE`. A test that
+    /// exercises the grace injects a short one so it need not wait the production 250 ms.
+    grace: Duration,
 }
 
 enum Cmd {
@@ -279,6 +292,7 @@ impl VideoDecoderBackend for FakeBackend {
         let (events_tx, events) = mpsc::channel::<DecoderEvent>();
         let log = Arc::clone(&self.log);
         let thread_log = Arc::clone(&self.log);
+        let grace = self.grace;
         let thread = thread::spawn(move || {
             let emit = |e: DecoderEvent| {
                 let _ = events_tx.send(e);
@@ -291,6 +305,41 @@ impl VideoDecoderBackend for FakeBackend {
             let mut format_announced = false;
             // A resolution change waiting for its `LAST` buffer to go out first.
             let mut pending_format: Option<(u32, u32)> = None;
+            // Guest OUTPUT buffer indices whose `InputBufferDone` is held behind a `SOURCE_CHANGE`
+            // the client is waiting for (D45/D55), the start of the hold, and whether a
+            // mid-stream config buffer started it (`awaiting_drc`). This mirrors `android.rs`'s
+            // `note_input_done` / `deferred_input_done` / `ANNOUNCE_GRACE`: a buffer is held while
+            // the format is not yet announced or a DRC is expected, and released after the
+            // announcement or after `grace` (whichever comes first), never on a bare input-slot
+            // recycle.
+            let mut deferred: std::collections::VecDeque<u32> = Default::default();
+            let mut deferred_since: Option<Instant> = None;
+            let mut awaiting_drc = false;
+            // Return the guest OUTPUT buffer, or hold it if a `SOURCE_CHANGE` is still owed.
+            let hold = |index: u32,
+                        format_announced: bool,
+                        awaiting_drc: bool,
+                        deferred: &mut std::collections::VecDeque<u32>,
+                        deferred_since: &mut Option<Instant>| {
+                if !format_announced || awaiting_drc {
+                    if deferred_since.is_none() {
+                        *deferred_since = Some(Instant::now());
+                    }
+                    deferred.push_back(index);
+                } else {
+                    emit(DecoderEvent::InputBufferDone(index));
+                }
+            };
+            // Release every held buffer, after whatever event was just emitted; ends the hold.
+            let release_deferred = |deferred: &mut std::collections::VecDeque<u32>,
+                                    deferred_since: &mut Option<Instant>,
+                                    awaiting_drc: &mut bool| {
+                while let Some(index) = deferred.pop_front() {
+                    emit(DecoderEvent::InputBufferDone(index));
+                }
+                *deferred_since = None;
+                *awaiting_drc = false;
+            };
 
             // Write a frame into a capture buffer and dequeue it, or -- when draining and no
             // frame is left -- the empty LAST buffer.
@@ -363,7 +412,31 @@ impl VideoDecoderBackend for FakeBackend {
                 }
             };
 
-            for cmd in rx {
+            loop {
+                // While a buffer is held, wait only until its grace deadline: if no command
+                // arrives first, the grace fires and the held buffers are returned (D56 -- the
+                // release must not depend on a codec event). This is what `GraceTimer` does for the
+                // real backend; here the fake's own loop is the timer.
+                let cmd = if let Some(since) = deferred_since {
+                    let deadline = since + grace;
+                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                        Ok(cmd) => cmd,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            release_deferred(
+                                &mut deferred,
+                                &mut deferred_since,
+                                &mut awaiting_drc,
+                            );
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match rx.recv() {
+                        Ok(cmd) => cmd,
+                        Err(_) => break,
+                    }
+                };
                 match cmd {
                     Cmd::Start((_fmt, size)) => {
                         coded_size = size;
@@ -374,17 +447,59 @@ impl VideoDecoderBackend for FakeBackend {
                         timestamp,
                     } => {
                         if first_byte == NO_ANNOUNCE_MAGIC {
-                            // The codec consumed the buffer but cannot announce a format from it,
-                            // and asks for more input: the OUTPUT buffer goes back with no
-                            // SOURCE_CHANGE and no frame (D48).
-                            emit(DecoderEvent::InputBufferDone(index));
+                            // The codec consumed the buffer but cannot announce a format from it:
+                            // no SOURCE_CHANGE, no frame, and its InputBufferDone is HELD, released
+                            // only on a later announcement or the grace (D55/D56), never here.
+                            hold(
+                                index,
+                                format_announced,
+                                awaiting_drc,
+                                &mut deferred,
+                                &mut deferred_since,
+                            );
+                            continue;
+                        }
+                        if first_byte == DRC_RACE_MAGIC {
+                            // A parameter-set-only buffer that raises a mid-stream resolution
+                            // change with the D55 race: the input slot recycles before the codec
+                            // announces. The backend holds this InputBufferDone until the second
+                            // SOURCE_CHANGE, so a GStreamer client in `wait_for_src_ch` is not
+                            // emptied. Model it: begin the DRC hold, announce, then release the
+                            // held buffer AFTER the event.
+                            awaiting_drc = true;
+                            hold(
+                                index,
+                                format_announced,
+                                awaiting_drc,
+                                &mut deferred,
+                                &mut deferred_since,
+                            );
+                            let new_size = (
+                                (coded_size.0 / 2).max(2) & !1,
+                                (coded_size.1 / 2).max(2) & !1,
+                            );
+                            coded_size = new_size;
+                            emit(DecoderEvent::FormatChanged {
+                                coded_size,
+                                visible_rect: v4l2r::Rect::new(0, 0, new_size.0, new_size.1),
+                                min_capture_buffers: 4,
+                            });
+                            release_deferred(&mut deferred, &mut deferred_since, &mut awaiting_drc);
+                            pump(
+                                &mut ready,
+                                &mut captures,
+                                &mut coded_size,
+                                &mut draining,
+                                &mut pending_format,
+                            );
                             continue;
                         }
                         if first_byte == DRC_MAGIC
                             || first_byte == DRC_LAST_MAGIC
                             || first_byte == DRC_LAST_AFTER_MAGIC
                         {
-                            // The input is consumed at once.
+                            // The input is consumed at once (an inline-SPS change, not the config
+                            // buffer of DRC_RACE_MAGIC: nothing to hold).
                             emit(DecoderEvent::InputBufferDone(index));
                             // Mid-stream resolution change: halve the size (kept even).
                             let new_size = (
@@ -447,9 +562,18 @@ impl VideoDecoderBackend for FakeBackend {
                                 visible_rect: v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1),
                                 min_capture_buffers: 4,
                             });
+                            // Any buffers held before the announcement (an earlier NO_ANNOUNCE
+                            // one) go back now, AFTER the SOURCE_CHANGE (D45/D55 ordering).
+                            release_deferred(&mut deferred, &mut deferred_since, &mut awaiting_drc);
                         }
                         // The input is consumed at once, behind the announcement above.
-                        emit(DecoderEvent::InputBufferDone(index));
+                        hold(
+                            index,
+                            format_announced,
+                            awaiting_drc,
+                            &mut deferred,
+                            &mut deferred_since,
+                        );
                         ready.push_back(ReadyFrame {
                             luma: luma_of(first_byte),
                             timestamp,
@@ -474,10 +598,15 @@ impl VideoDecoderBackend for FakeBackend {
                     }
                     Cmd::Flush(ack) => {
                         // Seek: drop everything queued so far; the CAPTURE queue keeps its buffers
-                        // but no pre-seek frame is produced into them.
+                        // but no pre-seek frame is produced into them. Held input-done is dropped,
+                        // not reported late -- the guest takes its OUTPUT buffers back itself
+                        // (`android.rs` `flush_codec`).
                         ready.clear();
                         draining = false;
                         pending_format = None;
+                        deferred.clear();
+                        deferred_since = None;
+                        awaiting_drc = false;
                         let _ = ack.send(());
                     }
                     Cmd::ClearCapture(ack) => {
@@ -697,7 +826,20 @@ fn caps() -> DecoderCapabilities {
     }
 }
 
+/// The default grace the fake holds an unannounceable buffer for. Long enough that a test which
+/// announces from a later buffer always releases on the announcement, not the clock; a test that
+/// wants the clock injects a short one through [`rig_grace`].
+const FAKE_GRACE: Duration = Duration::from_millis(250);
+
 fn rig_with(fail_start: Option<i32>) -> Rig {
+    rig_full(fail_start, FAKE_GRACE)
+}
+
+fn rig_grace(grace: Duration) -> Rig {
+    rig_full(None, grace)
+}
+
+fn rig_full(fail_start: Option<i32>, grace: Duration) -> Rig {
     let events = EventLog::default();
     let events_log = Rc::clone(&events.0);
     let log: SharedLog = Default::default();
@@ -710,6 +852,7 @@ fn rig_with(fail_start: Option<i32>) -> Rig {
         caps: caps(),
         log: Arc::clone(&log),
         fail_start,
+        grace,
     };
     let device = VideoDecoder::new(
         backend,
@@ -2811,22 +2954,82 @@ fn source_change_precedes_the_output_buffer_that_produced_it() {
     close(&mut r.device, s);
 }
 
-/// D48: a backend that consumes the first OUTPUT buffer but cannot announce a format from it (an
-/// mp4 whose first packet is a 31-byte header, D44) still returns the buffer -- **before** any
-/// `SOURCE_CHANGE` -- and the device must dequeue it for the guest. A one-buffer-in-flight client
-/// (a stateful ffmpeg on an mp4, `v4l2-compliance -s`) polls for its OUTPUT buffer to come back
-/// before it queues the next; if the device held the buffer behind the initial `SOURCE_CHANGE`
-/// the codec can never reach, the two wait on each other forever (B9-build §6 measured exactly
-/// this: `1 bitstream buffers in, 0 frames out`). The MediaCodec backend bounds that hold
-/// (`android.rs`: it releases the held `InputBufferDone` the moment the codec asks for more input
-/// than the buffer carried, plus a 500 ms backstop); this pins the device end of the contract --
-/// an `InputBufferDone` reported before the first `FormatChanged` reaches the guest as a `DQBUF`,
-/// so the D45 hold (which lives entirely in the backend) can end without waiting for a
-/// `SOURCE_CHANGE` that is not coming. The companion
-/// `source_change_precedes_the_output_buffer_that_produced_it` pins the other half: when the codec
-/// *can* announce, the event still precedes the buffer (`POLLPRI` before `POLLOUT`).
+/// The position of the OUTPUT `DQBUF` for a given buffer index in the accumulated event log.
+fn output_dqbuf_at(events: &[V4l2Event], index: u32) -> Option<usize> {
+    events.iter().position(|e| {
+        matches!(e, V4l2Event::DequeueBuffer(d)
+            if d.v4l2_buffer().queue() == OUTPUT && d.v4l2_buffer().index() == index)
+    })
+}
+
+/// The position of the `n`-th (1-based) `SOURCE_CHANGE` event in the accumulated event log.
+fn nth_source_change_at(events: &[V4l2Event], n: usize) -> Option<usize> {
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(e, V4l2Event::Event(se)
+                if se.event().type_ == bindings::V4L2_EVENT_SOURCE_CHANGE)
+        })
+        .map(|(i, _)| i)
+        .nth(n - 1)
+}
+
+/// D55/D56 (a): a backend that never announces a format holds the `InputBufferDone` and returns it
+/// only once [`ANNOUNCE_GRACE`] passes, never on the codec's bare input-slot recycle. This is the
+/// one-buffer-in-flight case (a stateful ffmpeg on an mp4 whose first packet is a 31-byte header,
+/// D44; a `v4l2-compliance -s` feeding undecodable bytes): the buffer must come back, or the
+/// client deadlocks -- but on the *clock*, not on a codec event, because a codec that goes silent
+/// after consuming the garbage emits no callback to drive an event-driven release (D56, the
+/// residue of D28/D48). Here a short grace is injected so the test need not wait the production
+/// 250 ms; the point is the buffer is held for at least that grace and comes back with **no**
+/// `SOURCE_CHANGE` ever.
 #[test]
-fn an_output_buffer_returns_before_the_first_source_change_when_the_codec_cannot_announce() {
+fn a_held_input_buffer_returns_after_the_grace_when_the_codec_never_announces() {
+    let grace = Duration::from_millis(40);
+    let mut r = rig_grace(grace);
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 4).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // Buffer 0 carries bytes the backend cannot announce a format from: it is HELD, not returned
+    // on the input-slot recycle.
+    poke_mmap_output(&mut s, 0, NO_ANNOUNCE_MAGIC);
+    let mut ob = mmap_buffer(OUTPUT, 0, 1 << 20);
+    ob.set_timestamp(ts(1));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    let start = Instant::now();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while dequeued_on(&r.events.borrow(), OUTPUT).is_empty() {
+        assert!(wait_ready(&s), "no OUTPUT DQBUF within 2s");
+        process(&mut r.device, &mut s);
+    }
+    // It was held for at least the grace (the hold began after `start`, so the release is strictly
+    // later than `start + grace`), and it came back with no announcement -- freed on the clock.
+    assert!(
+        start.elapsed() >= grace,
+        "the buffer must be held for the grace, not returned on the recycle"
+    );
+    assert_eq!(dequeued_on(&r.events.borrow(), OUTPUT).len(), 1, "buffer 0 returned after the grace");
+    assert_eq!(source_changes(&r.events.borrow()), 0, "the codec never announced");
+    close(&mut r.device, s);
+}
+
+/// D55 (b): the race the F12 fix opened. MediaCodec can recycle the input slot
+/// (`onInputAvailable`) *before* it announces (`onOutputFormatChanged`); the F12 backend released
+/// the held `InputBufferDone` on that recycle, which returned the OUTPUT buffer **before** the
+/// `SOURCE_CHANGE` a GStreamer client was waiting for -- so `wait_for_src_ch` emptied its OUTPUT
+/// queue and its CAPTURE poll took `POLLPRI|POLLERR` (4/20 DRC runs died, B10-acceptance §1.4).
+/// With the recycle no longer a release point, the held buffer comes back only *after* the
+/// announcement, so the `SOURCE_CHANGE` still precedes the OUTPUT `DQBUF` (`POLLPRI` before
+/// `POLLOUT`) even though the codec recycled the slot first. Buffer 0 is one the codec cannot
+/// announce from (its slot recycles with nothing announced); buffer 1 lets it announce.
+#[test]
+fn a_held_input_buffer_returns_after_the_source_change_when_the_codec_announces_late() {
+    // A long grace, so the announcement -- not the clock -- is what ends the hold here.
     let mut r = rig();
     let mut s = session(&mut r.device);
     r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
@@ -2835,39 +3038,109 @@ fn an_output_buffer_returns_before_the_first_source_change_when_the_codec_cannot
         .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
         .unwrap();
 
-    // Buffer 0 carries bytes the backend cannot announce a format from: it comes back with no
-    // SOURCE_CHANGE, modelling the release condition the MediaCodec backend implements (D48).
+    // Buffer 0: the slot recycles with nothing announced -- held, NOT returned yet.
     poke_mmap_output(&mut s, 0, NO_ANNOUNCE_MAGIC);
     let mut ob = mmap_buffer(OUTPUT, 0, 1 << 20);
     ob.set_timestamp(ts(1));
     r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
     r.device.streamon(&mut s, OUTPUT).unwrap();
-    while dequeued_on(&r.events.borrow(), OUTPUT).is_empty() {
-        assert!(wait_ready(&s), "no OUTPUT DQBUF within 2s");
-        process(&mut r.device, &mut s);
-    }
-    // The buffer came back, and no SOURCE_CHANGE preceded it: a one-buffer client can now queue
-    // the next OUTPUT buffer instead of deadlocking.
-    assert_eq!(dequeued_on(&r.events.borrow(), OUTPUT).len(), 1, "buffer 0 returned");
-    assert_eq!(source_changes(&r.events.borrow()), 0, "no announcement yet");
 
-    // Queue buffer 1, which the backend CAN announce from: the SOURCE_CHANGE arrives now, and
-    // this buffer too comes back.
+    // Buffer 1: the codec can announce from it. Its arrival ends the hold -- after the event.
     poke_mmap_output(&mut s, 1, 0x01);
     let mut ob = mmap_buffer(OUTPUT, 1, 1 << 20);
     ob.set_timestamp(ts(2));
     r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
-    while source_changes(&r.events.borrow()) == 0 {
-        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+    while dequeued_on(&r.events.borrow(), OUTPUT).len() < 2 {
+        assert!(wait_ready(&s), "both OUTPUT buffers back within 2s");
         process(&mut r.device, &mut s);
     }
-    assert_eq!(source_changes(&r.events.borrow()), 1);
-    assert_eq!(
-        dequeued_on(&r.events.borrow(), OUTPUT).len(),
-        2,
-        "both OUTPUT buffers returned"
+    let events = r.events.borrow();
+    assert_eq!(source_changes(&events), 1, "one announcement");
+    let src_at = nth_source_change_at(&events, 1).expect("a SOURCE_CHANGE");
+    let out0_at = output_dqbuf_at(&events, 0).expect("buffer 0's OUTPUT DQBUF");
+    // The buffer whose slot recycled first still comes back AFTER the SOURCE_CHANGE (D55): the
+    // recycle is no longer a release point.
+    assert!(
+        src_at < out0_at,
+        "SOURCE_CHANGE (idx {src_at}) must precede the recycled buffer's OUTPUT DQBUF (idx {out0_at})"
     );
+    drop(events);
     close(&mut r.device, s);
+}
+
+/// D55 (c): the same race at a mid-stream resolution change. A parameter-set-only buffer
+/// (`CODEC_CONFIG`) carries the new SPS; MediaCodec may recycle its input slot before it announces
+/// the second `SOURCE_CHANGE`. The backend holds that `InputBufferDone` (`android.rs`
+/// `awaiting_drc`) until the change is out, so a GStreamer client waiting in `wait_for_src_ch` for
+/// the second change is not emptied. The second `SOURCE_CHANGE` must precede the OUTPUT `DQBUF` of
+/// the buffer that carried the new parameter sets.
+#[test]
+fn a_drc_input_buffer_returns_after_the_second_source_change() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let _ = start_streaming_320x240(&mut r, &mut s);
+    let before = source_changes(&r.events.borrow());
+
+    // A parameter-set-only buffer that raises the mid-stream change with the recycle-first race.
+    poke_mmap_output(&mut s, 1, DRC_RACE_MAGIC);
+    let mut ob = mmap_buffer(OUTPUT, 1, 1 << 20);
+    ob.set_timestamp(ts(9));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    while output_dqbuf_at(&r.events.borrow(), 1).is_none()
+        || source_changes(&r.events.borrow()) <= before
+    {
+        assert!(wait_ready(&s), "the second SOURCE_CHANGE and buffer 1 within 2s");
+        process(&mut r.device, &mut s);
+    }
+    let events = r.events.borrow();
+    assert_eq!(source_changes(&events), before + 1, "a second announcement");
+    let src2_at = nth_source_change_at(&events, before + 1).expect("the second SOURCE_CHANGE");
+    let out1_at = output_dqbuf_at(&events, 1).expect("buffer 1's OUTPUT DQBUF");
+    assert!(
+        src2_at < out1_at,
+        "the second SOURCE_CHANGE (idx {src2_at}) must precede the new-SPS buffer's OUTPUT DQBUF (idx {out1_at})"
+    );
+    drop(events);
+    close(&mut r.device, s);
+}
+
+/// D54: every fourcc the decoder and encoder advertise is spelled exactly as its `videodev2.h`
+/// `V4L2_PIX_FMT_*` macro (`v4l2_fourcc(a,b,c,d) = a | b<<8 | c<<16 | d<<24`), so
+/// `v4l2-compliance`'s `determine_codec_mask` recognises every compressed OUTPUT format and
+/// classifies the node as a stateful decoder (and any client matching on the fourcc can find the
+/// format). AV1 was advertised as `AV10`, which is not a V4L2 format; `determine_codec_mask` bailed
+/// on it and left the node unclassified, failing `testEvents` for the very control D29 gave it
+/// (B10-acceptance §2.1). The fix is `AV01` = `v4l2_fourcc('A','V','0','1')` = `V4L2_PIX_FMT_AV1`.
+#[test]
+fn advertised_fourccs_match_videodev2_h() {
+    let f = |s: &[u8; 4]| PixelFormat::from_fourcc(s);
+    // The exact `V4L2_PIX_FMT_*` wire values from the guest's `videodev2.h`.
+    assert_eq!(f(b"H264").to_u32(), 0x3436_3248, "V4L2_PIX_FMT_H264");
+    assert_eq!(f(b"HEVC").to_u32(), 0x4356_4548, "V4L2_PIX_FMT_HEVC");
+    assert_eq!(f(b"VP80").to_u32(), 0x3038_5056, "V4L2_PIX_FMT_VP8");
+    assert_eq!(f(b"VP90").to_u32(), 0x3039_5056, "V4L2_PIX_FMT_VP9");
+    assert_eq!(f(b"AV01").to_u32(), 0x3130_5641, "V4L2_PIX_FMT_AV1");
+    assert_eq!(f(b"NV12").to_u32(), 0x3231_564e, "V4L2_PIX_FMT_NV12");
+
+    // Each advertised fourcc has a real (non-`Unknown`) ENUM_FMT description, so compliance's
+    // description check passes and `determine_codec_mask` recognises the compressed formats.
+    for spelled in [b"H264", b"HEVC", b"VP80", b"VP90", b"AV01"] {
+        assert_ne!(
+            fourcc_description(f(spelled)),
+            b"Unknown",
+            "advertised fourcc {} must be a known V4L2 format",
+            std::str::from_utf8(spelled).unwrap()
+        );
+    }
+    assert_eq!(fourcc_description(f(b"AV01")), b"AV1");
+    assert_eq!(fourcc_description(NV12), b"Y/UV 4:2:0");
+    // The D54 bug spelling is NOT a V4L2 format: it must not be recognised (a guard against
+    // regressing to `AV10`, which is what made compliance bail).
+    assert_eq!(
+        fourcc_description(f(b"AV10")),
+        b"Unknown",
+        "AV10 is not a V4L2 pixel format (D54)"
+    );
 }
 
 /// D29: the decoder exposes `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` through the whole control
@@ -3049,6 +3322,14 @@ fn start_streaming_320x240(r: &mut Rig, s: &mut Session) -> u32 {
     r.device.streamon(s, OUTPUT).unwrap();
     while source_changes(&r.events.borrow()) == 0 {
         assert!(wait_ready(s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, s);
+    }
+    // Buffer 0's `InputBufferDone` follows the announcement (the backend holds it behind the
+    // SOURCE_CHANGE, D45/D55), and may land in the batch after the event. Drain it before
+    // returning, so a caller can re-queue buffer 0 -- several tests do -- without racing that
+    // trailing DQBUF.
+    while output_dqbuf_at(&r.events.borrow(), 0).is_none() {
+        assert!(wait_ready(s), "no OUTPUT DQBUF for buffer 0 within 2s");
         process(&mut r.device, s);
     }
     let sizeimage = pix(&r.device.g_fmt(s, CAPTURE).unwrap()).sizeimage;

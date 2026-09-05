@@ -240,7 +240,7 @@ pub struct QpRange {
 /// here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodedFormat {
-    /// The V4L2 CAPTURE fourcc: `H264`, `HEVC`, `VP80`, `VP90` or `AV10`.
+    /// The V4L2 CAPTURE fourcc: `H264`, `HEVC`, `VP80`, `VP90` or `AV01`.
     pub fourcc: PixelFormat,
     pub width: SizeRange,
     pub height: SizeRange,
@@ -290,7 +290,7 @@ fn fourcc_description(fourcc: PixelFormat) -> &'static [u8] {
         b"HEVC" => b"HEVC",
         b"VP80" => b"VP8",
         b"VP90" => b"VP9",
-        b"AV10" => b"AV1",
+        b"AV01" => b"AV1",
         b"NV12" => b"Y/UV 4:2:0",
         _ => b"Unknown",
     }

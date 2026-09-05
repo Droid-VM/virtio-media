@@ -11,6 +11,7 @@
 //! dynamic resolution change, the §2.5 ordering invariants and the `v4l2-compliance` probes.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -44,6 +45,9 @@ impl VirtioMediaEventQueue for EventLog {
 struct FakeGuest {
     memory: Rc<RefCell<Vec<u8>>>,
     live_mappings: Rc<RefCell<usize>>,
+    /// So a mapping can assert, as it is released, that the codec thread is not still holding
+    /// the buffer it maps (review-m4 R1/R7, F5-crate §2.1).
+    log: SharedLog,
 }
 
 struct FakeMapping {
@@ -87,6 +91,17 @@ impl GuestMemoryRange for FakeMapping {
 impl Drop for FakeMapping {
     fn drop(&mut self) {
         *self.guest.live_mappings.borrow_mut() -= 1;
+        // §2.5: a guest mapping is released only once the backend has stopped writing the buffer
+        // behind it -- either because the backend reported the frame, or because it was joined.
+        // Skipped while another panic unwinds, so one violation fails one test instead of
+        // aborting the binary (F5-crate §2.1).
+        if !std::thread::panicking() {
+            let ptr = self.as_ptr() as usize;
+            assert!(
+                !self.guest.log.lock().unwrap().holding.contains(&ptr),
+                "a guest mapping was released while the codec thread still held the buffer"
+            );
+        }
     }
 }
 
@@ -165,12 +180,21 @@ struct FakeLog {
     stops: usize,
     /// Buffers released while `capture_active` -- the §2.5 violation the ordering tests look for.
     released_while_capture_active: RefCell<usize>,
+    /// Pointers of the CAPTURE buffers the codec thread holds right now: added by
+    /// `use_as_capture` (device thread), removed when the frame is written or when the backend
+    /// is joined. A guest mapping released while its pointer is in here is the R1 violation.
+    holding: HashSet<usize>,
 }
 
 type SharedLog = Arc<Mutex<FakeLog>>;
 
-/// The bitstream's first byte that makes the fake report a mid-stream resolution change.
+/// The bitstream's first byte that makes the fake report a mid-stream resolution change the way
+/// the MediaCodec backend does today: the new size is announced and no `CAPTURE` buffer is marked
+/// (`M6-backend` §10 item 2).
 const DRC_MAGIC: u8 = 0xff;
+/// The same change, marked as the kernel asks and as `F7.md`'s crosvm change makes the MediaCodec
+/// backend do: the frames of the old size, then an empty `LAST` buffer, then the announcement.
+const DRC_LAST_MAGIC: u8 = 0xfe;
 /// The resolution the fake "parses" out of the stream, whatever coded size the client set as a
 /// placeholder on `S_FMT(OUTPUT)`. A real decoder reads this from the bitstream.
 const FAKE_STREAM_SIZE: (u32, u32) = (320, 240);
@@ -242,28 +266,44 @@ impl VideoDecoderBackend for FakeBackend {
             let mut captures: std::collections::VecDeque<(u32, SendPtr, usize)> = Default::default();
             let mut draining = false;
             let mut format_announced = false;
+            // A resolution change waiting for its `LAST` buffer to go out first.
+            let mut pending_format: Option<(u32, u32)> = None;
 
             // Write a frame into a capture buffer and dequeue it, or -- when draining and no
             // frame is left -- the empty LAST buffer.
+            let unhold = |ptr: SendPtr| {
+                thread_log.lock().unwrap().holding.remove(&(ptr.as_ptr() as usize));
+            };
             let pump = |ready: &mut std::collections::VecDeque<ReadyFrame>,
                             captures: &mut std::collections::VecDeque<(u32, SendPtr, usize)>,
-                            coded_size: (u32, u32),
-                            draining: &mut bool| {
-                while let Some(&(index, ptr, len)) = captures.front() {
-                    if let Some(frame) = ready.pop_front() {
+                            coded_size: &mut (u32, u32),
+                            draining: &mut bool,
+                            pending_format: &mut Option<(u32, u32)>| {
+                while !captures.is_empty() {
+                    if !ready.is_empty() {
                         let (w, h) = (coded_size.0 as usize, coded_size.1 as usize);
                         let sizeimage = w * h + 2 * (w.div_ceil(2)) * (h.div_ceil(2));
-                        assert!(len >= sizeimage, "capture buffer too small for a frame");
+                        // The first lent buffer that can hold a frame of the announced size, as
+                        // the MediaCodec backend does (`android.rs` `pump_output`): a smaller one
+                        // -- lent for a placeholder size before the SOURCE_CHANGE -- stays lent
+                        // and unfilled, and the frame waits with it.
+                        let Some(at) = captures.iter().position(|&(_, _, len)| len >= sizeimage)
+                        else {
+                            break;
+                        };
+                        let frame = ready.pop_front().expect("not empty");
+                        let (index, ptr, _) = captures.remove(at).expect("position was found");
                         let dst = ptr.as_ptr();
                         for row in 0..h {
-                            // SAFETY: `len >= sizeimage` covers both loops.
+                            // SAFETY: the buffer was picked for `len >= sizeimage`, which covers
+                            // both loops.
                             unsafe { std::ptr::write_bytes(dst.add(row * w), frame.luma, w) };
                         }
                         for row in 0..h.div_ceil(2) {
                             // SAFETY: as above.
                             unsafe { std::ptr::write_bytes(dst.add((h + row) * w), 0x80, w) };
                         }
-                        captures.pop_front();
+                        unhold(ptr);
                         emit(DecoderEvent::FrameDecoded {
                             index,
                             bytesused: sizeimage as u32,
@@ -271,7 +311,8 @@ impl VideoDecoderBackend for FakeBackend {
                             is_last: false,
                         });
                     } else if *draining {
-                        captures.pop_front();
+                        let (index, ptr, _) = captures.pop_front().expect("not empty");
+                        unhold(ptr);
                         *draining = false;
                         emit(DecoderEvent::FrameDecoded {
                             index,
@@ -282,6 +323,19 @@ impl VideoDecoderBackend for FakeBackend {
                         break;
                     } else {
                         break;
+                    }
+                }
+                // A resolution change held behind the frames of the old size (`Held::Format` in
+                // the MediaCodec backend): announced once its `LAST` buffer has gone out.
+                if let Some(size) = *pending_format {
+                    if !*draining {
+                        *pending_format = None;
+                        *coded_size = size;
+                        emit(DecoderEvent::FormatChanged {
+                            coded_size: size,
+                            visible_rect: v4l2r::Rect::new(0, 0, size.0, size.1),
+                            min_capture_buffers: 4,
+                        });
                     }
                 }
             };
@@ -298,17 +352,32 @@ impl VideoDecoderBackend for FakeBackend {
                     } => {
                         // The input is consumed at once.
                         emit(DecoderEvent::InputBufferDone(index));
-                        if first_byte == DRC_MAGIC {
+                        if first_byte == DRC_MAGIC || first_byte == DRC_LAST_MAGIC {
                             // Mid-stream resolution change: halve the size (kept even).
-                            coded_size = (
+                            let new_size = (
                                 (coded_size.0 / 2).max(2) & !1,
                                 (coded_size.1 / 2).max(2) & !1,
                             );
-                            emit(DecoderEvent::FormatChanged {
-                                coded_size,
-                                visible_rect: v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1),
-                                min_capture_buffers: 4,
-                            });
+                            if first_byte == DRC_LAST_MAGIC {
+                                // Every frame of the old size first, then the empty LAST buffer,
+                                // then the announcement.
+                                pending_format = Some(new_size);
+                                draining = true;
+                            } else {
+                                coded_size = new_size;
+                                emit(DecoderEvent::FormatChanged {
+                                    coded_size,
+                                    visible_rect: v4l2r::Rect::new(0, 0, new_size.0, new_size.1),
+                                    min_capture_buffers: 4,
+                                });
+                            }
+                            pump(
+                                &mut ready,
+                                &mut captures,
+                                &mut coded_size,
+                                &mut draining,
+                                &mut pending_format,
+                            );
                             continue;
                         }
                         if !format_announced {
@@ -325,28 +394,48 @@ impl VideoDecoderBackend for FakeBackend {
                             luma: luma_of(first_byte),
                             timestamp,
                         });
-                        pump(&mut ready, &mut captures, coded_size, &mut draining);
+                        pump(
+                            &mut ready,
+                            &mut captures,
+                            &mut coded_size,
+                            &mut draining,
+                            &mut pending_format,
+                        );
                     }
                     Cmd::UseCapture { index, ptr, len } => {
                         captures.push_back((index, ptr, len));
-                        pump(&mut ready, &mut captures, coded_size, &mut draining);
+                        pump(
+                            &mut ready,
+                            &mut captures,
+                            &mut coded_size,
+                            &mut draining,
+                            &mut pending_format,
+                        );
                     }
                     Cmd::Flush(ack) => {
                         // Seek: drop everything queued so far; the CAPTURE queue keeps its buffers
                         // but no pre-seek frame is produced into them.
                         ready.clear();
                         draining = false;
+                        pending_format = None;
                         let _ = ack.send(());
                     }
                     Cmd::ClearCapture(ack) => {
                         captures.clear();
                         ready.clear();
                         draining = false;
+                        pending_format = None;
                         let _ = ack.send(());
                     }
                     Cmd::Drain => {
                         draining = true;
-                        pump(&mut ready, &mut captures, coded_size, &mut draining);
+                        pump(
+                            &mut ready,
+                            &mut captures,
+                            &mut coded_size,
+                            &mut draining,
+                            &mut pending_format,
+                        );
                     }
                     Cmd::Stop(ack) => {
                         let _ = ack.send(());
@@ -369,6 +458,15 @@ impl VideoDecoderBackend for FakeBackend {
 
     fn close_session(&mut self, mut session: FakeSession) {
         session.stop();
+    }
+}
+
+impl Drop for FakeSession {
+    fn drop(&mut self) {
+        // As the real backend does (`impl Drop for MediaCodecDecoderSession`, crosvm
+        // `android_codec_backend/android.rs`): a session that is dropped without a `stop` still
+        // joins its codec. This is what makes the device's field order observable.
+        self.stop();
     }
 }
 
@@ -414,7 +512,11 @@ impl VideoDecoderBackendSession for FakeSession {
     }
 
     fn use_as_capture(&mut self, buffer: OutputBuffer) -> IoctlResult<()> {
-        self.log.lock().unwrap().capture_active = true;
+        {
+            let mut log = self.log.lock().unwrap();
+            log.capture_active = true;
+            log.holding.insert(buffer.ptr.as_ptr() as usize);
+        }
         self.commands
             .send(Cmd::UseCapture {
                 index: buffer.index,
@@ -429,7 +531,9 @@ impl VideoDecoderBackendSession for FakeSession {
         // The rendezvous joins the worker w.r.t. CAPTURE buffers; only then is it safe to free
         // them, which is what the `capture_active` flag records.
         self.rendezvous(Cmd::ClearCapture);
-        self.log.lock().unwrap().capture_active = false;
+        let mut log = self.log.lock().unwrap();
+        log.capture_active = false;
+        log.holding.clear();
         Ok(())
     }
 
@@ -450,6 +554,7 @@ impl VideoDecoderBackendSession for FakeSession {
             let mut log = self.log.lock().unwrap();
             log.stops += 1;
             log.capture_active = false;
+            log.holding.clear();
         }
     }
 
@@ -503,11 +608,12 @@ fn caps() -> DecoderCapabilities {
 fn rig_with(fail_start: Option<i32>) -> Rig {
     let events = EventLog::default();
     let events_log = Rc::clone(&events.0);
+    let log: SharedLog = Default::default();
     let guest = FakeGuest {
         memory: Rc::new(RefCell::new(vec![0u8; GUEST_MEMORY])),
         live_mappings: Rc::new(RefCell::new(0)),
+        log: Arc::clone(&log),
     };
-    let log: SharedLog = Default::default();
     let backend = FakeBackend {
         caps: caps(),
         log: Arc::clone(&log),
@@ -1195,6 +1301,332 @@ fn lifecycle_invariants_join_the_backend_before_freeing() {
     assert_eq!(r.log.lock().unwrap().stops, 1, "close joined the backend exactly once");
     assert_eq!(*r.log.lock().unwrap().released_while_capture_active.borrow(), 0);
     assert_eq!(r.device.active_session, None);
+}
+
+/// vb2's rule (`vb2_core_reqbufs`, Linux 6.18.21 `videobuf2-core.c:883-886`): `REQBUFS` with a
+/// non-zero count on a streaming queue is `EBUSY`, because the buffers it would free may be lent
+/// to the codec (`M7-crate` §9 item 3). `REQBUFS(0)` is still the implicit `STREAMOFF` and joins
+/// before freeing, and `CREATE_BUFS` -- which only appends -- keeps working, as in vb2
+/// (`vb2_core_create_bufs`, `videobuf2-core.c:1038-1081`, no `q->streaming` check).
+#[test]
+fn reqbufs_on_a_streaming_queue_is_busy() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let sizeimage = start_streaming_320x240(&mut r, &mut s);
+    assert!(s.state.output_streaming && s.state.capture_streaming);
+
+    // Both queues stream and their buffers are lent: no REQBUFS(n) may free them.
+    assert_eq!(
+        r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).err(),
+        Some(libc::EBUSY)
+    );
+    assert_eq!(s.output.buffers.len(), 4, "the CAPTURE buffers are still there");
+    assert_eq!(
+        r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2).err(),
+        Some(libc::EBUSY)
+    );
+    assert_eq!(s.input.buffers.len(), 4, "the OUTPUT buffers are still there");
+    assert_eq!(*r.log.lock().unwrap().released_while_capture_active.borrow(), 0);
+    assert_eq!(r.log.lock().unwrap().clears, 0, "nothing joined the backend either");
+
+    // CREATE_BUFS appends to a streaming queue and the new buffer can be queued at once.
+    let created = r
+        .device
+        .create_bufs(
+            &mut s,
+            2,
+            CAPTURE,
+            MemoryType::Mmap,
+            capture_format_sized(320, 240, 1, sizeimage),
+        )
+        .unwrap();
+    assert_eq!((created.index, created.count), (4, 2));
+    assert_eq!(s.output.buffers.len(), 6);
+    r.device.qbuf(&mut s, mmap_buffer(CAPTURE, 4, sizeimage), vec![], true).unwrap();
+
+    // REQBUFS(0) joins the backend first, then frees everything.
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
+    assert_eq!(r.log.lock().unwrap().clears, 1, "REQBUFS(0) clears once");
+    assert!(s.output.buffers.is_empty());
+    assert!(!s.state.capture_streaming);
+    assert_eq!(*r.log.lock().unwrap().released_while_capture_active.borrow(), 0);
+
+    // And with the queue stopped, a fresh set is fine again.
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).unwrap();
+    close(&mut r.device, s);
+}
+
+/// review-m4 R1 for the decoder: a session that ends without a `CLOSE` -- a worker returning on
+/// its kill event, a `stop_queue`, a `reset` -- is only dropped, and must still join the codec
+/// before the buffers it was lent go away. The session's field order (`backend` before the two
+/// queues) is the mechanism; a mapping released too early trips `FakeMapping::drop`.
+#[test]
+fn a_dropped_session_joins_the_backend_before_its_buffers() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+    poke_mmap_output(&mut s, 0, 0x21);
+    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while source_changes(&r.events.borrow()) == 0 {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+
+    // Two guest-owned CAPTURE buffers for one ready frame: the second stays held by the codec
+    // thread, its guest mapping alive, when the session goes away.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::UserPtr, 2).unwrap();
+    for i in 0..2u32 {
+        let (cb, sgs) = userptr_buffer(CAPTURE, i, 0x200000 + i as u64 * 0x40000, sizeimage, 0);
+        r.device.qbuf(&mut s, cb, sgs, true).unwrap();
+    }
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    assert_eq!(*r.guest.live_mappings.borrow(), 1, "the second buffer is still lent");
+    assert!(r.log.lock().unwrap().holding.len() == 1, "the codec holds it");
+
+    // No close_session, no stop: just drop it, as the runner's kill path does.
+    drop(s);
+    let log = r.log.lock().unwrap();
+    assert_eq!(log.stops, 1, "the drop joined the codec");
+    assert!(!log.open, "the codec thread is gone");
+    assert!(!log.capture_active);
+    drop(log);
+    assert_eq!(*r.guest.live_mappings.borrow(), 0, "and only then were the mappings released");
+}
+
+/// review-m4 R2 for the decoder: `PREPARE_BUF` maps nothing, so the `QBUF` that follows carries
+/// the scatter list again -- and `ioctl::get_userptr_regions` reads that list against *this*
+/// call's `length`. A `QBUF` that shrinks the plane is refused on both queues, whatever
+/// `PREPARE_BUF` accepted, and nothing is mapped from the short list.
+#[test]
+fn prepare_buf_does_not_let_qbuf_shrink_the_mapping() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::UserPtr, 1).unwrap();
+    let bitstream = MIN_BITSTREAM_SIZE;
+
+    // OUTPUT: prepared at a full-length plane, nothing mapped yet.
+    let (pb, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, bitstream, 4096);
+    let prepared = r.device.prepare_buf(&mut s, pb, sgs, true).unwrap();
+    assert!(prepared.flags().contains(BufferFlags::PREPARED));
+    assert_eq!(*r.guest.live_mappings.borrow(), 0, "PREPARE_BUF maps nothing");
+
+    // The same buffer queued over an eight-byte scatter list: refused, still prepared.
+    let (short, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, 8, 8);
+    assert_eq!(r.device.qbuf(&mut s, short, sgs, true).err(), Some(libc::EINVAL));
+    assert_eq!(*r.guest.live_mappings.borrow(), 0, "nothing was mapped");
+    assert!(s.input.buffers[0].prepared.is_some(), "the buffer is still prepared");
+    assert!(!s.input.buffers[0].queued);
+
+    // A plane longer than the buffer was allocated for is refused too.
+    let (big, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, bitstream + 1, 4096);
+    assert_eq!(r.device.qbuf(&mut s, big, sgs, true).err(), Some(libc::EINVAL));
+
+    // The honest QBUF maps the full list and keeps PREPARE_BUF's payload.
+    let (ok, sgs) = userptr_buffer(OUTPUT, 0, 0x1000, bitstream, 0);
+    let queued = r.device.qbuf(&mut s, ok, sgs, true).unwrap();
+    assert_eq!(*queued.get_first_plane().bytesused, 4096, "the prepared payload survived");
+    assert_eq!(*r.guest.live_mappings.borrow(), 1);
+
+    // CAPTURE: the same, over a frame-sized plane.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::UserPtr, 1).unwrap();
+    let cap_gpa = 0x300000u64;
+    let (pb, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, sizeimage, 0);
+    r.device.prepare_buf(&mut s, pb, sgs, true).unwrap();
+    let (short, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, 8, 0);
+    assert_eq!(r.device.qbuf(&mut s, short, sgs, true).err(), Some(libc::EINVAL));
+    assert_eq!(*r.guest.live_mappings.borrow(), 1, "still only the OUTPUT mapping");
+    // A full-length plane whose scatter list is short is caught by the backstop.
+    let (mut lying, _) = userptr_buffer(CAPTURE, 0, cap_gpa, sizeimage, 0);
+    *lying.get_first_plane_mut().length = sizeimage;
+    let short_sgs = vec![vec![SgEntry::new(cap_gpa, sizeimage - 1)]];
+    assert_eq!(r.device.qbuf(&mut s, lying, short_sgs, true).err(), Some(libc::EINVAL));
+    assert_eq!(*r.guest.live_mappings.borrow(), 1, "the short mapping was dropped");
+
+    let (ok, sgs) = userptr_buffer(CAPTURE, 0, cap_gpa, sizeimage, 0);
+    r.device.qbuf(&mut s, ok, sgs, true).unwrap();
+    assert_eq!(*r.guest.live_mappings.borrow(), 2);
+
+    close(&mut r.device, s);
+}
+
+/// The kernel's resolution-change sequence ends the *decoder*, not the *stream*: the last CAPTURE
+/// buffer of the old resolution carries `V4L2_BUF_FLAG_LAST` -- it may be empty -- and no
+/// `V4L2_EVENT_EOS` follows it (`dev-decoder.rst`, "Dynamic Resolution Change" step 2 asks for the
+/// flag "similarly to the Drain sequence" and lists the event nowhere; "Drain" step 3 is the only
+/// place it appears). The decoder then stays stopped -- a CAPTURE buffer queued in the meantime
+/// waits -- until `V4L2_DEC_CMD_START` or the `STREAMON(CAPTURE)` of the reallocation.
+///
+/// This is the behaviour a backend gets when it marks the change (`DRC_LAST_MAGIC`; `F7.md` §3 is
+/// the exact crosvm change that makes the MediaCodec backend do it), and the reason
+/// `is_last` no longer implies `EOS`.
+#[test]
+fn a_resolution_change_marks_its_last_buffer_and_sends_no_eos() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming_320x240(&mut r, &mut s);
+
+    // A frame at the first resolution, then the change.
+    poke_mmap_output(&mut s, 0, 0x08);
+    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    let before = source_changes(&r.events.borrow());
+    poke_mmap_output(&mut s, 1, DRC_LAST_MAGIC);
+    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
+    while source_changes(&r.events.borrow()) == before {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+
+    // The buffer before the announcement is the LAST one, and it ends no stream.
+    let frames = dequeued_on(&r.events.borrow(), CAPTURE);
+    let last = frames.last().unwrap().clone();
+    assert!(
+        last.flags().contains(BufferFlags::LAST),
+        "the last buffer of the old resolution carries LAST"
+    );
+    assert_eq!(*last.get_first_plane().bytesused, 0, "and may be empty");
+    assert!(
+        !frames[0].flags().contains(BufferFlags::LAST),
+        "and only the last one"
+    );
+    assert_eq!(
+        eos_events(&r.events.borrow()),
+        0,
+        "a resolution change sends no EOS, unlike a drain"
+    );
+    assert_eq!(s.drain, Drain::Stopped, "but the decoder is stopped");
+
+    // Stopped: a CAPTURE buffer queued now waits instead of being lent, and `DEC_CMD_START`
+    // resumes (so does the `STREAMON(CAPTURE)` of the reallocation, which the DRC test covers).
+    let index = last.index() as usize;
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device
+        .qbuf(&mut s, mmap_buffer(CAPTURE, index as u32, sizeimage), vec![], true)
+        .unwrap();
+    assert_eq!(s.output.pending.len(), 1, "not lent while the decoder is stopped");
+    assert!(!s.output.buffers[index].lent);
+    r.device.decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START)).unwrap();
+    assert_eq!(s.drain, Drain::None);
+    assert!(s.output.pending.is_empty());
+    assert!(s.output.buffers[index].lent, "DEC_CMD_START resumes the decoder");
+    assert_eq!(eos_events(&r.events.borrow()), 0);
+
+    close(&mut r.device, s);
+}
+
+/// The same sequence from a backend that marks nothing -- the MediaCodec backend as it stands
+/// (`M6-backend` §10 item 2), which the fork must keep accepting. There is no `LAST` buffer to
+/// show for it, but the `SOURCE_CHANGE` alone still stops the decoder (the kernel's implicit
+/// drain), so no CAPTURE buffer is handed to a codec that has stopped decoding at that size, and
+/// no `EOS` is invented.
+#[test]
+fn a_resolution_change_stops_the_decoder_even_when_nothing_is_marked() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming_320x240(&mut r, &mut s);
+    poke_mmap_output(&mut s, 0, 0x08);
+    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    let before = source_changes(&r.events.borrow());
+
+    poke_mmap_output(&mut s, 1, DRC_MAGIC);
+    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
+    while source_changes(&r.events.borrow()) == before {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert!(
+        dequeued_on(&r.events.borrow(), CAPTURE)
+            .iter()
+            .all(|b| !b.flags().contains(BufferFlags::LAST)),
+        "this backend marks nothing"
+    );
+    assert_eq!(eos_events(&r.events.borrow()), 0);
+    assert_eq!(s.drain, Drain::Stopped);
+
+    // The first announcement is not a change and must not stop anything: the frame above proves
+    // the initial SOURCE_CHANGE left the decoder running.
+    let index = 0usize;
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device
+        .qbuf(&mut s, mmap_buffer(CAPTURE, index as u32, sizeimage), vec![], true)
+        .unwrap();
+    assert!(!s.output.buffers[index].lent, "not lent while the decoder is stopped");
+    r.device.decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START)).unwrap();
+    assert!(s.output.buffers[index].lent);
+
+    close(&mut r.device, s);
+}
+
+/// A CAPTURE buffer smaller than the announced canvas -- a queue sized from the client's own
+/// placeholder before the `SOURCE_CHANGE`, and never reallocated -- is lent anyway (the guest may
+/// still take it back), but a backend can only hold it unfilled, so decoding stalls with nothing
+/// in the log to say why (`M6-backend` §10 item 6). The device says it once per session.
+#[test]
+fn a_capture_buffer_too_small_for_the_canvas_is_reported_once() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 160, 120)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // The CAPTURE queue sized from the placeholder, before the stream has been parsed.
+    let placeholder = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    assert_eq!(placeholder, 160 * 120 * 3 / 2);
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).unwrap();
+    for i in 0..2 {
+        r.device.qbuf(&mut s, mmap_buffer(CAPTURE, i, placeholder), vec![], true).unwrap();
+    }
+
+    // The stream turns out to be 320x240: those buffers hold a quarter of a frame.
+    poke_mmap_output(&mut s, 0, 0x03);
+    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], true).unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while source_changes(&r.events.borrow()) == 0 {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    assert_eq!(sizeimage, 320 * 240 * 3 / 2);
+    assert!(!s.warned_small_capture, "nothing has been lent yet");
+
+    // STREAMON(CAPTURE) lends them, warns once, and no frame can come out of them.
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+    assert!(s.warned_small_capture, "the too-small buffer was reported");
+    assert!(s.output.buffers.iter().all(|b| b.lent), "and lent all the same");
+    process(&mut r.device, &mut s);
+    assert!(
+        dequeued_on(&r.events.borrow(), CAPTURE).is_empty(),
+        "the frame waits for a buffer that fits"
+    );
+
+    // The reallocation the client owes: buffers of the announced size, and frames flow.
+    r.device.streamoff(&mut s, CAPTURE).unwrap();
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 2).unwrap();
+    for i in 0..2 {
+        r.device.qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], true).unwrap();
+    }
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+    poke_mmap_output(&mut s, 1, 0x04);
+    r.device.qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], true).unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    let frame = dequeued_on(&r.events.borrow(), CAPTURE).remove(0);
+    assert_eq!(*frame.get_first_plane().bytesused, sizeimage);
+    assert_eq!(*r.log.lock().unwrap().released_while_capture_active.borrow(), 0);
+
+    close(&mut r.device, s);
 }
 
 /// One decode at a time: a second session's `REQBUFS`/`CREATE_BUFS` is refused with `EBUSY` while

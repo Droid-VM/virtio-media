@@ -1380,6 +1380,56 @@ mod tests {
         assert_eq!(dispatch_prepare_buf(&broken), libc::EINVAL);
     }
 
+    /// One `v4l2_buffer` on the wire declaring a plane array of `length` entries: the first a
+    /// real 4096-byte plane, the rest the zeroed tail a multiplanar client leaves behind it.
+    fn mplane_buffer_with_plane_array(length: u32) -> Vec<u8> {
+        use zerocopy::AsBytes;
+        let buffer = v4l2_buffer {
+            index: 0,
+            type_: QueueType::VideoOutputMplane as u32,
+            memory: MemoryType::Mmap as u32,
+            length,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(buffer.to_le().as_bytes());
+        for i in 0..length {
+            let plane = v4l2_plane {
+                length: if i == 0 { 4096 } else { 0 },
+                ..Default::default()
+            };
+            out.extend_from_slice(plane.to_le().as_bytes());
+        }
+        out
+    }
+
+    /// `length` is the size of the guest's plane array, not the number of planes the format
+    /// uses, and V4L2 allows exactly `VIDEO_MAX_PLANES` entries -- which is what ffmpeg puts on
+    /// every multiplanar buffer ioctl (`libavdevice/v4l2.c`). The vendored v4l2r refused that
+    /// value (`>=` where the kernel's `__verify_planes_array` has `<=`), so a legal `QBUF` came
+    /// back `EINVAL` from the shared reader and `ffmpeg -f v4l2` could not capture at all
+    /// (defect D17). The reader here has always allowed it; this pins the pair, since the check
+    /// that broke lives in the dependency and every device inherits it.
+    #[test]
+    fn a_plane_array_of_video_max_planes_reaches_the_device() {
+        for length in 1..=v4l2r::bindings::VIDEO_MAX_PLANES {
+            assert_eq!(
+                dispatch_prepare_buf(&mplane_buffer_with_plane_array(length)),
+                libc::ENOTTY,
+                "a plane array of {} entries never reached the handler",
+                length
+            );
+        }
+        // One entry more than a `V4l2Buffer` can hold is still refused by the reader, before any
+        // handler is asked: there is no buffer to run an ioctl on.
+        assert_eq!(
+            dispatch_prepare_buf(&mplane_buffer_with_plane_array(
+                v4l2r::bindings::VIDEO_MAX_PLANES + 1
+            )),
+            libc::EINVAL
+        );
+    }
+
     #[test]
     fn sg_list_is_capped() {
         let entries: Vec<(u64, u32)> = (0..(MAX_SG_ENTRIES as u64 + 1))

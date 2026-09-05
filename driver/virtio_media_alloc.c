@@ -546,7 +546,19 @@ int vmedia_queue_alloc_dbufs(struct virtio_media *vv,
 			if (IS_ERR(dbuf)) {
 				int ret = PTR_ERR(dbuf);
 
-				pr_warn("virtio-media: driver-owned buffer allocation of %zu bytes (buffer %u plane %u) failed: %d\n",
+				/*
+				 * Rate-limited: REQBUFS is a client-driven
+				 * loop, and an exhausted pool answers every
+				 * turn of it. An unrated line here printed
+				 * 2 520 copies of itself in 2.3 s under the
+				 * D46 stress and pushed the rest of the run
+				 * out of the kernel ring (D51, B9-acceptance
+				 * §12). One line still says what failed;
+				 * printk's suppression counter says how many
+				 * more there were.
+				 */
+				pr_warn_ratelimited(
+					"virtio-media: driver-owned buffer allocation of %zu bytes (buffer %u plane %u) failed: %d\n",
 					sizes[p], i, p, ret);
 				/*
 				 * Release what this call allocated: the buffer

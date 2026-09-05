@@ -157,6 +157,8 @@ const DEFAULT_FRAME_RATE: u32 = 30;
 const MIN_BITSTREAM_SIZE: u32 = 64 << 10;
 /// Floor of the device's default bitstream buffer size (a keyframe at a high bitrate).
 const DEFAULT_BITSTREAM_FLOOR: u32 = 256 << 10;
+/// The least `S_FMT(CAPTURE)` is capped at, whatever the raw size (`max_bitstream_size`).
+const MAX_BITSTREAM_FLOOR: u32 = 4 << 20;
 
 // ---------------------------------------------------------------------------------------------
 // What a backend provides
@@ -517,8 +519,11 @@ pub trait VideoEncoderBackendSession {
 
     /// `STREAMOFF(OUTPUT)`, and `V4L2_ENC_CMD_START` after a finished drain: drop every pending
     /// `OUTPUT` frame and be ready to take new ones. When this returns the backend touches no
-    /// `OUTPUT` buffer any more (the device returns them all to the guest), and the codec is
-    /// kept. On an async codec this is flush-then-start.
+    /// `OUTPUT` buffer any more and reports nothing more about the ones it held -- the device
+    /// returns them to the guest itself (`STREAMOFF`) or queues them again (`START`), and a late
+    /// [`EncoderEvent::InputBufferDone`] would land on a buffer the guest may have queued again
+    /// (review-m7 R7-2, R7-11) -- and the codec is kept. On an async codec this is
+    /// flush-then-start. An error here ends the session (the device never fails `STREAMOFF`).
     fn flush(&mut self) -> IoctlResult<()>;
 
     /// `V4L2_ENC_CMD_STOP`: encode everything queued so far, then report the last `CAPTURE`
@@ -1045,14 +1050,33 @@ enum Drain {
 }
 
 /// Bytes of one tightly packed NV12 frame of `width` x `height`. Odd dimensions round the chroma
-/// plane up.
+/// plane up. Saturates: the sizes come from the backend's published ranges, and a store that
+/// reports a dimension past ~53 000 must not turn a plain `S_FMT` into an overflow abort of the
+/// helper (review-m7 R7-13); `u32::MAX` bytes is a buffer the allocator refuses.
 fn nv12_sizeimage(width: u32, height: u32) -> u32 {
-    width * height + 2 * width.div_ceil(2) * height.div_ceil(2)
+    let luma = width.saturating_mul(height);
+    let chroma = width
+        .div_ceil(2)
+        .saturating_mul(2)
+        .saturating_mul(height.div_ceil(2));
+    luma.saturating_add(chroma)
 }
 
 /// The bitstream buffer size the device picks for a raw size when the client does not.
 fn default_bitstream_size(width: u32, height: u32) -> u32 {
     (nv12_sizeimage(width, height) / 2).max(DEFAULT_BITSTREAM_FLOOR)
+}
+
+/// The most `S_FMT(CAPTURE)` honours for a bitstream buffer at a raw size: four times the
+/// device's own default for that size, and never under 4 MiB. GStreamer asks for
+/// `max_width * max_height / 2` **of the probed maximum**, not of the negotiated size
+/// (`gstv4l2object.c` `calculate_max_sizeimage`) -- 32 MiB per buffer against the QC encoders'
+/// 8192x8192, times its pool, out of a 256 MiB `media_host` pool shared with the decoder
+/// (review-m7 R7-4). Real drivers refit such a request to the stream; so does this one.
+fn max_bitstream_size(width: u32, height: u32) -> u32 {
+    default_bitstream_size(width, height)
+        .saturating_mul(4)
+        .max(MAX_BITSTREAM_FLOOR)
 }
 
 /// Where a buffer's bytes live. Same two ownerships as `camera.rs` / `video_decoder.rs`.
@@ -1859,12 +1883,16 @@ where
         }
     }
 
-    /// The codec died: unqueue every buffer, mark the session dead, tell the guest.
+    /// The codec died: unqueue every buffer, mark the session dead, tell the guest. Once per
+    /// session: a second cause after the first changes nothing.
     fn end_session(
         &mut self,
         session: &mut VideoEncoderSession<M::GuestMemoryMapping, B::Session>,
         why: &str,
     ) {
+        if session.dead {
+            return;
+        }
         log::error!("encoder: session {} ends: {}", session.id, why);
         session.backend.stop();
         session.codec_started = false;
@@ -2285,15 +2313,16 @@ where
                 Ok(raw_output_format(width, height, colorspace))
             }
             // The coded side: the codec (an unknown one snaps to the first), the client's
-            // bitstream buffer size if it is a plausible one, the raw size refitted to the
-            // codec's range (read-only), the colorimetry of the raw side.
+            // bitstream buffer size if it is a plausible one -- held to what this raw size can
+            // need (`max_bitstream_size`) -- the raw size refitted to the codec's range
+            // (read-only), the colorimetry of the raw side.
             QueueDirection::Capture => {
                 let coded = self.adjust_coded_format(pix_mp.pixelformat)?;
                 let width = coded.width.fit(session.coded_size.0);
                 let height = coded.height.fit(session.coded_size.1);
                 let asked = pix_mp.plane_fmt[0].sizeimage;
                 let sizeimage = if asked >= MIN_BITSTREAM_SIZE {
-                    asked
+                    asked.min(max_bitstream_size(width, height))
                 } else {
                     default_bitstream_size(width, height)
                 };
@@ -2373,9 +2402,12 @@ where
             _ => (),
         }
         // `REQBUFS(0)` is an implicit `STREAMOFF`; any other count on a streaming queue is
-        // refused, as vb2 does, because its buffers may be lent.
+        // refused, as vb2 does, because its buffers may be lent. A dead session may free, never
+        // allocate: pool space an encode can never use (review-m6 R6-11's shape).
         if count == 0 {
             self.streamoff(session, queue)?;
+        } else if session.dead {
+            return Err(libc::ENODEV);
         } else if session.streaming(direction) {
             return Err(libc::EBUSY);
         }
@@ -2415,6 +2447,9 @@ where
         let direction = queue.direction_or_einval()?;
         if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
+        }
+        if session.dead {
+            return Err(libc::ENODEV);
         }
         match self.active_session {
             Some(id) if id != session.id => return Err(libc::EBUSY),
@@ -2597,6 +2632,9 @@ where
     ) -> IoctlResult<V4l2Buffer> {
         let queue_type = buffer.queue();
         let direction = queue_type.direction_or_einval()?;
+        if session.dead {
+            return Err(libc::ENODEV);
+        }
         // The same rule `qbuf` applies, with no prepared description to fall back on.
         if !payload.is_accepted_by(direction, buffer.memory(), NUM_PLANES) {
             return Err(libc::EINVAL);
@@ -2659,7 +2697,12 @@ where
         let before = session.state;
         match direction {
             QueueDirection::Output => session.state.output_streaming = true,
-            QueueDirection::Capture => session.state.capture_streaming = true,
+            QueueDirection::Capture => {
+                session.state.capture_streaming = true;
+                // The sequence counter counts buffers since this queue started streaming
+                // (`v4l2_buffer.sequence`; review-m7 R7-13).
+                session.sequence = 0;
+            }
         }
         if let Err(e) = self.maybe_start_codec(session) {
             // A codec that will not start leaves the queue as it was, buffers queued for a
@@ -2676,13 +2719,23 @@ where
     /// dropped and returned, the codec is kept. `STREAMOFF(CAPTURE)` resets it (the kernel's
     /// "Reset"): the codec is torn down, so the next start produces a stream that stands on its
     /// own, headers included; raw frames it had not encoded are queued again for it.
+    ///
+    /// Neither fails: V4L2 has `STREAMOFF` remove every buffer from the queue whatever the state
+    /// of the hardware, and a guest that cannot `STREAMOFF` cannot `REQBUFS(0)` either
+    /// (review-m7 R7-3). A backend that cannot flush -- a wedged codec past its bound -- ends the
+    /// session instead; the queue is reset and the buffers unqueued either way.
     fn streamoff(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
         let direction = queue.direction_or_einval()?;
         match direction {
             QueueDirection::Output => {
                 // The backend must let go of every raw frame before we release them (§2.5).
                 if session.codec_started && !session.dead {
-                    session.backend.flush()?;
+                    if let Err(e) = session.backend.flush() {
+                        self.end_session(
+                            session,
+                            &format!("the backend could not flush: errno {e}"),
+                        );
+                    }
                 }
                 session.state.output_streaming = false;
                 session.input.pending.clear();
@@ -2742,23 +2795,15 @@ where
         if session.codec_started {
             return Err(libc::EBUSY);
         }
-        // Held inside the frame, never empty: an empty or oversized request means the whole
-        // frame, as the default does.
+        // Held inside the frame, never empty (an empty or oversized request means the whole
+        // frame, as the default does), and fitted to the coded format the way `S_FMT` fits the
+        // frame: the codec is configured for exactly this rectangle, so a crop it cannot take
+        // must be adjusted here, where `S_SELECTION` may adjust, rather than fail at `STREAMON`
+        // from a `configure` two layers down (review-m7 R7-7).
+        let coded = self.current_format(session)?;
         let (w, h) = session.coded_size;
-        let left = sel_rect.left.clamp(0, w.saturating_sub(1) as i32);
-        let top = sel_rect.top.clamp(0, h.saturating_sub(1) as i32);
-        let max_w = w - left as u32;
-        let max_h = h - top as u32;
-        let width = if sel_rect.width == 0 {
-            max_w
-        } else {
-            sel_rect.width.min(max_w)
-        };
-        let height = if sel_rect.height == 0 {
-            max_h
-        } else {
-            sel_rect.height.min(max_h)
-        };
+        let (left, width) = fit_crop_axis(&coded.width, sel_rect.left, sel_rect.width, w);
+        let (top, height) = fit_crop_axis(&coded.height, sel_rect.top, sel_rect.height, h);
         session.crop = v4l2r::Rect::new(left, top, width, height);
         Ok(session.crop.into())
     }
@@ -2970,8 +3015,10 @@ where
         }
     }
 
-    /// Every control is validated before any is applied, so a refused set changes nothing
-    /// (`error_idx = count`, as the kernel reports a validation failure of a set).
+    /// Every control is validated before any is applied, so a set the validation refuses changes
+    /// nothing (`error_idx = count`, as the kernel reports a validation failure of a set). A
+    /// value the backend refuses while applying -- `set_bitrate` on a running codec -- leaves
+    /// the controls before it applied, with the same `error_idx` (review-m7 R7-10).
     fn s_ext_ctrls(
         &mut self,
         session: &mut Self::Session,
@@ -3040,16 +3087,44 @@ where
         match (cmd.cmd, session.drain) {
             (_, Drain::Pending) => return Err(libc::EBUSY),
             (bindings::V4L2_ENC_CMD_STOP, Drain::None) => {
+                // `Pending` only once the backend has taken the drain: a session waiting for a
+                // `LAST` buffer no drain will produce would answer `EBUSY` to every later
+                // command (review-m7 R7-12).
                 if session.state.running() && session.codec_started {
-                    session.drain = Drain::Pending;
                     session.backend.drain()?;
+                    session.drain = Drain::Pending;
                 }
             }
             (bindings::V4L2_ENC_CMD_STOP, Drain::Done) => (),
             (bindings::V4L2_ENC_CMD_START, Drain::Done) => {
-                // "The encoder will not be reset and will resume operation normally": the
-                // backend takes input again, and what was held back is lent.
-                session.backend.flush()?;
+                // "The encoder will not be reset and will resume operation normally". The raw
+                // frames lent while the drain ran sat behind its `EOS` in the backend, which
+                // reports nothing about them once it has flushed (the trait's `flush`
+                // contract): so first what the codec did finish is returned, then the flush,
+                // then every frame still lent is queued again -- ahead of anything queued since
+                // the `LAST` buffer, in index order, as `stop_codec` does for a reset -- so it
+                // is encoded by the resumed codec rather than lost for the life of the stream
+                // (review-m7 R7-2).
+                for event in session.backend.take_events() {
+                    self.handle_event(session, event);
+                }
+                if session.dead {
+                    return Err(libc::ENODEV);
+                }
+                if let Err(e) = session.backend.flush() {
+                    self.end_session(session, &format!("the backend could not flush: errno {e}"));
+                    return Err(libc::EIO);
+                }
+                let mut lent: Vec<usize> = Vec::new();
+                for (index, buffer) in session.input.buffers.iter_mut().enumerate() {
+                    if buffer.lent {
+                        buffer.lent = false;
+                        lent.push(index);
+                    }
+                }
+                for index in lent.into_iter().rev() {
+                    session.input.pending.push_front(index);
+                }
                 session.drain = Drain::None;
                 self.feed_pending(session)?;
             }
@@ -3058,6 +3133,23 @@ where
         }
         Ok(cmd)
     }
+}
+
+/// One axis of a crop rectangle fitted to a format: the origin held even (so the crop's chroma
+/// samples exist whole) and no further in than a minimum-sized crop still fits; the extent held
+/// into the format's range and aligned to its step, rounded down where rounding up would leave
+/// the frame. An empty extent means "to the edge", as the default rectangle does.
+fn fit_crop_axis(range: &SizeRange, origin: i32, extent: u32, frame: u32) -> (i32, u32) {
+    let step = range.step.max(1);
+    let min = range.min.max(1).min(frame);
+    let origin = (origin.max(0) as u32 & !1).min(frame.saturating_sub(min));
+    let room = frame - origin;
+    let asked = if extent == 0 { room } else { extent.min(room) };
+    let mut extent = range.fit(asked);
+    if extent > room {
+        extent = ((room / step) * step).max(min);
+    }
+    (origin as i32, extent)
 }
 
 /// A raw (OUTPUT) NV12 `v4l2_format`, tightly packed.

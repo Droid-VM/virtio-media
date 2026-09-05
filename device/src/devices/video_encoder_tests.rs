@@ -280,6 +280,13 @@ struct FakeLog {
     forced: usize,
     /// Buffers released while `capture_active` -- the §2.5 violation the ordering tests look for.
     released_while_capture_active: RefCell<usize>,
+    /// Raw frames a `flush` dropped without a word: the ones the codec had not written out, and
+    /// the ones parked behind a drain's `EOS` (the MediaCodec backend's rule, review-m7 R7-11).
+    dropped_by_flush: usize,
+    /// The next `flush` / `drain` fails with this errno (once): the wedged-codec case the
+    /// device's bounds exist for.
+    fail_flush: Option<i32>,
+    fail_drain: Option<i32>,
 }
 
 type SharedLog = Arc<Mutex<FakeLog>>;
@@ -348,12 +355,18 @@ fn run_codec(
     let mut ready: VecDeque<Packet> = VecDeque::new();
     let mut captures: VecDeque<(u32, SendPtr, usize)> = VecDeque::new();
     let mut draining = false;
+    // From the drain's `EOS` on, a codec takes no input until it is flushed (the async rule):
+    // frames lent in the meantime sit in the backend's FIFO, encoded by nobody, and go with the
+    // flush -- the MediaCodec backend's `pending`.
+    let mut stopped = false;
+    let mut parked: Vec<u32> = Vec::new();
 
     // Write packets into capture buffers while both are there; when draining, the
     // last packet (or an empty buffer) carries LAST.
     let pump = |ready: &mut VecDeque<Packet>,
                 captures: &mut VecDeque<(u32, SendPtr, usize)>,
-                draining: &mut bool| {
+                draining: &mut bool,
+                stopped: &mut bool| {
         while let Some(&(index, ptr, len)) = captures.front() {
             if let Some(packet) = ready.pop_front() {
                 assert!(len >= packet.bytes.len(), "capture buffer too small");
@@ -373,6 +386,7 @@ fn run_codec(
                 let is_last = *draining && ready.is_empty();
                 if is_last {
                     *draining = false;
+                    *stopped = true;
                 }
                 emit(EncoderEvent::FrameEncoded {
                     index,
@@ -384,6 +398,7 @@ fn run_codec(
             } else if *draining {
                 captures.pop_front();
                 *draining = false;
+                *stopped = true;
                 emit(EncoderEvent::FrameEncoded {
                     index,
                     bytesused: 0,
@@ -406,6 +421,8 @@ fn run_codec(
                 force_key = false;
                 headers_due = true;
                 draining = false;
+                stopped = false;
+                parked.clear();
             }
             Cmd::Encode {
                 index,
@@ -417,6 +434,10 @@ fn run_codec(
                     emit(EncoderEvent::Error("frame before start".into()));
                     continue;
                 };
+                if draining || stopped {
+                    parked.push(index);
+                    continue;
+                }
                 let (w, h) = c.coded_size;
                 let luma_len = (w * h) as usize;
                 assert!(len >= luma_len * 3 / 2, "raw buffer too small for a frame");
@@ -459,27 +480,30 @@ fn run_codec(
                     timestamp,
                     input: Some(index),
                 });
-                pump(&mut ready, &mut captures, &mut draining);
+                pump(&mut ready, &mut captures, &mut draining, &mut stopped);
             }
             Cmd::UseCapture { index, ptr, len } => {
                 captures.push_back((index, ptr, len));
-                pump(&mut ready, &mut captures, &mut draining);
+                pump(&mut ready, &mut captures, &mut draining, &mut stopped);
             }
             Cmd::ForceKey => force_key = true,
             Cmd::Flush(ack) => {
-                // Drop what is not written yet; the device returns the raw frames
-                // itself, but a real codec reports them, so do the same.
-                for packet in ready.drain(..) {
-                    if let Some(input) = packet.input {
-                        emit(EncoderEvent::InputBufferDone(input));
-                    }
-                }
+                // Drop what is not written yet and what was parked behind the EOS, and say
+                // nothing about either: the device returns or re-queues the raw frames itself
+                // (the trait's `flush` contract), and the MediaCodec backend does exactly this,
+                // because a report delivered after the device has unqueued a buffer could land
+                // on one the guest has queued again (review-m7 R7-11).
+                let dropped = ready.iter().filter(|p| p.input.is_some()).count() + parked.len();
+                thread_log.lock().unwrap().dropped_by_flush += dropped;
+                ready.clear();
+                parked.clear();
                 draining = false;
+                stopped = false;
                 let _ = ack.send(());
             }
             Cmd::Drain => {
                 draining = true;
-                pump(&mut ready, &mut captures, &mut draining);
+                pump(&mut ready, &mut captures, &mut draining, &mut stopped);
             }
             Cmd::Stop(ack) => {
                 let _ = ack.send(());
@@ -581,12 +605,21 @@ impl VideoEncoderBackendSession for FakeSession {
     }
 
     fn flush(&mut self) -> IoctlResult<()> {
-        self.log.lock().unwrap().flushes += 1;
+        {
+            let mut log = self.log.lock().unwrap();
+            log.flushes += 1;
+            if let Some(errno) = log.fail_flush.take() {
+                return Err(errno);
+            }
+        }
         self.rendezvous(Cmd::Flush);
         Ok(())
     }
 
     fn drain(&mut self) -> IoctlResult<()> {
+        if let Some(errno) = self.log.lock().unwrap().fail_drain.take() {
+            return Err(errno);
+        }
         self.send(Cmd::Drain)
     }
 
@@ -2300,16 +2333,20 @@ fn gstreamer_v4l2h264enc_sequence() {
         VideoH264Level::L4_1 as i32
     );
 
-    // decide_allocation: S_FMT(CAPTURE) sized from the maximum frame size; G_PARM(CAPTURE) and
-    // MIN_BUFFERS_FOR_CAPTURE fail harmlessly.
+    // decide_allocation: S_FMT(CAPTURE) sized from the maximum frame size (`gstv4l2object.c`
+    // `calculate_max_sizeimage`: half the *probed maximum* frame, 8 MiB here, 32 MiB against the
+    // phone's 8192x8192 codecs) -- which the device refits to what the raw size can need, 4 MiB
+    // at this size, so a pool of those does not take the shared `media_host` pool (review-m7
+    // R7-4); G_PARM(CAPTURE) and MIN_BUFFERS_FOR_CAPTURE fail harmlessly.
     let max_sizeimage = 4096 * 4096 * 8 / 8 / 2;
     let cfmt = pix(&r
         .device
         .s_fmt(&mut s, CAPTURE, capture_format(H264, max_sizeimage))
         .unwrap());
     assert_eq!(
-        cfmt.sizeimage, max_sizeimage,
-        "the client's size is honoured"
+        cfmt.sizeimage,
+        4 << 20,
+        "the client's size is refitted to the raw size, and the answer is what it gets"
     );
     assert_eq!(r.device.g_parm(&s, CAPTURE).err(), Some(libc::ENOTTY));
     assert_eq!(r.device.g_ctrl(&s, CID_MIN_CAP).err(), Some(libc::EINVAL));
@@ -3353,8 +3390,284 @@ fn a_codec_error_ends_the_session() {
             .err(),
         Some(libc::ENODEV)
     );
+    // A dead session takes no more pool space (review-m6 R6-11's shape): the three allocating
+    // ioctls are refused, and `REQBUFS(0)` still frees.
+    assert_eq!(
+        r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).err(),
+        Some(libc::ENODEV)
+    );
+    assert_eq!(
+        r.device
+            .create_bufs(
+                &mut s,
+                1,
+                CAPTURE,
+                MemoryType::Mmap,
+                capture_format(H264, 1 << 20)
+            )
+            .err(),
+        Some(libc::ENODEV)
+    );
+    assert_eq!(
+        r.device
+            .prepare_buf(
+                &mut s,
+                mmap_buffer(OUTPUT, 0, RAW_SIZEIMAGE),
+                vec![],
+                PayloadValidity::ALL
+            )
+            .err(),
+        Some(libc::ENODEV)
+    );
     r.device
         .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
         .unwrap();
+    assert!(s.output.buffers.is_empty());
+    assert_eq!(
+        errors(&r.events.borrow()),
+        1,
+        "one error event, however many causes"
+    );
+    close(&mut r.device, s);
+}
+
+/// `V4L2_ENC_CMD_START` after a finished drain queues again every raw frame the codec never got
+/// to (review-m7 R7-2): the frames lent while the drain ran sat behind its `EOS` in the backend,
+/// which drops them at the flush without a word (the trait's `flush` contract, R7-11), so the
+/// device must put them back itself, as it does for a `STREAMOFF(CAPTURE)` reset. Before the
+/// fix they stayed `queued && lent` for the rest of the stream: no `DQBUF` could ever return
+/// them.
+#[test]
+fn enc_cmd_start_after_a_drain_queues_the_frames_the_codec_never_took() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let sizeimage = start_streaming(&mut r, &mut s);
+    queue_frame(&mut r, &mut s, 0, 0x30, 0);
+    queue_frame(&mut r, &mut s, 1, 0x31, 1);
+    collect_capture(&mut r, &mut s, 2);
+    collect_output(&mut r, &mut s, 2);
+
+    // Drain, with two frames arriving while it runs: lent, parked behind the EOS.
+    r.device
+        .encoder_cmd(&mut s, enc_cmd(bindings::V4L2_ENC_CMD_STOP))
+        .unwrap();
+    queue_frame(&mut r, &mut s, 2, 0x32, 2);
+    queue_frame(&mut r, &mut s, 3, 0x33, 3);
+    assert!(s.input.buffers[2].lent && s.input.buffers[3].lent);
+    collect_capture(&mut r, &mut s, 3);
+    let last = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
+    assert!(last.flags().contains(BufferFlags::LAST));
+    assert_eq!(*last.get_first_plane().bytesused, 0);
+    assert_eq!(s.drain, Drain::Done);
+    assert!(
+        s.input.buffers[2].lent && s.input.buffers[3].lent,
+        "still with the backend when the LAST buffer is out"
+    );
+
+    // START: the backend flushes (and says nothing about the two), the device queues them again
+    // in front of anything newer, and the resumed codec encodes them in order.
+    r.device
+        .encoder_cmd(&mut s, enc_cmd(bindings::V4L2_ENC_CMD_START))
+        .unwrap();
+    assert_eq!(r.log.lock().unwrap().flushes, 1);
+    assert_eq!(
+        r.log.lock().unwrap().dropped_by_flush,
+        2,
+        "the backend dropped both without a report"
+    );
+    assert_eq!(s.drain, Drain::None);
+    assert!(
+        s.input.buffers[2].queued && s.input.buffers[3].queued,
+        "queued again for the resumed codec"
+    );
+    // One CAPTURE buffer was left lent; a second one takes the other frame.
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, 0, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    collect_capture(&mut r, &mut s, 5);
+    collect_output(&mut r, &mut s, 4);
+    let packets = dequeued_on(&r.events.borrow(), CAPTURE);
+    assert_eq!(
+        (packets[3].timestamp().tv_sec, packets[4].timestamp().tv_sec),
+        (2, 3),
+        "the two frames, in order"
+    );
+    assert!(
+        s.input.buffers.iter().all(|b| !b.queued && !b.lent),
+        "every raw frame is back with the guest"
+    );
+    let units = parse_units(&capture_bytes(
+        &s,
+        packets[4].index() as usize,
+        *packets[4].get_first_plane().bytesused as usize,
+    ));
+    assert_eq!(
+        units,
+        vec![Unit::Frame {
+            key: false,
+            frame_no: 3,
+            digest: digest_of(0x33, SIZE)
+        }],
+        "the same stream continues"
+    );
+    close(&mut r.device, s);
+}
+
+/// `STREAMOFF(OUTPUT)` never fails (review-m7 R7-3, review-m6 R6-4): a flush the backend cannot
+/// complete -- a wedged codec past its bound -- ends the session instead, the queue is reset,
+/// the buffers unqueued, and `REQBUFS(0)` frees the pool space.
+#[test]
+fn streamoff_never_fails_a_backend_that_will_not_flush() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming(&mut r, &mut s);
+    queue_frame(&mut r, &mut s, 0, 0x40, 0);
+    collect_capture(&mut r, &mut s, 1);
+    r.log.lock().unwrap().fail_flush = Some(libc::ETIMEDOUT);
+    assert_eq!(
+        r.device.streamoff(&mut s, OUTPUT),
+        Ok(()),
+        "STREAMOFF answers Ok"
+    );
+    assert!(s.dead, "and the session is over");
+    assert_eq!(errors(&r.events.borrow()), 1);
+    assert_eq!(r.log.lock().unwrap().stops, 1, "the backend was joined");
+    assert!(!s.state.output_streaming);
+    assert!(
+        s.input
+            .buffers
+            .iter()
+            .chain(s.output.buffers.iter())
+            .all(|b| !b.queued && !b.lent),
+        "every buffer of both queues is back"
+    );
+    r.device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 0)
+        .unwrap();
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
+        .unwrap();
+    assert!(s.input.buffers.is_empty() && s.output.buffers.is_empty());
+    assert_eq!(r.device.active_session, None);
+    close(&mut r.device, s);
+}
+
+/// `S_FMT(CAPTURE)` honours a client's bitstream buffer size only up to what the raw size can
+/// need (review-m7 R7-4): GStreamer asks for half the *probed maximum* frame -- 32 MiB against an
+/// 8192x8192 codec -- for every buffer of its pool, out of a `media_host` pool the decoder
+/// shares. Four times the device's own default for the negotiated size, never under 4 MiB.
+#[test]
+fn s_fmt_capture_caps_the_bitstream_size_at_what_the_raw_size_can_need() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    // 640x480 (the default raw size): the default is the 256 KiB floor, the cap 4 MiB.
+    let set = pix(&r
+        .device
+        .s_fmt(&mut s, CAPTURE, capture_format(H264, 32 << 20))
+        .unwrap());
+    assert_eq!(set.sizeimage, 4 << 20);
+    // A plausible ask is still honoured as it is.
+    let set = pix(&r
+        .device
+        .s_fmt(&mut s, CAPTURE, capture_format(H264, 3 << 20))
+        .unwrap());
+    assert_eq!(set.sizeimage, 3 << 20);
+    // At 4096x2160 the default is 6 635 520 bytes, so the cap is four times that.
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(NV12, 4096, 2160))
+        .unwrap();
+    let tried = pix(&r
+        .device
+        .try_fmt(&s, CAPTURE, capture_format(H264, 32 << 20))
+        .unwrap());
+    assert_eq!(tried.sizeimage, 4 * (4096 * 2160 * 3 / 2 / 2));
+    assert_eq!(
+        nv12_sizeimage(u32::MAX, u32::MAX),
+        u32::MAX,
+        "and never an abort"
+    );
+    close(&mut r.device, s);
+}
+
+/// `S_SELECTION(OUTPUT, CROP)` fits the rectangle to the coded format the way `S_FMT` fits the
+/// frame (review-m7 R7-7): the codec is configured for exactly this rectangle, so a legal-looking
+/// crop it cannot take (641x481, 64x64 on a codec whose minimum is 128) is adjusted here, where
+/// the ioctl may adjust, instead of failing at `STREAMON`.
+#[test]
+fn s_selection_fits_the_crop_to_the_coded_format() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(NV12, SIZE.0, SIZE.1))
+        .unwrap();
+    let crop = |r: &mut Rig, s: &mut Session, left: i32, top: i32, width: u32, height: u32| {
+        let got = r
+            .device
+            .s_selection(
+                s,
+                SelectionType::Output,
+                SelectionTarget::Crop,
+                bindings::v4l2_rect {
+                    left,
+                    top,
+                    width,
+                    height,
+                },
+                SelectionFlags::empty(),
+            )
+            .unwrap();
+        (got.left, got.top, got.width, got.height)
+    };
+    // H264: 16..4096 step 2. Odd extents round up (an encoder pads), an odd origin rounds down
+    // (its chroma samples must exist whole), and nothing leaves the frame.
+    assert_eq!(crop(&mut r, &mut s, 2, 2, 301, 201), (2, 2, 302, 202));
+    assert_eq!(crop(&mut r, &mut s, 0, 0, 319, 239), (0, 0, 320, 240));
+    assert_eq!(crop(&mut r, &mut s, 1, 3, 0, 0), (0, 2, 320, 238));
+    assert_eq!(crop(&mut r, &mut s, 0, 0, 317, 237), (0, 0, 318, 238));
+    // HEVC: 64..8192 step 8. A crop below the minimum grows to it; an origin too far in for a
+    // minimum crop moves back.
+    r.device
+        .s_fmt(&mut s, CAPTURE, capture_format(HEVC, 0))
+        .unwrap();
+    assert_eq!(crop(&mut r, &mut s, 0, 0, 100, 100), (0, 0, 104, 104));
+    assert_eq!(crop(&mut r, &mut s, 0, 0, 30, 30), (0, 0, 64, 64));
+    assert_eq!(crop(&mut r, &mut s, 300, 0, 0, 0), (256, 0, 64, 240));
+    let got = r
+        .device
+        .g_selection(&s, SelectionType::Output, SelectionTarget::Crop)
+        .unwrap();
+    assert_eq!((got.left, got.width), (256, 64));
+    close(&mut r.device, s);
+}
+
+/// A drain the backend refuses leaves no drain pending (review-m7 R7-12): the session is not
+/// left answering `EBUSY` to every later command while waiting for a `LAST` buffer no drain
+/// will produce.
+#[test]
+fn a_refused_drain_leaves_no_drain_pending() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming(&mut r, &mut s);
+    r.log.lock().unwrap().fail_drain = Some(libc::EIO);
+    assert_eq!(
+        r.device
+            .encoder_cmd(&mut s, enc_cmd(bindings::V4L2_ENC_CMD_STOP))
+            .err(),
+        Some(libc::EIO)
+    );
+    assert_eq!(s.drain, Drain::None);
+    r.device
+        .encoder_cmd(&mut s, enc_cmd(bindings::V4L2_ENC_CMD_STOP))
+        .unwrap();
+    assert_eq!(s.drain, Drain::Pending);
+    collect_capture(&mut r, &mut s, 1);
+    let last = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
+    assert!(last.flags().contains(BufferFlags::LAST));
+    assert_eq!(eos_events(&r.events.borrow()), 1);
     close(&mut r.device, s);
 }

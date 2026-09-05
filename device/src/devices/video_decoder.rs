@@ -1961,7 +1961,7 @@ where
         &mut self,
         session: &mut Self::Session,
         event: EventType,
-        _flags: SubscribeEventFlags,
+        flags: SubscribeEventFlags,
     ) -> IoctlResult<()> {
         match event {
             EventType::SourceChange(0) => {
@@ -1970,6 +1970,22 @@ where
             }
             EventType::Eos => {
                 session.eos_subscribed = true;
+                Ok(())
+            }
+            // A control event (D50): D29 gave the decoder a control table, so
+            // `SUBSCRIBE_EVENT(V4L2_EVENT_CTRL)` must be accepted for the class marker and each
+            // exposed control (the encoder does the same at `video_encoder.rs:2895`; refusing it
+            // cost the decoder a `v4l2-compliance` subtest, `testEvents`). Only the initial event
+            // is ever sent -- the decoder's one real control (`MIN_BUFFERS_FOR_CAPTURE`) is
+            // read-only and per session, so no other subscriber can see it change -- and the class
+            // marker gets no initial value, as the kernel's `v4l2_ctrl_add_event` does.
+            EventType::Ctrl(id) => {
+                let def = decoder_control(id).ok_or(libc::EINVAL)?;
+                if flags.contains(SubscribeEventFlags::SEND_INITIAL) && !def.is_class {
+                    let event = decoder_ctrl_event(session, def);
+                    self.evt_queue
+                        .send_event(V4l2Event::Event(SessionEvent::new(session.id, event)));
+                }
                 Ok(())
             }
             _ => Err(libc::EINVAL),
@@ -1989,6 +2005,13 @@ where
         }
         if all || matches!(EventType::try_from(&event), Ok(EventType::Eos)) {
             session.eos_subscribed = false;
+            valid = true;
+        }
+        // A control-event subscription (D50) sends only its initial event and keeps no state, so
+        // there is nothing to tear down; the kernel answers 0 for a control id whether or not it
+        // was subscribed (`video_encoder.rs`'s unsubscribe does the same). `V4L2_EVENT_ALL`
+        // (`all`) already succeeds above.
+        if matches!(EventType::try_from(&event), Ok(EventType::Ctrl(_))) {
             valid = true;
         }
         if valid {
@@ -2301,6 +2324,39 @@ fn decoder_control_value<GM, S>(session: &VideoDecoderSession<GM, S>, id: u32) -
             Some(_) => Ok(0),
             None => Err(libc::EINVAL),
         },
+    }
+}
+
+/// The `V4L2_EVENT_CTRL` event describing a control's current state, for `SUBSCRIBE_EVENT` with
+/// `SEND_INITIAL` (D50). Modelled on the encoder's `ctrl_event` (`video_encoder.rs:1577`): the
+/// bounds and flags come from the static [`DecoderControl`] table, the value from the session
+/// (`MIN_BUFFERS_FOR_CAPTURE` follows the last `SOURCE_CHANGE`). A class marker carries no value.
+fn decoder_ctrl_event<GM, S>(
+    session: &VideoDecoderSession<GM, S>,
+    def: &DecoderControl,
+) -> bindings::v4l2_event {
+    let (minimum, maximum, step, default_value) = def.bounds();
+    let value = if def.is_class {
+        0
+    } else {
+        decoder_control_value(session, def.id).unwrap_or(0)
+    };
+    bindings::v4l2_event {
+        type_: bindings::V4L2_EVENT_CTRL,
+        id: def.id,
+        u: bindings::v4l2_event__bindgen_ty_1 {
+            ctrl: bindings::v4l2_event_ctrl {
+                changes: bindings::V4L2_EVENT_CTRL_CH_VALUE,
+                type_: def.v4l2_type(),
+                __bindgen_anon_1: bindings::v4l2_event_ctrl__bindgen_ty_1 { value },
+                flags: def.flags(),
+                minimum,
+                maximum,
+                step,
+                default_value,
+            },
+        },
+        ..Default::default()
     }
 }
 

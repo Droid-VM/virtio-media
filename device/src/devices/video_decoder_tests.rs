@@ -211,6 +211,13 @@ const DRC_LAST_MAGIC: u8 = 0xfe;
 /// the kernel's decoder interface documents, and the one GStreamer and ffmpeg both poll for
 /// (`POLLPRI` before `POLLIN`).
 const DRC_LAST_AFTER_MAGIC: u8 = 0xfd;
+/// A bitstream buffer the backend consumes without being able to announce a format: it returns
+/// the OUTPUT buffer (`InputBufferDone`) but emits no `SOURCE_CHANGE`, and produces no frame. This
+/// models the MediaCodec backend releasing a held `InputBufferDone` when the codec asks for more
+/// input than the buffer carried (D48, `android.rs` -- the first packet of an mp4 our own encoder
+/// wrote is a 31-byte header the codec cannot announce from). A one-buffer-in-flight client must
+/// still get this buffer back, or it never queues the next.
+const NO_ANNOUNCE_MAGIC: u8 = 0xfc;
 /// The resolution the fake "parses" out of the stream, whatever coded size the client set as a
 /// placeholder on `S_FMT(OUTPUT)`. A real decoder reads this from the bitstream.
 const FAKE_STREAM_SIZE: (u32, u32) = (320, 240);
@@ -366,6 +373,13 @@ impl VideoDecoderBackend for FakeBackend {
                         first_byte,
                         timestamp,
                     } => {
+                        if first_byte == NO_ANNOUNCE_MAGIC {
+                            // The codec consumed the buffer but cannot announce a format from it,
+                            // and asks for more input: the OUTPUT buffer goes back with no
+                            // SOURCE_CHANGE and no frame (D48).
+                            emit(DecoderEvent::InputBufferDone(index));
+                            continue;
+                        }
                         if first_byte == DRC_MAGIC
                             || first_byte == DRC_LAST_MAGIC
                             || first_byte == DRC_LAST_AFTER_MAGIC
@@ -778,6 +792,21 @@ fn eos_events(events: &[V4l2Event]) -> usize {
             _ => false,
         })
         .count()
+}
+
+/// The `(id, value)` of every `V4L2_EVENT_CTRL` in the batch, in order (D50).
+fn ctrl_events(events: &[V4l2Event]) -> Vec<(u32, i32)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            V4l2Event::Event(se) if se.event().type_ == bindings::V4L2_EVENT_CTRL => {
+                // SAFETY: a CTRL event carries the `ctrl` member.
+                let ctrl = unsafe { se.event().u.ctrl };
+                Some((se.event().id, unsafe { ctrl.__bindgen_anon_1.value }))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn errors(events: &[V4l2Event]) -> usize {
@@ -2341,12 +2370,19 @@ fn prepare_buf_then_qbuf_keeps_the_prepared_payload() {
     close(&mut r.device, s);
 }
 
-/// `SUBSCRIBE_EVENT` accepts only `SOURCE_CHANGE` and `EOS`; anything else is `EINVAL`. A decoder
-/// must offer both (the `v4l2-compliance` `testEvents` rule for a stateful decoder).
+/// `SUBSCRIBE_EVENT` accepts `SOURCE_CHANGE`, `EOS`, and -- since D29 gave the decoder a control
+/// table -- a `V4L2_EVENT_CTRL` on the class marker and each exposed control (D50); anything else
+/// is `EINVAL`. A stateful decoder must offer all three (the `v4l2-compliance` `testEvents` rule;
+/// refusing the control event cost the decoder subtest 48/47/1 -> 48/46/2, B9-acceptance §4.2).
+/// With `SEND_INITIAL` a control event is answered at once with the control's state -- for every
+/// control but the class marker, which the kernel's `v4l2_ctrl_add_event` sends no initial value
+/// for. Modelled on the encoder's `events_are_eos_and_control_events_only`.
 #[test]
-fn events_are_source_change_and_eos_only() {
+fn events_are_source_change_eos_and_control_events() {
     let mut r = rig();
     let mut s = session(&mut r.device);
+    const CID_MIN_CAP: u32 = bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
+
     assert!(r
         .device
         .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
@@ -2361,6 +2397,67 @@ fn events_are_source_change_and_eos_only() {
             .err(),
         Some(libc::EINVAL)
     );
+
+    // The control event compliance subscribes to: MIN_BUFFERS_FOR_CAPTURE. With SEND_INITIAL the
+    // current value goes out at once. Before any SOURCE_CHANGE it is the floor, 1.
+    assert!(r
+        .device
+        .subscribe_event(
+            &mut s,
+            EventType::Ctrl(CID_MIN_CAP),
+            SubscribeEventFlags::SEND_INITIAL,
+        )
+        .is_ok());
+    // The class marker is accepted too, but carries no initial value.
+    assert!(r
+        .device
+        .subscribe_event(
+            &mut s,
+            EventType::Ctrl(bindings::V4L2_CID_USER_CLASS),
+            SubscribeEventFlags::SEND_INITIAL,
+        )
+        .is_ok());
+    // Subscribing without SEND_INITIAL emits nothing.
+    assert!(r
+        .device
+        .subscribe_event(&mut s, EventType::Ctrl(CID_MIN_CAP), SubscribeEventFlags::empty())
+        .is_ok());
+    // A control the decoder does not have: EINVAL, not silently accepted.
+    assert_eq!(
+        r.device
+            .subscribe_event(
+                &mut s,
+                EventType::Ctrl(bindings::V4L2_CID_BRIGHTNESS),
+                SubscribeEventFlags::SEND_INITIAL,
+            )
+            .err(),
+        Some(libc::EINVAL)
+    );
+
+    // Exactly one initial control event went out: MIN_BUFFERS_FOR_CAPTURE = 1 (the class marker
+    // and the no-flag subscription send none).
+    assert_eq!(ctrl_events(&r.events.borrow()), vec![(CID_MIN_CAP, 1)]);
+
+    // Unsubscribe accepts SOURCE_CHANGE, EOS and a control id, and V4L2_EVENT_ALL.
+    let unsub = |type_: u32, id: u32| bindings::v4l2_event_subscription {
+        type_,
+        id,
+        ..Default::default()
+    };
+    assert!(r
+        .device
+        .unsubscribe_event(&mut s, unsub(bindings::V4L2_EVENT_CTRL, CID_MIN_CAP))
+        .is_ok());
+    assert!(r
+        .device
+        .unsubscribe_event(&mut s, unsub(bindings::V4L2_EVENT_SOURCE_CHANGE, 0))
+        .is_ok());
+    assert!(!s.src_change_subscribed);
+    assert!(r
+        .device
+        .unsubscribe_event(&mut s, unsub(bindings::V4L2_EVENT_ALL, 0))
+        .is_ok());
+    assert!(!s.eos_subscribed);
     close(&mut r.device, s);
 }
 
@@ -2711,6 +2808,65 @@ fn source_change_precedes_the_output_buffer_that_produced_it() {
     // No CAPTURE buffer was ever queued, yet the client saw the event.
     assert_eq!(source_changes(&events), 1);
     drop(events);
+    close(&mut r.device, s);
+}
+
+/// D48: a backend that consumes the first OUTPUT buffer but cannot announce a format from it (an
+/// mp4 whose first packet is a 31-byte header, D44) still returns the buffer -- **before** any
+/// `SOURCE_CHANGE` -- and the device must dequeue it for the guest. A one-buffer-in-flight client
+/// (a stateful ffmpeg on an mp4, `v4l2-compliance -s`) polls for its OUTPUT buffer to come back
+/// before it queues the next; if the device held the buffer behind the initial `SOURCE_CHANGE`
+/// the codec can never reach, the two wait on each other forever (B9-build §6 measured exactly
+/// this: `1 bitstream buffers in, 0 frames out`). The MediaCodec backend bounds that hold
+/// (`android.rs`: it releases the held `InputBufferDone` the moment the codec asks for more input
+/// than the buffer carried, plus a 500 ms backstop); this pins the device end of the contract --
+/// an `InputBufferDone` reported before the first `FormatChanged` reaches the guest as a `DQBUF`,
+/// so the D45 hold (which lives entirely in the backend) can end without waiting for a
+/// `SOURCE_CHANGE` that is not coming. The companion
+/// `source_change_precedes_the_output_buffer_that_produced_it` pins the other half: when the codec
+/// *can* announce, the event still precedes the buffer (`POLLPRI` before `POLLOUT`).
+#[test]
+fn an_output_buffer_returns_before_the_first_source_change_when_the_codec_cannot_announce() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 4).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // Buffer 0 carries bytes the backend cannot announce a format from: it comes back with no
+    // SOURCE_CHANGE, modelling the release condition the MediaCodec backend implements (D48).
+    poke_mmap_output(&mut s, 0, NO_ANNOUNCE_MAGIC);
+    let mut ob = mmap_buffer(OUTPUT, 0, 1 << 20);
+    ob.set_timestamp(ts(1));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while dequeued_on(&r.events.borrow(), OUTPUT).is_empty() {
+        assert!(wait_ready(&s), "no OUTPUT DQBUF within 2s");
+        process(&mut r.device, &mut s);
+    }
+    // The buffer came back, and no SOURCE_CHANGE preceded it: a one-buffer client can now queue
+    // the next OUTPUT buffer instead of deadlocking.
+    assert_eq!(dequeued_on(&r.events.borrow(), OUTPUT).len(), 1, "buffer 0 returned");
+    assert_eq!(source_changes(&r.events.borrow()), 0, "no announcement yet");
+
+    // Queue buffer 1, which the backend CAN announce from: the SOURCE_CHANGE arrives now, and
+    // this buffer too comes back.
+    poke_mmap_output(&mut s, 1, 0x01);
+    let mut ob = mmap_buffer(OUTPUT, 1, 1 << 20);
+    ob.set_timestamp(ts(2));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    while source_changes(&r.events.borrow()) == 0 {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert_eq!(source_changes(&r.events.borrow()), 1);
+    assert_eq!(
+        dequeued_on(&r.events.borrow(), OUTPUT).len(),
+        2,
+        "both OUTPUT buffers returned"
+    );
     close(&mut r.device, s);
 }
 

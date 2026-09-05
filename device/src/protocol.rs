@@ -268,6 +268,11 @@ impl EventHeader {
     pub fn new(event: u32, session_id: u32) -> Self {
         Self { event, session_id }
     }
+
+    /// The session this event is for.
+    pub fn session_id(&self) -> u32 {
+        self.session_id
+    }
 }
 
 #[repr(C)]

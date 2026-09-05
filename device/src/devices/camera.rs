@@ -22,6 +22,17 @@
 //! device's [`VirtioMediaBufferAllocator`] -- the `media_host` pool on DroidVM) or guest-owned
 //! (`USERPTR`, `driver_owned_queues=all`), on the one `CAPTURE` queue.
 //!
+//! # Controls
+//!
+//! The camera's features -- zoom, exposure, focus, white balance, flash, and the rest of plan
+//! §3.1's table -- are standard V4L2 controls, plus a private block for what V4L2 has no control
+//! for (the metering and focus regions, the active lens, the auto-exposure state). Which ones
+//! exist is decided once from [`CameraInfo`]; their values belong to the device, not to a
+//! session, so a `v4l2-ctl --set-ctrl` from one process reaches the stream another runs, and
+//! what is set with no stream open is applied when one opens. Changes -- a set from another
+//! session, a flag flip, a state the backend observed -- are `V4L2_EVENT_CTRL` to the sessions
+//! that subscribed. The [`controls`] module has the table, the units and the wire formats.
+//!
 //! # Threads and buffers
 //!
 //! Frames arrive on a thread the backend owns -- a camera API is a stream of callbacks, and on
@@ -52,6 +63,7 @@
 //! Converting from whatever the camera produces (NV21, I420, padded rows) is the backend's job;
 //! the device never looks at the pixels.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Result as IoResult;
 use std::os::fd::AsFd;
@@ -62,17 +74,24 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use v4l2r::bindings;
+use v4l2r::bindings::v4l2_control;
 use v4l2r::bindings::v4l2_create_buffers;
 use v4l2r::bindings::v4l2_event_subscription;
+use v4l2r::bindings::v4l2_ext_control;
+use v4l2r::bindings::v4l2_ext_controls;
 use v4l2r::bindings::v4l2_fmtdesc;
 use v4l2r::bindings::v4l2_format;
 use v4l2r::bindings::v4l2_frmivalenum;
 use v4l2r::bindings::v4l2_frmsizeenum;
+use v4l2r::bindings::v4l2_query_ext_ctrl;
+use v4l2r::bindings::v4l2_queryctrl;
+use v4l2r::bindings::v4l2_querymenu;
 use v4l2r::bindings::v4l2_requestbuffers;
 use v4l2r::bindings::v4l2_streamparm;
 use v4l2r::ioctl::BufferCapabilities;
 use v4l2r::ioctl::BufferField;
 use v4l2r::ioctl::BufferFlags;
+use v4l2r::ioctl::CtrlWhich;
 use v4l2r::ioctl::EventType;
 use v4l2r::ioctl::SubscribeEventFlags;
 use v4l2r::ioctl::V4l2Buffer;
@@ -88,6 +107,7 @@ use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::mmap::MmapMappingManager;
 use crate::mmap::RetiredBuffers;
 use crate::protocol::DequeueBufferEvent;
+use crate::protocol::SessionEvent;
 use crate::protocol::SgEntry;
 use crate::protocol::V4l2Event;
 use crate::protocol::V4l2Ioctl;
@@ -102,6 +122,40 @@ use crate::VirtioMediaEventQueue;
 use crate::VirtioMediaGuestMemoryMapper;
 use crate::VirtioMediaHostMemoryMapper;
 use crate::WriteToDescriptorChain;
+
+pub mod controls;
+pub use controls::AeMode;
+pub use controls::AeState;
+pub use controls::AfMode;
+pub use controls::AfTrigger;
+pub use controls::CameraControl;
+pub use controls::ColorEffect;
+pub use controls::ControlDesc;
+pub use controls::Controls;
+pub use controls::ExposureBias;
+pub use controls::ExposureMode;
+pub use controls::FlashLed;
+pub use controls::IsoMode;
+pub use controls::Kind;
+pub use controls::MaxRegions;
+pub use controls::PowerLine;
+pub use controls::Region;
+pub use controls::SceneMode;
+pub use controls::Value;
+pub use controls::WhiteBalance;
+pub use controls::AF_STATUS_BUSY;
+pub use controls::AF_STATUS_FAILED;
+pub use controls::AF_STATUS_IDLE;
+pub use controls::AF_STATUS_REACHED;
+pub use controls::REGION_MAX_WEIGHT;
+pub use controls::REGION_SCALE;
+pub use controls::REGION_WORDS;
+pub use controls::VCAM_CID_ACTIVE_PHYSICAL_ID;
+pub use controls::VCAM_CID_AE_REGIONS;
+pub use controls::VCAM_CID_AE_STATE;
+pub use controls::VCAM_CID_AF_REGIONS;
+pub use controls::VCAM_CID_AWB_REGIONS;
+pub use controls::VCAM_CID_BASE;
 
 /// The one pixel format offered: Y plane then interleaved Cb/Cr, tightly packed.
 pub const NV12: PixelFormat = PixelFormat::from_fourcc(b"NV12");
@@ -165,8 +219,10 @@ impl FrameSize {
     }
 }
 
-/// What a camera can do, in the terms `ENUM_FRAMESIZES`, `ENUM_FRAMEINTERVALS` and `G/S_PARM`
-/// are answered with. Controls (`VPU_DESIGN.md` §7.1, M5) extend this.
+/// What a camera can do, in the terms `ENUM_FRAMESIZES`, `ENUM_FRAMEINTERVALS`, `G/S_PARM` and
+/// the controls are answered with. Every control field is a capability: a control is offered
+/// only when the field says the camera has the feature (`VPU_DESIGN.md` §7.1); the table
+/// [`Controls::new`] builds says exactly which field makes which control.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CameraInfo {
     /// The host's name for the camera (`"0"` on Android).
@@ -179,6 +235,41 @@ pub struct CameraInfo {
     /// (`CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` on Android). A range whose ends differ lets the
     /// camera slow down in low light.
     pub fps_ranges: Vec<(u32, u32)>,
+    /// The zoom ratio range in hundredths (`CONTROL_ZOOM_RATIO_RANGE` x100): `ZOOM_ABSOLUTE`.
+    pub zoom_range: Option<(u32, u32)>,
+    /// The autofocus modes (`CONTROL_AF_AVAILABLE_MODES`): `FOCUS_AUTO`, the trigger buttons and
+    /// `AUTO_FOCUS_STATUS`.
+    pub af_modes: Vec<AfMode>,
+    /// A flash unit (`FLASH_INFO_AVAILABLE`): `FLASH_LED_MODE`.
+    pub flash: bool,
+    /// The auto-exposure modes (`CONTROL_AE_AVAILABLE_MODES`); `Off` and `On` together make
+    /// `EXPOSURE_AUTO` and `ISO_SENSITIVITY_AUTO`.
+    pub ae_modes: Vec<AeMode>,
+    /// The exposure time range in nanoseconds (`SENSOR_INFO_EXPOSURE_TIME_RANGE`):
+    /// `EXPOSURE_ABSOLUTE`, in 100 µs units.
+    pub exposure_range_ns: Option<(u64, u64)>,
+    /// The sensitivity range (`SENSOR_INFO_SENSITIVITY_RANGE`): the `ISO_SENSITIVITY` menu.
+    pub iso_range: Option<(u32, u32)>,
+    /// The exposure compensation range and step: the `AUTO_EXPOSURE_BIAS` menu.
+    pub exposure_bias: Option<ExposureBias>,
+    /// The white-balance modes (`CONTROL_AWB_AVAILABLE_MODES`), in the crate's names:
+    /// `AUTO_N_PRESET_WHITE_BALANCE`.
+    pub awb_modes: Vec<WhiteBalance>,
+    /// The antibanding modes (`CONTROL_AE_AVAILABLE_ANTIBANDING_MODES`): `POWER_LINE_FREQUENCY`.
+    pub antibanding: Vec<PowerLine>,
+    /// The colour effects (`CONTROL_AVAILABLE_EFFECTS`), those with a V4L2 name: `COLORFX`.
+    pub effects: Vec<ColorEffect>,
+    /// The scene modes (`CONTROL_AVAILABLE_SCENE_MODES`), those with a V4L2 name: `SCENE_MODE`.
+    pub scenes: Vec<SceneMode>,
+    /// Video stabilisation can be switched on (`CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES`):
+    /// `IMAGE_STABILIZATION`.
+    pub stabilization: bool,
+    /// How many metering / focus / white-balance regions the camera takes
+    /// (`CONTROL_MAX_REGIONS`): the private regions controls.
+    pub max_regions: MaxRegions,
+    /// The physical lenses behind a logical camera (`LOGICAL_MULTI_CAMERA_PHYSICAL_IDS`): the
+    /// private active-physical-id control indexes this list.
+    pub physical_ids: Vec<String>,
 }
 
 impl CameraInfo {
@@ -320,17 +411,15 @@ pub enum CameraEvent {
     Disconnected,
     /// The stream failed and produces no more frames; the string is for the log.
     Error(String),
-}
-
-/// A control applied to an open stream. M5 adds the camera controls proper.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CameraControl {
-    /// `CONTROL_AE_TARGET_FPS_RANGE`: what `S_PARM` during streaming asks for.
-    FpsRange(u32, u32),
+    /// A control's value as the camera reports it: the autofocus state, the auto-exposure
+    /// state, the lens in use, or a value the backend had to change itself. The backend sends
+    /// one only when the value differs from what it last sent, and the device compares again
+    /// before it tells the guest, so a report is never a redundant `V4L2_EVENT_CTRL`.
+    Control(CameraControl),
 }
 
 /// What a stream is opened for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamRequest {
     pub width: u32,
     pub height: u32,
@@ -338,6 +427,9 @@ pub struct StreamRequest {
     pub fps: (u32, u32),
     /// How many buffers the guest allocated, for a backend that sizes a queue of its own.
     pub buffers: u32,
+    /// Every settable control at its current value, to be applied before the first frame --
+    /// what a guest set while nothing was streaming, or the defaults.
+    pub controls: Vec<CameraControl>,
 }
 
 /// An eventfd a session's worker polls. Bumped once per filled buffer and per event; drained by
@@ -443,6 +535,16 @@ pub trait CameraBackend {
         request: StreamRequest,
         sink: CaptureSink,
     ) -> Result<Self::Stream, i32>;
+
+    /// Apply `controls` to the stream this backend opened last, if it is still running, in one
+    /// submission; `Ok(())` and nothing done when none is.
+    ///
+    /// The device calls this, not [`CameraStream::set_controls`], for the V4L2 controls: they
+    /// belong to the device, the session setting them need not be the one streaming (the
+    /// stream is another session's, out of this one's reach), and a value set with no stream
+    /// open is carried in the next [`StreamRequest`] instead. `S_PARM` still goes through the
+    /// stream: the frame rate is the streaming session's own.
+    fn set_controls(&mut self, controls: &[CameraControl]) -> Result<(), i32>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -574,6 +676,10 @@ pub struct CameraDevice<
     /// The one session allowed to hold buffers: a camera cannot be shared, and
     /// `v4l2-compliance` checks that a second session is refused (see `SimpleCaptureDevice`).
     active_session: Option<u32>,
+    /// The control table and the current values: the device's, shared by every session.
+    controls: Controls,
+    /// `V4L2_EVENT_CTRL` subscriptions, by session id: control id to "allow feedback".
+    subscriptions: HashMap<u32, HashMap<u32, bool>>,
 }
 
 impl<B, Q, M, HM, A> CameraDevice<B, Q, M, HM, A>
@@ -585,6 +691,7 @@ where
     A: VirtioMediaBufferAllocator,
 {
     pub fn new(backend: B, evt_queue: Q, mem: M, mapper: HM, allocator: A) -> Self {
+        let controls = Controls::new(backend.info());
         Self {
             backend,
             evt_queue,
@@ -593,7 +700,14 @@ where
             allocator,
             retired: RetiredBuffers::new(),
             active_session: None,
+            controls,
+            subscriptions: HashMap::new(),
         }
+    }
+
+    /// The control table, for a VMM that wants to log it.
+    pub fn controls(&self) -> &Controls {
+        &self.controls
     }
 
     pub fn info(&self) -> &CameraInfo {
@@ -817,6 +931,308 @@ where
                 session.id, event,
             )));
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Controls
+    // -----------------------------------------------------------------------------------------
+
+    /// `V4L2_EVENT_CTRL` for control `id` to every session subscribed to it. `from` is the
+    /// session whose set caused it, which is told only if it asked for feedback; `None` sends
+    /// to all, as the kernel does for a flag change or a value the hardware changed.
+    fn send_control_event(&mut self, id: u32, changes: u32, from: Option<u32>) {
+        let Some(desc) = self.controls.find(id) else {
+            return;
+        };
+        let event = self.controls.event(desc, changes);
+        let targets: Vec<u32> = self
+            .subscriptions
+            .iter()
+            .filter_map(|(sid, subs)| {
+                let feedback = *subs.get(&id)?;
+                (from != Some(*sid) || feedback).then_some(*sid)
+            })
+            .collect();
+        for sid in targets {
+            self.evt_queue
+                .send_event(V4l2Event::Event(SessionEvent::new(sid, event)));
+        }
+    }
+
+    /// Store `values` (validated already), hand what changed to the camera in one submission,
+    /// and tell the subscribers. `from` is the session that set them.
+    ///
+    /// A value that did not change is neither sent nor announced, as the kernel's control
+    /// framework does; a button always executes. A camera that will not take the set (`EIO`:
+    /// its capture thread is gone) leaves the values stored -- they are what the next stream
+    /// opens with -- and the error goes to the guest.
+    fn commit_controls(&mut self, from: u32, values: Vec<(u32, Value)>) -> IoctlResult<()> {
+        let manual_before = self.controls.manual_exposure();
+        let mut changed: Vec<CameraControl> = Vec::new();
+        let mut announce: Vec<u32> = Vec::new();
+        for (id, value) in values {
+            if !self.controls.set(id, value.clone()) {
+                continue;
+            }
+            if let Some(control) = self.controls.control_of(id, &value) {
+                changed.push(control);
+            }
+            // A button has no value to announce.
+            if self.controls.current(id).is_some() {
+                announce.push(id);
+            }
+        }
+        let result = if changed.is_empty() {
+            Ok(())
+        } else {
+            self.backend.set_controls(&changed).map_err(|e| {
+                log::error!(
+                    "camera {}: the stream would not take {} control(s): errno {}",
+                    self.backend.info().id,
+                    changed.len(),
+                    e
+                );
+                e
+            })
+        };
+        for id in announce {
+            self.send_control_event(id, bindings::V4L2_EVENT_CTRL_CH_VALUE, Some(from));
+        }
+        if manual_before != self.controls.manual_exposure() {
+            for id in [
+                bindings::V4L2_CID_EXPOSURE_ABSOLUTE,
+                bindings::V4L2_CID_ISO_SENSITIVITY,
+            ] {
+                self.send_control_event(id, bindings::V4L2_EVENT_CTRL_CH_FLAGS, None);
+            }
+        }
+        result
+    }
+
+    /// A value the running camera reported: stored, and announced if it differs.
+    fn observe_control(&mut self, control: &CameraControl) {
+        if let Some(id) = self.controls.observe(control) {
+            self.send_control_event(id, bindings::V4L2_EVENT_CTRL_CH_VALUE, None);
+        }
+    }
+
+    /// The control `QUERYCTRL` / `QUERY_EXT_CTRL` asks for, from the `id` word as the guest
+    /// sent it, and the id to report: the next one after `id` under the `V4L2_CTRL_FLAG_NEXT_*`
+    /// bits, the private control an old-style `V4L2_CID_PRIVATE_BASE + n` names (reported under
+    /// that alias, as the kernel does), or the control itself.
+    fn lookup_query(&self, raw: u32) -> IoctlResult<(&ControlDesc, u32)> {
+        let next =
+            raw & (bindings::V4L2_CTRL_FLAG_NEXT_CTRL | bindings::V4L2_CTRL_FLAG_NEXT_COMPOUND);
+        let id = raw & bindings::V4L2_CTRL_ID_MASK;
+        if next != 0 {
+            let regular = next & bindings::V4L2_CTRL_FLAG_NEXT_CTRL != 0;
+            let compound = next & bindings::V4L2_CTRL_FLAG_NEXT_COMPOUND != 0;
+            let desc = self
+                .controls
+                .next(id, regular, compound)
+                .ok_or(libc::EINVAL)?;
+            Ok((desc, desc.id))
+        } else if id >= controls::V4L2_CID_PRIVATE_BASE {
+            let desc = self.controls.private_alias(id).ok_or(libc::EINVAL)?;
+            Ok((desc, id))
+        } else {
+            let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+            Ok((desc, id))
+        }
+    }
+
+    /// What every ext-controls ioctl checks first: the `which` word, the reserved words, and a
+    /// `count == 0` call, which is a class probe and ends there.
+    fn ext_ctrls_prelude(
+        &self,
+        which: CtrlWhich,
+        ctrls: &mut v4l2_ext_controls,
+        ctrl_array: &mut [v4l2_ext_control],
+        set: bool,
+    ) -> IoctlResult<Option<ExtCtrls>> {
+        ctrls.error_idx = ctrls.count;
+        ctrls.reserved = [0];
+        for ctrl in ctrl_array.iter_mut() {
+            ctrl.reserved2 = [0];
+        }
+        let (class, default) = match which {
+            CtrlWhich::Current => (None, false),
+            // The defaults can be read but not changed.
+            CtrlWhich::Default if set => return Err(libc::EINVAL),
+            CtrlWhich::Default => (None, true),
+            CtrlWhich::Class(class) => (Some(class), false),
+            CtrlWhich::Request(_) => return Err(libc::EINVAL),
+        };
+        if ctrl_array.is_empty() {
+            // "Does this class exist": the kernel's `class_check`.
+            return match class {
+                Some(class) if !self.controls.has_class(class) => Err(libc::EINVAL),
+                _ => Ok(None),
+            };
+        }
+        Ok(Some(ExtCtrls { class, default }))
+    }
+
+    /// The values an `S_EXT_CTRLS` / `TRY_EXT_CTRLS` carries, each resolved and validated; a
+    /// compound control's payload is read from the guest memory the ioctl named. `Err((i, e))`
+    /// is the control that failed.
+    fn read_ext_values(
+        &self,
+        class: Option<u32>,
+        ctrl_array: &mut [v4l2_ext_control],
+        user_regions: Vec<Vec<SgEntry>>,
+    ) -> Result<Vec<(u32, Value)>, (usize, i32)> {
+        let mut regions = user_regions.into_iter();
+        let mut values = Vec::with_capacity(ctrl_array.len());
+        for (i, ctrl) in ctrl_array.iter_mut().enumerate() {
+            let fail = |e: i32| (i, e);
+            // The SG list of a payload control was read in order, whatever else fails.
+            let sgs = (ctrl.size > 0)
+                .then(|| regions.next().ok_or(fail(libc::EINVAL)))
+                .transpose()?;
+            let id = ctrl.id & bindings::V4L2_CTRL_ID_MASK;
+            if class.is_some_and(|class| controls::ctrl_class(id) != class) {
+                return Err(fail(libc::EINVAL));
+            }
+            // Old-style private ids are for `G_CTRL`/`S_CTRL` only (the kernel's rule).
+            if id >= controls::V4L2_CID_PRIVATE_BASE {
+                return Err(fail(libc::EINVAL));
+            }
+            let desc = self.controls.find(id).ok_or(fail(libc::EINVAL))?;
+            if desc.is_read_only() {
+                return Err(fail(libc::EACCES));
+            }
+            let value = if desc.is_compound() {
+                let needed = desc.payload_len();
+                if ctrl.size < needed {
+                    return Err(fail(libc::EFAULT));
+                }
+                ctrl.size = needed;
+                let sgs = sgs.ok_or(fail(libc::EFAULT))?;
+                let mapping = self.mem.new_mapping_for(sgs, false).map_err(|e| {
+                    log::error!("failed to map a control payload: {:#}", e);
+                    fail(guest_mapping_errno(&e))
+                })?;
+                Value::Array(read_words(&mapping, needed as usize).ok_or(fail(libc::EFAULT))?)
+            } else {
+                // A plain control travels in `value`; none of this device's is 64-bit.
+                let union = ctrl.__bindgen_anon_1;
+                // SAFETY: `value` is the member a plain control carries; every bit pattern is
+                // a valid `i32`.
+                Value::Int(unsafe { union.value } as i64)
+            };
+            let value = self.controls.validate(desc, &value).map_err(fail)?;
+            values.push((id, value));
+        }
+        Ok(values)
+    }
+
+    /// `G_EXT_CTRLS`: every control checked first -- an unknown id, a write-only control, a
+    /// payload buffer too small (`ENOSPC`, with the size it needs written back) -- then the
+    /// values filled in, the current ones or the defaults. A payload goes into the guest
+    /// memory the ioctl named.
+    fn write_ext_values(
+        &self,
+        class: Option<u32>,
+        default: bool,
+        ctrl_array: &mut [v4l2_ext_control],
+        user_regions: Vec<Vec<SgEntry>>,
+    ) -> IoctlResult<()> {
+        let mut regions = user_regions.into_iter();
+        let mut planned: Vec<(&ControlDesc, Option<Vec<SgEntry>>)> =
+            Vec::with_capacity(ctrl_array.len());
+        for ctrl in ctrl_array.iter_mut() {
+            let sgs = (ctrl.size > 0)
+                .then(|| regions.next().ok_or(libc::EINVAL))
+                .transpose()?;
+            let id = ctrl.id & bindings::V4L2_CTRL_ID_MASK;
+            if class.is_some_and(|class| controls::ctrl_class(id) != class) {
+                return Err(libc::EINVAL);
+            }
+            if id >= controls::V4L2_CID_PRIVATE_BASE {
+                return Err(libc::EINVAL);
+            }
+            let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+            if desc.is_write_only() {
+                return Err(libc::EACCES);
+            }
+            if desc.is_compound() {
+                let needed = desc.payload_len();
+                if ctrl.size < needed {
+                    // "In the get case the application first queries to obtain the size."
+                    ctrl.size = needed;
+                    return Err(libc::ENOSPC);
+                }
+                ctrl.size = needed;
+            }
+            planned.push((desc, sgs));
+        }
+        for (ctrl, (desc, sgs)) in ctrl_array.iter_mut().zip(planned) {
+            let value = if default {
+                desc.kind.default_value()
+            } else {
+                self.controls
+                    .current(desc.id)
+                    .cloned()
+                    .unwrap_or_else(|| desc.kind.default_value())
+            };
+            match value {
+                Value::Int(v) => {
+                    ctrl.__bindgen_anon_1 =
+                        bindings::v4l2_ext_control__bindgen_ty_1 { value: v as i32 };
+                }
+                Value::Array(words) => {
+                    let sgs = sgs.ok_or(libc::EFAULT)?;
+                    let mut mapping = self.mem.new_mapping_for(sgs, true).map_err(|e| {
+                        log::error!("failed to map a control payload: {:#}", e);
+                        guest_mapping_errno(&e)
+                    })?;
+                    if !write_words(&mut mapping, &words) {
+                        return Err(libc::EFAULT);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What an ext-controls ioctl with controls in it asks for.
+struct ExtCtrls {
+    /// The class every control must be in, when `which` named one.
+    class: Option<u32>,
+    /// `V4L2_CTRL_WHICH_DEF_VAL`: the defaults rather than the current values.
+    default: bool,
+}
+
+/// `bytes` bytes of a control payload as little-endian words, out of the guest memory the
+/// ioctl named; `None` for a mapping too short to hold them. Copied out with a raw pointer:
+/// the guest can write those pages at any time, so no slice is ever made over them.
+fn read_words<GM: GuestMemoryRange>(mapping: &GM, bytes: usize) -> Option<Vec<u32>> {
+    if mapping.len() < bytes {
+        return None;
+    }
+    let mut raw = vec![0u8; bytes];
+    // SAFETY: the mapping holds at least `bytes` bytes (checked), `raw` is exactly that long,
+    // and a fresh `Vec` cannot overlap guest memory.
+    unsafe { std::ptr::copy_nonoverlapping(mapping.as_ptr(), raw.as_mut_ptr(), bytes) };
+    Some(
+        raw.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// `words` into a control payload in guest memory, little-endian; `false` for a mapping too
+/// short to take them.
+fn write_words<GM: GuestMemoryRange>(mapping: &mut GM, words: &[u32]) -> bool {
+    let raw: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    if mapping.len() < raw.len() {
+        return false;
+    }
+    // SAFETY: the mapping holds at least `raw.len()` bytes (checked) and `raw` is a `Vec` of
+    // our own, so the two cannot overlap.
+    unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), mapping.as_mut_ptr(), raw.len()) };
+    true
 }
 
 impl<B, Q, M, HM, A, Reader, Writer> VirtioMediaDevice<Reader, Writer>
@@ -855,6 +1271,7 @@ where
         if self.active_session == Some(session.id) {
             self.active_session = None;
         }
+        self.subscriptions.remove(&session.id);
         // The stream first, so no thread is writing into a buffer that goes away below.
         self.stop_stream(&mut session);
         self.free_buffers(&mut session);
@@ -916,12 +1333,19 @@ where
         for buffer in filled {
             self.return_filled(session, buffer);
         }
-        if let Some(event) = events.into_iter().next() {
+        // A control the camera reported is announced; the first fatal event ends the session
+        // and nothing after it matters.
+        for event in events {
             let why = match event {
+                CameraEvent::Control(control) => {
+                    self.observe_control(&control);
+                    continue;
+                }
                 CameraEvent::Disconnected => "the camera was disconnected".to_owned(),
                 CameraEvent::Error(reason) => reason,
             };
             self.end_session(session, &why);
+            break;
         }
         Ok(())
     }
@@ -1468,15 +1892,17 @@ where
             height: session.size.height,
             fps: info.range_at(&session.size, session.fps),
             buffers: session.buffers.len() as u32,
+            controls: self.controls.all_settable(),
         };
         let sink = CaptureSink(Arc::clone(&session.signal));
+        let (width, height, fps) = (request.width, request.height, request.fps);
         let stream = self.backend.open_stream(request, sink).map_err(|e| {
             log::error!(
                 "camera {}: cannot open a {}x{} stream at {:?} fps: errno {}",
                 id,
-                request.width,
-                request.height,
-                request.fps,
+                width,
+                height,
+                fps,
                 e
             );
             e
@@ -1601,30 +2027,203 @@ where
         }
     }
 
-    /// `EOS` and `SOURCE_CHANGE` are accepted and never emitted (a camera has neither); the
-    /// controls' `V4L2_EVENT_CTRL` is M5.
+    // -----------------------------------------------------------------------------------------
+    // Controls: see `controls.rs` for the table and the units.
+    // -----------------------------------------------------------------------------------------
+
+    fn queryctrl_raw(&mut self, _session: &Self::Session, id: u32) -> IoctlResult<v4l2_queryctrl> {
+        let (desc, id) = self.lookup_query(id)?;
+        Ok(self.controls.query(desc, id))
+    }
+
+    fn query_ext_ctrl_raw(
+        &mut self,
+        _session: &Self::Session,
+        id: u32,
+    ) -> IoctlResult<v4l2_query_ext_ctrl> {
+        let (desc, id) = self.lookup_query(id)?;
+        Ok(self.controls.query_ext(desc, id))
+    }
+
+    fn querymenu(
+        &mut self,
+        _session: &Self::Session,
+        id: u32,
+        index: u32,
+    ) -> IoctlResult<v4l2_querymenu> {
+        self.controls.menu_item(id, index)
+    }
+
+    /// `G_CTRL`: the plain controls only, as the kernel's `is_int`; a write-only one is
+    /// `EACCES`.
+    fn g_ctrl(&mut self, _session: &Self::Session, id: u32) -> IoctlResult<v4l2_control> {
+        let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+        if !desc.is_int() {
+            return Err(libc::EINVAL);
+        }
+        if desc.is_write_only() {
+            return Err(libc::EACCES);
+        }
+        let value = self.controls.current(id).map(Value::int).unwrap_or(0);
+        Ok(v4l2_control {
+            id,
+            value: value as i32,
+        })
+    }
+
+    /// `S_CTRL`: validated against the range, stored, sent to the camera and announced, like a
+    /// one-control `S_EXT_CTRLS`.
+    fn s_ctrl(
+        &mut self,
+        session: &mut Self::Session,
+        id: u32,
+        value: i32,
+    ) -> IoctlResult<v4l2_control> {
+        let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+        if !desc.is_int() {
+            return Err(libc::EINVAL);
+        }
+        if desc.is_read_only() {
+            return Err(libc::EACCES);
+        }
+        let value = self.controls.validate(desc, &Value::Int(value as i64))?;
+        let reply = value.int() as i32;
+        self.commit_controls(session.id, vec![(id, value)])?;
+        Ok(v4l2_control { id, value: reply })
+    }
+
+    /// `G_EXT_CTRLS`. `error_idx` is `count` on every failure, as the kernel leaves it for a get.
+    fn g_ext_ctrls(
+        &mut self,
+        _session: &Self::Session,
+        which: CtrlWhich,
+        ctrls: &mut v4l2_ext_controls,
+        ctrl_array: &mut Vec<v4l2_ext_control>,
+        user_regions: Vec<Vec<SgEntry>>,
+    ) -> IoctlResult<()> {
+        let Some(ExtCtrls { class, default }) =
+            self.ext_ctrls_prelude(which, ctrls, ctrl_array, false)?
+        else {
+            return Ok(());
+        };
+        self.write_ext_values(class, default, ctrl_array, user_regions)
+    }
+
+    /// `S_EXT_CTRLS`: every control validated before any is applied, then all of them stored
+    /// and handed to the camera in one submission. A failure applies nothing and leaves
+    /// `error_idx` at `count` (the whole set failed, as the kernel reports a set); the reply
+    /// carries the values as stored.
+    fn s_ext_ctrls(
+        &mut self,
+        session: &mut Self::Session,
+        which: CtrlWhich,
+        ctrls: &mut v4l2_ext_controls,
+        ctrl_array: &mut Vec<v4l2_ext_control>,
+        user_regions: Vec<Vec<SgEntry>>,
+    ) -> IoctlResult<()> {
+        let Some(ExtCtrls { class, .. }) =
+            self.ext_ctrls_prelude(which, ctrls, ctrl_array, true)?
+        else {
+            return Ok(());
+        };
+        let values = self
+            .read_ext_values(class, ctrl_array, user_regions)
+            .map_err(|(_, e)| e)?;
+        for (ctrl, (_, value)) in ctrl_array.iter_mut().zip(values.iter()) {
+            if let Value::Int(v) = value {
+                ctrl.__bindgen_anon_1 =
+                    bindings::v4l2_ext_control__bindgen_ty_1 { value: *v as i32 };
+            }
+        }
+        self.commit_controls(session.id, values)
+    }
+
+    /// `TRY_EXT_CTRLS`: the validation of `S_EXT_CTRLS` and nothing else; `error_idx` names
+    /// the control refused.
+    fn try_ext_ctrls(
+        &mut self,
+        _session: &Self::Session,
+        which: CtrlWhich,
+        ctrls: &mut v4l2_ext_controls,
+        ctrl_array: &mut Vec<v4l2_ext_control>,
+        user_regions: Vec<Vec<SgEntry>>,
+    ) -> IoctlResult<()> {
+        let Some(ExtCtrls { class, .. }) =
+            self.ext_ctrls_prelude(which, ctrls, ctrl_array, true)?
+        else {
+            return Ok(());
+        };
+        let values = self
+            .read_ext_values(class, ctrl_array, user_regions)
+            .map_err(|(i, e)| {
+                ctrls.error_idx = i as u32;
+                e
+            })?;
+        for (ctrl, (_, value)) in ctrl_array.iter_mut().zip(values.iter()) {
+            if let Value::Int(v) = value {
+                ctrl.__bindgen_anon_1 =
+                    bindings::v4l2_ext_control__bindgen_ty_1 { value: *v as i32 };
+            }
+        }
+        Ok(())
+    }
+
+    /// `EOS` and `SOURCE_CHANGE` are accepted and never emitted (a camera has neither).
+    /// `V4L2_EVENT_CTRL` is per control id; with `SEND_INITIAL` the current value and flags go
+    /// out at once, for every control but a class (the kernel's `v4l2_ctrl_add_event`).
     fn subscribe_event(
         &mut self,
-        _session: &mut Self::Session,
+        session: &mut Self::Session,
         event: EventType,
-        _flags: SubscribeEventFlags,
+        flags: SubscribeEventFlags,
     ) -> IoctlResult<()> {
         match event {
             EventType::Eos | EventType::SourceChange(0) => Ok(()),
+            EventType::Ctrl(id) => {
+                let (is_class, write_only) = {
+                    let desc = self.controls.find(id).ok_or(libc::EINVAL)?;
+                    (desc.kind == Kind::Class, desc.is_write_only())
+                };
+                self.subscriptions
+                    .entry(session.id)
+                    .or_default()
+                    .insert(id, flags.contains(SubscribeEventFlags::ALLOW_FEEDBACK));
+                if flags.contains(SubscribeEventFlags::SEND_INITIAL) && !is_class {
+                    let mut changes = bindings::V4L2_EVENT_CTRL_CH_FLAGS;
+                    if !write_only {
+                        changes |= bindings::V4L2_EVENT_CTRL_CH_VALUE;
+                    }
+                    if let Some(desc) = self.controls.find(id) {
+                        let event = self.controls.event(desc, changes);
+                        self.evt_queue
+                            .send_event(V4l2Event::Event(SessionEvent::new(session.id, event)));
+                    }
+                }
+                Ok(())
+            }
             _ => Err(libc::EINVAL),
         }
     }
 
+    /// `V4L2_EVENT_ALL` drops every subscription of the session; a control id drops that one,
+    /// subscribed or not (the kernel answers 0 either way).
     fn unsubscribe_event(
         &mut self,
-        _session: &mut Self::Session,
+        session: &mut Self::Session,
         event: v4l2_event_subscription,
     ) -> IoctlResult<()> {
         if event.type_ == bindings::V4L2_EVENT_ALL {
+            self.subscriptions.remove(&session.id);
             return Ok(());
         }
         match EventType::try_from(&event) {
             Ok(EventType::Eos) | Ok(EventType::SourceChange(0)) => Ok(()),
+            Ok(EventType::Ctrl(id)) => {
+                if let Some(subs) = self.subscriptions.get_mut(&session.id) {
+                    subs.remove(&id);
+                }
+                Ok(())
+            }
             _ => Err(libc::EINVAL),
         }
     }
@@ -1791,8 +2390,10 @@ mod tests {
         streaming: bool,
         /// Every buffer index lent, in order, across streams.
         lent: Vec<u32>,
-        /// Controls applied to an open stream.
+        /// Controls applied to an open stream through it (`S_PARM`).
         controls: Vec<CameraControl>,
+        /// Every `CameraBackend::set_controls`, with whether a stream was open at the time.
+        backend_controls: Vec<(bool, Vec<CameraControl>)>,
         /// Host buffers the allocator was handed back while a stream was open -- the §2.5
         /// violation the ordering tests look for.
         released_while_streaming: usize,
@@ -1822,10 +2423,17 @@ mod tests {
         /// The stream refuses the loans after this many (`give_empty` answers `EIO`), which is
         /// what a backend whose capture thread has died looks like.
         refuse_lend_after: Option<usize>,
+        /// The way to the open stream's thread, for `set_controls`; `None` before the first
+        /// stream, stale (and harmlessly so: the send fails) after one closes.
+        stream_commands: Option<mpsc::Sender<FakeCommand>>,
     }
 
     enum FakeCommand {
         Lend(EmptyBuffer),
+        /// V4L2 controls, through the backend. The thread plays a small script for an AF
+        /// trigger -- the states a real scan reports, with repeats, and a lens id the camera
+        /// never listed -- so the device's throttling and lookups are exercised.
+        Controls(Vec<CameraControl>),
         Stop,
     }
 
@@ -1857,6 +2465,7 @@ mod tests {
             request: StreamRequest,
             sink: CaptureSink,
         ) -> Result<FakeStream, i32> {
+            let (width, height) = (request.width, request.height);
             self.log.lock().unwrap().opened.push(request);
             if let Some(errno) = self.fail_open {
                 return Err(errno);
@@ -1868,12 +2477,53 @@ mod tests {
             let thread_log = Arc::clone(&self.log);
             let disconnect_after = self.disconnect_after;
             let hold_from = self.hold_from;
-            let (width, height) = (request.width, request.height);
             let thread = thread::spawn(move || {
                 let mut sequence = 0u32;
                 for command in rx {
                     let buffer = match command {
                         FakeCommand::Lend(buffer) => buffer,
+                        FakeCommand::Controls(controls) => {
+                            for control in controls {
+                                let script: &[CameraEvent] = match control {
+                                    CameraControl::AfTrigger(AfTrigger::Start) => &[
+                                        CameraEvent::Control(CameraControl::AfStatus(
+                                            AF_STATUS_BUSY,
+                                        )),
+                                        CameraEvent::Control(CameraControl::AeState(
+                                            AeState::Searching,
+                                        )),
+                                        CameraEvent::Control(CameraControl::AfStatus(
+                                            AF_STATUS_REACHED,
+                                        )),
+                                        CameraEvent::Control(CameraControl::AfStatus(
+                                            AF_STATUS_REACHED,
+                                        )),
+                                        CameraEvent::Control(CameraControl::ActivePhysicalId(
+                                            "4".into(),
+                                        )),
+                                        CameraEvent::Control(CameraControl::ActivePhysicalId(
+                                            "4".into(),
+                                        )),
+                                        CameraEvent::Control(CameraControl::ActivePhysicalId(
+                                            "nope".into(),
+                                        )),
+                                    ],
+                                    CameraControl::AfTrigger(AfTrigger::Cancel) => {
+                                        &[CameraEvent::Control(CameraControl::AfStatus(
+                                            AF_STATUS_IDLE,
+                                        ))]
+                                    }
+                                    _ => &[],
+                                };
+                                for event in script {
+                                    let _ = events_tx.send(event.clone());
+                                }
+                                if !script.is_empty() {
+                                    sink.signal();
+                                }
+                            }
+                            continue;
+                        }
                         FakeCommand::Stop => break,
                     };
                     thread_log.lock().unwrap().lent.push(buffer.index);
@@ -1924,6 +2574,7 @@ mod tests {
                 }
             });
             self.log.lock().unwrap().streaming = true;
+            self.stream_commands = Some(commands.clone());
             Ok(FakeStream {
                 commands,
                 filled,
@@ -1933,6 +2584,19 @@ mod tests {
                 lends: 0,
                 refuse_lend_after: self.refuse_lend_after,
             })
+        }
+
+        fn set_controls(&mut self, controls: &[CameraControl]) -> Result<(), i32> {
+            {
+                let mut log = self.log.lock().unwrap();
+                let streaming = log.streaming;
+                log.backend_controls.push((streaming, controls.to_vec()));
+            }
+            if let Some(commands) = &self.stream_commands {
+                // A closed stream's thread is gone: nothing to apply to, not an error.
+                let _ = commands.send(FakeCommand::Controls(controls.to_vec()));
+            }
+            Ok(())
         }
     }
 
@@ -2060,6 +2724,70 @@ mod tests {
                 },
             ],
             fps_ranges: vec![(15, 15), (7, 30), (15, 30), (30, 30), (24, 24), (60, 60)],
+            // The 5566 back camera's controls, near enough: 0.67x-20x zoom, every AF mode, a
+            // flash, manual exposure from 85 µs to 1 s, ISO 100-16000, ±4 EV in sixths.
+            zoom_range: Some((67, 2000)),
+            af_modes: vec![
+                AfMode::Off,
+                AfMode::Auto,
+                AfMode::Macro,
+                AfMode::ContinuousVideo,
+                AfMode::ContinuousPicture,
+            ],
+            flash: true,
+            ae_modes: vec![
+                AeMode::Off,
+                AeMode::On,
+                AeMode::OnAutoFlash,
+                AeMode::OnAlwaysFlash,
+            ],
+            exposure_range_ns: Some((85_000, 1_000_000_000)),
+            iso_range: Some((100, 16_000)),
+            exposure_bias: Some(ExposureBias {
+                min: -24,
+                max: 24,
+                step_num: 1,
+                step_den: 6,
+            }),
+            awb_modes: vec![
+                WhiteBalance::Auto,
+                WhiteBalance::Incandescent,
+                WhiteBalance::Fluorescent,
+                WhiteBalance::FluorescentH,
+                WhiteBalance::Daylight,
+                WhiteBalance::Cloudy,
+                WhiteBalance::Horizon,
+                WhiteBalance::Shade,
+            ],
+            antibanding: vec![
+                PowerLine::Disabled,
+                PowerLine::Hz50,
+                PowerLine::Hz60,
+                PowerLine::Auto,
+            ],
+            effects: vec![
+                ColorEffect::None,
+                ColorEffect::BlackWhite,
+                ColorEffect::Negative,
+                ColorEffect::Sepia,
+                ColorEffect::Aqua,
+                ColorEffect::Solarization,
+            ],
+            scenes: vec![
+                SceneMode::None,
+                SceneMode::Portrait,
+                SceneMode::Landscape,
+                SceneMode::Night,
+                SceneMode::Sports,
+                SceneMode::Fireworks,
+            ],
+            stabilization: true,
+            max_regions: MaxRegions {
+                ae: 1,
+                awb: 0,
+                af: 1,
+            },
+            physical_ids: vec!["3".into(), "2".into(), "4".into()],
         }
     }
 
@@ -2107,6 +2835,7 @@ mod tests {
             disconnect_after: None,
             hold_from: None,
             refuse_lend_after: None,
+            stream_commands: None,
         }
     }
 
@@ -2537,14 +3266,10 @@ mod tests {
         {
             let log = r.log.lock().unwrap();
             assert_eq!(log.opened.len(), 1);
+            let opened = &log.opened[0];
             assert_eq!(
-                log.opened[0],
-                StreamRequest {
-                    width: 64,
-                    height: 48,
-                    fps: (7, 30),
-                    buffers: 3,
-                }
+                (opened.width, opened.height, opened.fps, opened.buffers),
+                (64, 48, (7, 30), 3)
             );
         }
         // STREAMON twice is fine and opens nothing more.
@@ -3463,6 +4188,1620 @@ mod tests {
             Some(libc::EINVAL)
         );
 
+        close(&mut r.device, s);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Controls
+    // -----------------------------------------------------------------------------------------
+
+    fn ext_controls(count: usize) -> v4l2_ext_controls {
+        v4l2_ext_controls {
+            count: count as u32,
+            error_idx: 0xdead,
+            ..Default::default()
+        }
+    }
+
+    fn ext_control(id: u32, value: i32) -> v4l2_ext_control {
+        v4l2_ext_control {
+            id,
+            size: 0,
+            reserved2: [0xdead],
+            __bindgen_anon_1: bindings::v4l2_ext_control__bindgen_ty_1 { value },
+        }
+    }
+
+    fn ext_payload(id: u32, size: u32) -> v4l2_ext_control {
+        v4l2_ext_control {
+            id,
+            size,
+            ..Default::default()
+        }
+    }
+
+    fn ctrl_value(ctrl: &v4l2_ext_control) -> i32 {
+        let union = ctrl.__bindgen_anon_1;
+        // SAFETY: every control these tests set or read is a plain one.
+        unsafe { union.value }
+    }
+
+    fn menu_name(qm: &v4l2_querymenu) -> String {
+        let union = qm.__bindgen_anon_1;
+        // SAFETY: the tests ask this only of a MENU item.
+        let name = unsafe { union.name };
+        let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        String::from_utf8_lossy(&name[..end]).into_owned()
+    }
+
+    fn menu_value(qm: &v4l2_querymenu) -> i64 {
+        let union = qm.__bindgen_anon_1;
+        // SAFETY: the tests ask this only of an INTEGER_MENU item.
+        unsafe { union.value }
+    }
+
+    fn qc_name(qc: &v4l2_query_ext_ctrl) -> String {
+        let bytes: Vec<u8> = qc
+            .name
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The `QUERY_EXT_CTRL` walk under `flags` (`V4L2_CTRL_FLAG_NEXT_*`), as v4l2-ctl and
+    /// v4l2-compliance do it.
+    fn walk(device: &mut Device, session: &Session, flags: u32) -> Vec<v4l2_query_ext_ctrl> {
+        let mut out = Vec::new();
+        let mut id = 0;
+        while let Ok(qc) = device.query_ext_ctrl_raw(session, id | flags) {
+            assert!(qc.id > id, "{:#x} after {:#x}", qc.id, id);
+            id = qc.id;
+            out.push(qc);
+        }
+        out
+    }
+
+    /// A control event as the guest would see it: which session, which control, what changed.
+    #[derive(Debug, PartialEq, Eq)]
+    struct CtrlEv {
+        session: u32,
+        id: u32,
+        changes: u32,
+        value: i64,
+        flags: u32,
+    }
+
+    fn ctrl_events(events: &[V4l2Event]) -> Vec<CtrlEv> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                V4l2Event::Event(se) if se.event().type_ == bindings::V4L2_EVENT_CTRL => {
+                    let ev = se.event();
+                    // SAFETY: a CTRL event carries `ctrl`.
+                    let ctrl = unsafe { ev.u.ctrl };
+                    let union = ctrl.__bindgen_anon_1;
+                    // SAFETY: as above.
+                    let value = unsafe { union.value64 };
+                    Some(CtrlEv {
+                        session: se.hdr.session_id(),
+                        id: ev.id,
+                        changes: ctrl.changes,
+                        value,
+                        flags: ctrl.flags,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    const NEXT: u32 = bindings::V4L2_CTRL_FLAG_NEXT_CTRL;
+    const NEXT_COMPOUND: u32 = bindings::V4L2_CTRL_FLAG_NEXT_COMPOUND;
+    const CH_VALUE: u32 = bindings::V4L2_EVENT_CTRL_CH_VALUE;
+    const CH_FLAGS: u32 = bindings::V4L2_EVENT_CTRL_CH_FLAGS;
+
+    /// The table as `v4l2-compliance` walks it: ids ascending, a class control ahead of every
+    /// class, the plain walk and the compound walk partitioning it, every control answering
+    /// by its own id and the old private aliases answering for the private integer ones; the
+    /// ranges and menus the design's conventions give a phone-shaped camera.
+    #[test]
+    fn controls_enumerate_as_v4l2_compliance_walks_them() {
+        let mut r = rig();
+        let s = session(&mut r.device);
+
+        let all = walk(&mut r.device, &s, NEXT | NEXT_COMPOUND);
+        let ids: Vec<u32> = all.iter().map(|q| q.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                bindings::V4L2_CID_USER_CLASS,
+                bindings::V4L2_CID_POWER_LINE_FREQUENCY,
+                bindings::V4L2_CID_COLORFX,
+                VCAM_CID_ACTIVE_PHYSICAL_ID,
+                VCAM_CID_AE_STATE,
+                VCAM_CID_AE_REGIONS,
+                VCAM_CID_AF_REGIONS,
+                bindings::V4L2_CID_CAMERA_CLASS,
+                bindings::V4L2_CID_EXPOSURE_AUTO,
+                bindings::V4L2_CID_EXPOSURE_ABSOLUTE,
+                bindings::V4L2_CID_FOCUS_AUTO,
+                bindings::V4L2_CID_ZOOM_ABSOLUTE,
+                bindings::V4L2_CID_AUTO_EXPOSURE_BIAS,
+                bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE,
+                bindings::V4L2_CID_IMAGE_STABILIZATION,
+                bindings::V4L2_CID_ISO_SENSITIVITY,
+                bindings::V4L2_CID_ISO_SENSITIVITY_AUTO,
+                bindings::V4L2_CID_SCENE_MODE,
+                bindings::V4L2_CID_AUTO_FOCUS_START,
+                bindings::V4L2_CID_AUTO_FOCUS_STOP,
+                bindings::V4L2_CID_AUTO_FOCUS_STATUS,
+                bindings::V4L2_CID_FLASH_CLASS,
+                bindings::V4L2_CID_FLASH_LED_MODE,
+            ]
+        );
+        // The private ids are where the design puts them, in the USER class.
+        assert_eq!(VCAM_CID_BASE, 0x0098_0900 + 0x1200);
+        assert_eq!(
+            controls::ctrl_class(VCAM_CID_AF_REGIONS),
+            bindings::V4L2_CTRL_CLASS_USER
+        );
+        assert!(controls::is_driver_private(VCAM_CID_AF_REGIONS));
+
+        // A class control per class, with the flags and zeroed range compliance checks.
+        for qc in all
+            .iter()
+            .filter(|q| q.type_ == bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_CTRL_CLASS)
+        {
+            assert_eq!(qc.id & 0xffff, 1);
+            assert_eq!(
+                qc.flags,
+                bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_WRITE_ONLY
+            );
+            assert_eq!(
+                (qc.minimum, qc.maximum, qc.step, qc.default_value),
+                (0, 0, 0, 0)
+            );
+        }
+        assert_eq!(qc_name(&all[0]), "User Controls");
+        assert_eq!(qc_name(&all[7]), "Camera Controls");
+        assert_eq!(qc_name(&all[21]), "Flash Controls");
+
+        // The plain walk and the compound walk partition the table.
+        let plain: Vec<u32> = walk(&mut r.device, &s, NEXT).iter().map(|q| q.id).collect();
+        let compound: Vec<u32> = walk(&mut r.device, &s, NEXT_COMPOUND)
+            .iter()
+            .map(|q| q.id)
+            .collect();
+        assert_eq!(plain.len(), 21);
+        assert_eq!(compound, vec![VCAM_CID_AE_REGIONS, VCAM_CID_AF_REGIONS]);
+        assert!(plain.iter().all(|id| !compound.contains(id)));
+
+        // Every control answers by its own id, and nothing else does.
+        for id in &ids {
+            assert_eq!(r.device.query_ext_ctrl_raw(&s, *id).unwrap().id, *id);
+            assert_eq!(r.device.queryctrl_raw(&s, *id).unwrap().id, *id);
+        }
+        for id in [
+            0,
+            bindings::V4L2_CID_BRIGHTNESS,
+            bindings::V4L2_CID_EXPOSURE_METERING,
+            VCAM_CID_AWB_REGIONS,
+            VCAM_CID_BASE + 15,
+        ] {
+            assert_eq!(
+                r.device.query_ext_ctrl_raw(&s, id).err(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(r.device.queryctrl_raw(&s, id).err(), Some(libc::EINVAL));
+        }
+        // The old-style private aliases: the n-th private USER-class integer control,
+        // reported under the alias, as the kernel's `find_private_ref` resolves them.
+        let alias = r
+            .device
+            .query_ext_ctrl_raw(&s, controls::V4L2_CID_PRIVATE_BASE)
+            .unwrap();
+        assert_eq!(alias.id, controls::V4L2_CID_PRIVATE_BASE);
+        assert_eq!(qc_name(&alias), "Active Physical Camera");
+        let alias = r
+            .device
+            .queryctrl_raw(&s, controls::V4L2_CID_PRIVATE_BASE + 1)
+            .unwrap();
+        assert_eq!(alias.id, controls::V4L2_CID_PRIVATE_BASE + 1);
+        assert_eq!(alias.type_, bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU);
+        // The regions are not integer controls, so the aliases stop there.
+        assert_eq!(
+            r.device
+                .query_ext_ctrl_raw(&s, controls::V4L2_CID_PRIVATE_BASE + 2)
+                .err(),
+            Some(libc::EINVAL)
+        );
+
+        // Ranges and menus, by the design's conventions.
+        let zoom = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_ZOOM_ABSOLUTE)
+            .unwrap();
+        assert_eq!(zoom.type_, bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER);
+        assert_eq!(
+            (zoom.minimum, zoom.maximum, zoom.step, zoom.default_value),
+            (67, 2000, 1, 100)
+        );
+        assert_eq!(qc_name(&zoom), "Zoom, Absolute");
+        assert_eq!(zoom.flags, 0);
+        let exposure = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_EXPOSURE_ABSOLUTE)
+            .unwrap();
+        // 85 µs .. 1 s in 100 µs units: 1 .. 10000, and inactive while AE is on.
+        assert_eq!(
+            (exposure.minimum, exposure.maximum, exposure.default_value),
+            (1, 10_000, 333)
+        );
+        assert_eq!(exposure.flags, bindings::V4L2_CTRL_FLAG_INACTIVE);
+        let iso = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_ISO_SENSITIVITY)
+            .unwrap();
+        assert_eq!(
+            iso.type_,
+            bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER_MENU
+        );
+        assert_eq!(
+            (iso.minimum, iso.maximum, iso.step, iso.default_value),
+            (0, 8, 1, 0)
+        );
+        let ladder: Vec<i64> = (0..=8)
+            .map(|i| {
+                menu_value(
+                    &r.device
+                        .querymenu(&s, bindings::V4L2_CID_ISO_SENSITIVITY, i)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ladder,
+            vec![100, 200, 400, 800, 1600, 3200, 6400, 12800, 16000]
+        );
+        assert_eq!(
+            r.device
+                .querymenu(&s, bindings::V4L2_CID_ISO_SENSITIVITY, 9)
+                .err(),
+            Some(libc::EINVAL)
+        );
+        let bias = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_AUTO_EXPOSURE_BIAS)
+            .unwrap();
+        // -24..=24 sixths of an EV: 49 items in 0.001 EV, no compensation in the middle.
+        assert_eq!(
+            (bias.minimum, bias.maximum, bias.default_value),
+            (0, 48, 24)
+        );
+        let mut item = |i| {
+            menu_value(
+                &r.device
+                    .querymenu(&s, bindings::V4L2_CID_AUTO_EXPOSURE_BIAS, i)
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            (item(0), item(24), item(25), item(48)),
+            (-4000, 0, 166, 4000)
+        );
+
+        // Menus over what the camera offers: a missing item is `EINVAL`, the default is the
+        // conventional one when offered.
+        let power = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_POWER_LINE_FREQUENCY)
+            .unwrap();
+        assert_eq!(
+            (power.minimum, power.maximum, power.default_value),
+            (0, 3, 3)
+        );
+        assert_eq!(
+            menu_name(
+                &r.device
+                    .querymenu(&s, bindings::V4L2_CID_POWER_LINE_FREQUENCY, 1)
+                    .unwrap()
+            ),
+            "50 Hz"
+        );
+        let fx = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_COLORFX)
+            .unwrap();
+        assert_eq!((fx.minimum, fx.maximum, fx.default_value), (0, 13, 0));
+        let offered: Vec<u32> = (0..=13)
+            .filter(|&i| {
+                r.device
+                    .querymenu(&s, bindings::V4L2_CID_COLORFX, i)
+                    .is_ok()
+            })
+            .collect();
+        assert_eq!(offered, vec![0, 1, 2, 3, 10, 13]);
+        assert_eq!(
+            menu_name(
+                &r.device
+                    .querymenu(&s, bindings::V4L2_CID_COLORFX, 13)
+                    .unwrap()
+            ),
+            "Solarization"
+        );
+        let flash = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_FLASH_LED_MODE)
+            .unwrap();
+        assert_eq!(
+            (flash.minimum, flash.maximum, flash.default_value),
+            (0, 2, 0)
+        );
+        assert_eq!(
+            menu_name(
+                &r.device
+                    .querymenu(&s, bindings::V4L2_CID_FLASH_LED_MODE, 2)
+                    .unwrap()
+            ),
+            "Torch"
+        );
+        // `Flash` is the skipped item.
+        assert_eq!(
+            r.device
+                .querymenu(&s, bindings::V4L2_CID_FLASH_LED_MODE, 1)
+                .err(),
+            Some(libc::EINVAL)
+        );
+        let wb = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE)
+            .unwrap();
+        assert_eq!((wb.minimum, wb.maximum, wb.default_value), (0, 9, 1));
+        let offered: Vec<u32> = (0..=9)
+            .filter(|&i| {
+                r.device
+                    .querymenu(&s, bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE, i)
+                    .is_ok()
+            })
+            .collect();
+        assert_eq!(offered, vec![1, 2, 3, 4, 5, 6, 8, 9]);
+        let scene = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_SCENE_MODE)
+            .unwrap();
+        assert_eq!(
+            (scene.minimum, scene.maximum, scene.default_value),
+            (0, 11, 0)
+        );
+        let offered: Vec<u32> = (0..=11)
+            .filter(|&i| {
+                r.device
+                    .querymenu(&s, bindings::V4L2_CID_SCENE_MODE, i)
+                    .is_ok()
+            })
+            .collect();
+        assert_eq!(offered, vec![0, 6, 7, 8, 10, 11]);
+        let ae_state = r.device.query_ext_ctrl_raw(&s, VCAM_CID_AE_STATE).unwrap();
+        assert_eq!(
+            ae_state.flags,
+            bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE
+        );
+        assert_eq!(
+            menu_name(&r.device.querymenu(&s, VCAM_CID_AE_STATE, 4).unwrap()),
+            "Flash Required"
+        );
+        let lens = r
+            .device
+            .query_ext_ctrl_raw(&s, VCAM_CID_ACTIVE_PHYSICAL_ID)
+            .unwrap();
+        assert_eq!((lens.minimum, lens.maximum), (0, 2));
+        let lenses: Vec<i64> = (0..=2)
+            .map(|i| {
+                menu_value(
+                    &r.device
+                        .querymenu(&s, VCAM_CID_ACTIVE_PHYSICAL_ID, i)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(lenses, vec![3, 2, 4]);
+        // Not a menu.
+        assert_eq!(
+            r.device
+                .querymenu(&s, bindings::V4L2_CID_ZOOM_ABSOLUTE, 0)
+                .err(),
+            Some(libc::EINVAL)
+        );
+
+        // The buttons, the status, and the regions' shape.
+        let start = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_AUTO_FOCUS_START)
+            .unwrap();
+        assert_eq!(start.type_, bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_BUTTON);
+        assert_eq!(
+            start.flags,
+            bindings::V4L2_CTRL_FLAG_WRITE_ONLY | bindings::V4L2_CTRL_FLAG_EXECUTE_ON_WRITE
+        );
+        let status = r
+            .device
+            .query_ext_ctrl_raw(&s, bindings::V4L2_CID_AUTO_FOCUS_STATUS)
+            .unwrap();
+        assert_eq!(
+            status.type_,
+            bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_BITMASK
+        );
+        assert_eq!((status.minimum, status.maximum, status.step), (0, 7, 0));
+        assert_eq!(
+            status.flags,
+            bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE
+        );
+        let regions = r
+            .device
+            .query_ext_ctrl_raw(&s, VCAM_CID_AF_REGIONS)
+            .unwrap();
+        assert_eq!(regions.type_, bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_U32);
+        assert_eq!(regions.flags, bindings::V4L2_CTRL_FLAG_HAS_PAYLOAD);
+        assert_eq!(
+            (regions.elem_size, regions.elems, regions.nr_of_dims),
+            (4, 5, 2)
+        );
+        assert_eq!(&regions.dims[..2], &[1, 5]);
+        assert_eq!((regions.minimum, regions.maximum), (0, REGION_SCALE as i64));
+        assert_eq!(qc_name(&regions), "Auto Focus, Regions");
+        // `QUERYCTRL` cannot carry a compound range and zeroes it, as the kernel does.
+        let old = r.device.queryctrl_raw(&s, VCAM_CID_AF_REGIONS).unwrap();
+        assert_eq!(
+            (old.minimum, old.maximum, old.step, old.default_value),
+            (0, 0, 0, 0)
+        );
+        let old = r
+            .device
+            .queryctrl_raw(&s, bindings::V4L2_CID_ZOOM_ABSOLUTE)
+            .unwrap();
+        assert_eq!(
+            (old.minimum, old.maximum, old.step, old.default_value),
+            (67, 2000, 1, 100)
+        );
+        assert!(old.name.starts_with(b"Zoom, Absolute\0"));
+
+        // The wiring: the guest's id word, flags included, reaches the device through the
+        // dispatcher's `_raw` path.
+        let mut input = vec![0u8; std::mem::size_of::<v4l2_query_ext_ctrl>()];
+        input[..4].copy_from_slice(&(NEXT | NEXT_COMPOUND).to_le_bytes());
+        let mut out = Vec::new();
+        let mut other = session(&mut r.device);
+        <Device as VirtioMediaDevice<&[u8], Vec<u8>>>::do_ioctl(
+            &mut r.device,
+            &mut other,
+            crate::protocol::V4l2Ioctl::VIDIOC_QUERY_EXT_CTRL,
+            &mut input.as_slice(),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(i32::from_le_bytes(out[0..4].try_into().unwrap()), 0);
+        assert_eq!(
+            u32::from_le_bytes(out[8..12].try_into().unwrap()),
+            bindings::V4L2_CID_USER_CLASS
+        );
+
+        close(&mut r.device, s);
+    }
+
+    /// Set and get: a mixed-class `S_EXT_CTRLS` is validated as a whole and handed to the camera
+    /// in one call, a value set again is not; `G_EXT_CTRLS` and `G_CTRL` read it back; what is
+    /// set with no stream open is applied when one opens, and what is set while one runs
+    /// reaches it; `S_PARM` keeps its own path.
+    #[test]
+    fn controls_round_trip_and_reach_the_camera() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+
+        let mut ctrls = ext_controls(4);
+        let mut array = vec![
+            ext_control(bindings::V4L2_CID_ZOOM_ABSOLUTE, 300),
+            ext_control(
+                bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE,
+                WhiteBalance::Daylight as i32,
+            ),
+            ext_control(
+                bindings::V4L2_CID_POWER_LINE_FREQUENCY,
+                PowerLine::Hz50 as i32,
+            ),
+            ext_control(bindings::V4L2_CID_FLASH_LED_MODE, FlashLed::Torch as i32),
+        ];
+        r.device
+            .s_ext_ctrls(&mut s, CtrlWhich::Current, &mut ctrls, &mut array, vec![])
+            .unwrap();
+        assert_eq!(ctrls.error_idx, 4);
+        assert_eq!(ctrls.reserved, [0]);
+        assert!(array.iter().all(|c| {
+            let reserved = c.reserved2;
+            reserved == [0]
+        }));
+        {
+            let log = r.log.lock().unwrap();
+            assert_eq!(
+                log.backend_controls,
+                vec![(
+                    false,
+                    vec![
+                        CameraControl::Zoom(300),
+                        CameraControl::WhiteBalance(WhiteBalance::Daylight),
+                        CameraControl::PowerLine(PowerLine::Hz50),
+                        CameraControl::FlashLed(FlashLed::Torch),
+                    ]
+                )]
+            );
+        }
+        // Read back, both ways.
+        let mut ctrls = ext_controls(2);
+        let mut array = vec![
+            ext_control(bindings::V4L2_CID_ZOOM_ABSOLUTE, 0),
+            ext_control(bindings::V4L2_CID_FLASH_LED_MODE, 0),
+        ];
+        r.device
+            .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![])
+            .unwrap();
+        assert_eq!(ctrl_value(&array[0]), 300);
+        assert_eq!(ctrl_value(&array[1]), FlashLed::Torch as i32);
+        assert_eq!(
+            r.device
+                .g_ctrl(&s, bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE)
+                .unwrap()
+                .value,
+            WhiteBalance::Daylight as i32
+        );
+        // The same values again change nothing and reach nobody.
+        let mut ctrls = ext_controls(1);
+        let mut array = vec![ext_control(bindings::V4L2_CID_ZOOM_ABSOLUTE, 300)];
+        r.device
+            .s_ext_ctrls(&mut s, CtrlWhich::Current, &mut ctrls, &mut array, vec![])
+            .unwrap();
+        assert_eq!(r.log.lock().unwrap().backend_controls.len(), 1);
+
+        // `which` as a class: every control must be in it.
+        let mut ctrls = ext_controls(2);
+        let mut array = vec![
+            ext_control(bindings::V4L2_CID_ZOOM_ABSOLUTE, 310),
+            ext_control(bindings::V4L2_CID_POWER_LINE_FREQUENCY, 2),
+        ];
+        assert_eq!(
+            r.device.s_ext_ctrls(
+                &mut s,
+                CtrlWhich::Class(bindings::V4L2_CTRL_CLASS_CAMERA),
+                &mut ctrls,
+                &mut array,
+                vec![]
+            ),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(ctrls.error_idx, 2);
+        assert_eq!(
+            r.device
+                .g_ctrl(&s, bindings::V4L2_CID_ZOOM_ABSOLUTE)
+                .unwrap()
+                .value,
+            300,
+            "nothing of a refused set is applied"
+        );
+        let mut ctrls = ext_controls(1);
+        let mut array = vec![ext_control(bindings::V4L2_CID_ZOOM_ABSOLUTE, 310)];
+        r.device
+            .s_ext_ctrls(
+                &mut s,
+                CtrlWhich::Class(bindings::V4L2_CTRL_CLASS_CAMERA),
+                &mut ctrls,
+                &mut array,
+                vec![],
+            )
+            .unwrap();
+        // `count == 0` asks whether the class exists.
+        let mut none = ext_controls(0);
+        r.device
+            .g_ext_ctrls(
+                &s,
+                CtrlWhich::Class(bindings::V4L2_CTRL_CLASS_FLASH),
+                &mut none,
+                &mut vec![],
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(none.error_idx, 0);
+        assert_eq!(
+            r.device.g_ext_ctrls(
+                &s,
+                CtrlWhich::Class(bindings::V4L2_CTRL_CLASS_CODEC),
+                &mut none,
+                &mut vec![],
+                vec![]
+            ),
+            Err(libc::EINVAL)
+        );
+
+        // The plain ioctls: a class control, a button, a payload control, the read-only
+        // status, an unknown id.
+        assert_eq!(
+            r.device.g_ctrl(&s, bindings::V4L2_CID_CAMERA_CLASS).err(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            r.device
+                .g_ctrl(&s, bindings::V4L2_CID_AUTO_FOCUS_START)
+                .err(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(
+            r.device.g_ctrl(&s, VCAM_CID_AF_REGIONS).err(),
+            Some(libc::EINVAL)
+        );
+        assert_eq!(
+            r.device
+                .s_ctrl(&mut s, bindings::V4L2_CID_AUTO_FOCUS_STATUS, 0)
+                .err(),
+            Some(libc::EACCES)
+        );
+        assert_eq!(r.device.g_ctrl(&s, 0).err(), Some(libc::EINVAL));
+        assert_eq!(r.device.s_ctrl(&mut s, 0, 0).err(), Some(libc::EINVAL));
+        // A menu's value is its index: the ISO and the bias reach the camera as numbers.
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_ISO_SENSITIVITY, 3)
+            .unwrap();
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_AUTO_EXPOSURE_BIAS, 30)
+            .unwrap();
+        // A boolean is normalised, and only a change is sent.
+        assert_eq!(
+            r.device
+                .s_ctrl(&mut s, bindings::V4L2_CID_FOCUS_AUTO, 0)
+                .unwrap()
+                .value,
+            0
+        );
+        assert_eq!(
+            r.device
+                .s_ctrl(&mut s, bindings::V4L2_CID_FOCUS_AUTO, 7)
+                .unwrap()
+                .value,
+            1
+        );
+        {
+            let log = r.log.lock().unwrap();
+            let sent: Vec<CameraControl> = log
+                .backend_controls
+                .iter()
+                .flat_map(|(_, c)| c.clone())
+                .collect();
+            assert!(sent.contains(&CameraControl::Iso(800)));
+            assert!(sent.contains(&CameraControl::ExposureBias(6)));
+            assert!(sent.contains(&CameraControl::FocusAuto(false)));
+            assert!(sent.ends_with(&[CameraControl::FocusAuto(true)]));
+            assert!(log.backend_controls.iter().all(|(streaming, _)| !streaming));
+        }
+        // Manual exposure: either switch turns the auto off, and the manual values become
+        // active.
+        r.device
+            .s_ctrl(
+                &mut s,
+                bindings::V4L2_CID_EXPOSURE_AUTO,
+                ExposureMode::Manual as i32,
+            )
+            .unwrap();
+        assert_eq!(
+            r.device
+                .query_ext_ctrl_raw(&s, bindings::V4L2_CID_EXPOSURE_ABSOLUTE)
+                .unwrap()
+                .flags,
+            0
+        );
+        assert_eq!(
+            r.device
+                .query_ext_ctrl_raw(&s, bindings::V4L2_CID_ISO_SENSITIVITY)
+                .unwrap()
+                .flags,
+            0
+        );
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_EXPOSURE_ABSOLUTE, 500)
+            .unwrap();
+        r.device
+            .s_ctrl(
+                &mut s,
+                bindings::V4L2_CID_EXPOSURE_AUTO,
+                ExposureMode::Auto as i32,
+            )
+            .unwrap();
+        assert_eq!(
+            r.device
+                .query_ext_ctrl_raw(&s, bindings::V4L2_CID_EXPOSURE_ABSOLUTE)
+                .unwrap()
+                .flags,
+            bindings::V4L2_CTRL_FLAG_INACTIVE
+        );
+        r.device
+            .s_ctrl(
+                &mut s,
+                bindings::V4L2_CID_ISO_SENSITIVITY_AUTO,
+                IsoMode::Manual as i32,
+            )
+            .unwrap();
+        assert_eq!(
+            r.device
+                .query_ext_ctrl_raw(&s, bindings::V4L2_CID_EXPOSURE_ABSOLUTE)
+                .unwrap()
+                .flags,
+            0
+        );
+
+        // Everything set so far opens the stream.
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
+            .unwrap();
+        r.device
+            .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+            .unwrap();
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        {
+            let log = r.log.lock().unwrap();
+            let opened = &log.opened[0].controls;
+            for expected in [
+                CameraControl::Zoom(310),
+                CameraControl::WhiteBalance(WhiteBalance::Daylight),
+                CameraControl::PowerLine(PowerLine::Hz50),
+                CameraControl::FlashLed(FlashLed::Torch),
+                CameraControl::Iso(800),
+                CameraControl::ExposureBias(6),
+                CameraControl::FocusAuto(true),
+                CameraControl::ExposureMode(ExposureMode::Auto),
+                CameraControl::IsoMode(IsoMode::Manual),
+                CameraControl::ExposureTime(500),
+                CameraControl::ColorEffect(ColorEffect::None),
+                CameraControl::SceneMode(SceneMode::None),
+                CameraControl::Stabilization(false),
+                CameraControl::AeRegions(vec![Region::default()]),
+                CameraControl::AfRegions(vec![Region::default()]),
+            ] {
+                assert!(
+                    opened.contains(&expected),
+                    "{:?} missing from {:?}",
+                    expected,
+                    opened
+                );
+            }
+            assert!(!opened
+                .iter()
+                .any(|c| matches!(c, CameraControl::AfTrigger(_) | CameraControl::AfStatus(_))));
+        }
+        let _ = collect_frames(&mut r, &mut s, 1);
+        // While streaming, a set reaches the running camera.
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_ZOOM_ABSOLUTE, 150)
+            .unwrap();
+        assert_eq!(
+            r.log.lock().unwrap().backend_controls.last().unwrap(),
+            &(true, vec![CameraControl::Zoom(150)])
+        );
+        assert_eq!(
+            r.device
+                .g_ctrl(&s, bindings::V4L2_CID_ZOOM_ABSOLUTE)
+                .unwrap()
+                .value,
+            150
+        );
+        // `S_PARM` still goes through the stream, not the backend.
+        let before = r.log.lock().unwrap().backend_controls.len();
+        r.device.s_parm(&mut s, parm_for((1, 15))).unwrap();
+        {
+            let log = r.log.lock().unwrap();
+            assert_eq!(log.controls, vec![CameraControl::FpsRange(15, 15)]);
+            assert_eq!(log.backend_controls.len(), before);
+        }
+        r.device.streamoff(&mut s, QUEUE).unwrap();
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_ZOOM_ABSOLUTE, 200)
+            .unwrap();
+        assert_eq!(
+            r.log.lock().unwrap().backend_controls.last().unwrap(),
+            &(false, vec![CameraControl::Zoom(200)])
+        );
+
+        close(&mut r.device, s);
+    }
+
+    /// `TRY_EXT_CTRLS` refuses what `S_EXT_CTRLS` would -- out of range, a missing menu item, a
+    /// read-only control, the defaults, an unknown id -- naming the control, and changes
+    /// nothing; a set that is refused applies none of it.
+    #[test]
+    fn try_ext_ctrls_refuses_out_of_range_and_changes_nothing() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+
+        let mut ctrls = ext_controls(2);
+        let mut array = vec![
+            ext_control(
+                bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE,
+                WhiteBalance::Daylight as i32,
+            ),
+            ext_control(bindings::V4L2_CID_ZOOM_ABSOLUTE, 2001),
+        ];
+        assert_eq!(
+            r.device
+                .try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::ERANGE)
+        );
+        assert_eq!(ctrls.error_idx, 1, "the control refused");
+        assert_eq!(
+            r.device
+                .s_ext_ctrls(&mut s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::ERANGE)
+        );
+        assert_eq!(ctrls.error_idx, 2, "a set fails as a whole");
+        assert_eq!(
+            r.device
+                .g_ctrl(&s, bindings::V4L2_CID_AUTO_N_PRESET_WHITE_BALANCE)
+                .unwrap()
+                .value,
+            WhiteBalance::Auto as i32,
+            "the valid half was not applied either"
+        );
+        assert!(r.log.lock().unwrap().backend_controls.is_empty());
+        // Below the minimum, through `S_CTRL`.
+        assert_eq!(
+            r.device
+                .s_ctrl(&mut s, bindings::V4L2_CID_ZOOM_ABSOLUTE, 66)
+                .err(),
+            Some(libc::ERANGE)
+        );
+        // A menu index past the end is out of range; an item the camera lacks is invalid.
+        assert_eq!(
+            r.device
+                .s_ctrl(&mut s, bindings::V4L2_CID_POWER_LINE_FREQUENCY, 4)
+                .err(),
+            Some(libc::ERANGE)
+        );
+        let mut ctrls = ext_controls(1);
+        let mut array = vec![ext_control(
+            bindings::V4L2_CID_FLASH_LED_MODE,
+            FlashLed::Flash as i32,
+        )];
+        assert_eq!(
+            r.device
+                .try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(ctrls.error_idx, 0);
+        // Read-only: `EACCES`, at the control for a try and at `count` for a set.
+        let mut ctrls = ext_controls(1);
+        let mut array = vec![ext_control(bindings::V4L2_CID_AUTO_FOCUS_STATUS, 0)];
+        assert_eq!(
+            r.device
+                .try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EACCES)
+        );
+        assert_eq!(ctrls.error_idx, 0);
+        assert_eq!(
+            r.device
+                .s_ext_ctrls(&mut s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EACCES)
+        );
+        assert_eq!(ctrls.error_idx, 1);
+        // A class control can be neither read (write-only) nor written (read-only).
+        let mut array = vec![ext_control(bindings::V4L2_CID_CAMERA_CLASS, 0)];
+        assert_eq!(
+            r.device
+                .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EACCES)
+        );
+        assert_eq!(ctrls.error_idx, 1);
+        assert_eq!(
+            r.device
+                .try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EACCES)
+        );
+        // A button cannot be read.
+        let mut array = vec![ext_control(bindings::V4L2_CID_AUTO_FOCUS_START, 0)];
+        assert_eq!(
+            r.device
+                .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EACCES)
+        );
+        // A try normalises what a set would store, and stores nothing.
+        let mut array = vec![ext_control(bindings::V4L2_CID_FOCUS_AUTO, 5)];
+        r.device
+            .try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![])
+            .unwrap();
+        assert_eq!(ctrl_value(&array[0]), 1);
+        assert!(r.log.lock().unwrap().backend_controls.is_empty());
+        // The defaults can be read, not set or tried.
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_ZOOM_ABSOLUTE, 300)
+            .unwrap();
+        let mut array = vec![ext_control(bindings::V4L2_CID_ZOOM_ABSOLUTE, 0)];
+        r.device
+            .g_ext_ctrls(&s, CtrlWhich::Default, &mut ctrls, &mut array, vec![])
+            .unwrap();
+        assert_eq!(ctrl_value(&array[0]), 100);
+        r.device
+            .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![])
+            .unwrap();
+        assert_eq!(ctrl_value(&array[0]), 300);
+        assert_eq!(
+            r.device
+                .s_ext_ctrls(&mut s, CtrlWhich::Default, &mut ctrls, &mut array, vec![]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            r.device
+                .try_ext_ctrls(&s, CtrlWhich::Default, &mut ctrls, &mut array, vec![]),
+            Err(libc::EINVAL)
+        );
+        // `count == 0` is fine; id 0 is not, with the error index the kernel gives.
+        let mut none = ext_controls(0);
+        r.device
+            .try_ext_ctrls(&s, CtrlWhich::Current, &mut none, &mut vec![], vec![])
+            .unwrap();
+        assert_eq!((none.count, none.error_idx), (0, 0));
+        let mut ctrls = ext_controls(1);
+        let mut array = vec![ext_control(0, 0)];
+        assert_eq!(
+            r.device
+                .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(ctrls.error_idx, 1);
+        assert_eq!(
+            r.device
+                .try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(ctrls.error_idx, 0);
+        assert_eq!(
+            r.device
+                .s_ext_ctrls(&mut s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(ctrls.error_idx, 1);
+        // An old-style private id is for `G_CTRL`/`S_CTRL` only.
+        let mut array = vec![ext_control(controls::V4L2_CID_PRIVATE_BASE, 0)];
+        assert_eq!(
+            r.device
+                .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::EINVAL)
+        );
+
+        close(&mut r.device, s);
+    }
+
+    /// The autofocus buttons reach the camera every time they are pressed, and what the camera
+    /// reports back -- the focus state, the exposure state, the lens in use -- becomes a
+    /// `V4L2_EVENT_CTRL` only when it differs from what the guest was last told: the fake
+    /// reports each state twice and a lens the camera never listed.
+    #[test]
+    fn an_af_trigger_produces_status_events_only_on_change() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        for id in [
+            bindings::V4L2_CID_AUTO_FOCUS_STATUS,
+            VCAM_CID_AE_STATE,
+            VCAM_CID_ACTIVE_PHYSICAL_ID,
+        ] {
+            r.device
+                .subscribe_event(&mut s, EventType::Ctrl(id), SubscribeEventFlags::empty())
+                .unwrap();
+        }
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
+            .unwrap();
+        r.device
+            .qbuf(&mut s, mmap_buffer(0, 64 * 48 * 3 / 2), vec![], true)
+            .unwrap();
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        let _ = collect_frames(&mut r, &mut s, 1);
+
+        // A button is a press, not a value: the camera hears every one.
+        for _ in 0..2 {
+            r.device
+                .s_ctrl(&mut s, bindings::V4L2_CID_AUTO_FOCUS_START, 0)
+                .unwrap();
+        }
+        let sent: Vec<CameraControl> = r
+            .log
+            .lock()
+            .unwrap()
+            .backend_controls
+            .iter()
+            .flat_map(|(_, c)| c.clone())
+            .collect();
+        assert_eq!(
+            sent.iter()
+                .filter(|c| **c == CameraControl::AfTrigger(AfTrigger::Start))
+                .count(),
+            2
+        );
+        // Seven reports per press. The first press is four changes; the second repeats the
+        // exposure state and the lens, which are no events, and scans again -- busy, then
+        // reached -- which are two.
+        while ctrl_events(&r.events.borrow()).len() < 6 {
+            assert!(wait_ready(&s), "no event within 2s");
+            process(&mut r.device, &mut s);
+        }
+        process(&mut r.device, &mut s);
+        let events = ctrl_events(&r.events.borrow());
+        assert_eq!(events.len(), 6, "{events:?}");
+        assert_eq!(
+            events[0],
+            CtrlEv {
+                session: 0,
+                id: bindings::V4L2_CID_AUTO_FOCUS_STATUS,
+                changes: CH_VALUE,
+                value: AF_STATUS_BUSY as i64,
+                flags: bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE,
+            }
+        );
+        assert_eq!(
+            (events[1].id, events[1].value),
+            (VCAM_CID_AE_STATE, AeState::Searching as i64)
+        );
+        assert_eq!(
+            (events[2].id, events[2].value),
+            (
+                bindings::V4L2_CID_AUTO_FOCUS_STATUS,
+                AF_STATUS_REACHED as i64
+            )
+        );
+        // Lens "4" is the third physical id.
+        assert_eq!(
+            (events[3].id, events[3].value),
+            (VCAM_CID_ACTIVE_PHYSICAL_ID, 2)
+        );
+        assert_eq!(
+            (events[4].id, events[4].value, events[5].value),
+            (
+                bindings::V4L2_CID_AUTO_FOCUS_STATUS,
+                AF_STATUS_BUSY as i64,
+                AF_STATUS_REACHED as i64
+            )
+        );
+        // The volatile controls read what was last reported.
+        assert_eq!(
+            r.device
+                .g_ctrl(&s, bindings::V4L2_CID_AUTO_FOCUS_STATUS)
+                .unwrap()
+                .value,
+            AF_STATUS_REACHED as i32
+        );
+        assert_eq!(
+            r.device
+                .g_ctrl(&s, VCAM_CID_ACTIVE_PHYSICAL_ID)
+                .unwrap()
+                .value,
+            2
+        );
+        assert_eq!(
+            menu_value(
+                &r.device
+                    .querymenu(&s, VCAM_CID_ACTIVE_PHYSICAL_ID, 2)
+                    .unwrap()
+            ),
+            4
+        );
+        // A cancel reports idle, which is a change again.
+        r.device
+            .s_ctrl(&mut s, bindings::V4L2_CID_AUTO_FOCUS_STOP, 0)
+            .unwrap();
+        while ctrl_events(&r.events.borrow()).len() < 7 {
+            assert!(wait_ready(&s), "no event within 2s");
+            process(&mut r.device, &mut s);
+        }
+        let events = ctrl_events(&r.events.borrow());
+        assert_eq!(
+            (events[6].id, events[6].value),
+            (bindings::V4L2_CID_AUTO_FOCUS_STATUS, AF_STATUS_IDLE as i64)
+        );
+        // And the session is still streaming: reports are not errors.
+        assert!(!s.dead);
+        assert_eq!(errors(&r.events.borrow()), 0);
+
+        close(&mut r.device, s);
+    }
+
+    /// `V4L2_EVENT_CTRL` subscriptions are per session: an initial event on request (never for
+    /// a class), a value set by one session announced to the others (and to itself only with
+    /// feedback), a flag change announced to all, `V4L2_EVENT_ALL` dropping everything.
+    #[test]
+    fn control_events_go_to_subscribed_sessions() {
+        let mut r = rig();
+        let mut a = session(&mut r.device);
+        let mut b =
+            <Device as VirtioMediaDevice<&[u8], Vec<u8>>>::new_session(&mut r.device, 1).unwrap();
+        let zoom = bindings::V4L2_CID_ZOOM_ABSOLUTE;
+
+        // The initial event: the current value, the flags and the range.
+        r.device
+            .subscribe_event(
+                &mut b,
+                EventType::Ctrl(zoom),
+                SubscribeEventFlags::SEND_INITIAL,
+            )
+            .unwrap();
+        let events = ctrl_events(&r.events.borrow());
+        assert_eq!(
+            events,
+            vec![CtrlEv {
+                session: 1,
+                id: zoom,
+                changes: CH_FLAGS | CH_VALUE,
+                value: 100,
+                flags: 0,
+            }]
+        );
+        {
+            let events = r.events.borrow();
+            let V4l2Event::Event(se) = &events[0] else {
+                panic!("not a session event");
+            };
+            // SAFETY: a CTRL event.
+            let ctrl = unsafe { se.event().u.ctrl };
+            assert_eq!(
+                (
+                    ctrl.type_,
+                    ctrl.minimum,
+                    ctrl.maximum,
+                    ctrl.step,
+                    ctrl.default_value
+                ),
+                (
+                    bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER,
+                    67,
+                    2000,
+                    1,
+                    100
+                )
+            );
+        }
+        // A class control has no value to send; a button's initial event carries no value.
+        r.device
+            .subscribe_event(
+                &mut a,
+                EventType::Ctrl(bindings::V4L2_CID_CAMERA_CLASS),
+                SubscribeEventFlags::SEND_INITIAL,
+            )
+            .unwrap();
+        assert_eq!(ctrl_events(&r.events.borrow()).len(), 1);
+        r.device
+            .subscribe_event(
+                &mut a,
+                EventType::Ctrl(bindings::V4L2_CID_AUTO_FOCUS_START),
+                SubscribeEventFlags::SEND_INITIAL,
+            )
+            .unwrap();
+        assert_eq!(
+            ctrl_events(&r.events.borrow()).last().unwrap().changes,
+            CH_FLAGS
+        );
+        // What cannot be subscribed to.
+        assert_eq!(
+            r.device
+                .subscribe_event(&mut a, EventType::Ctrl(0), SubscribeEventFlags::empty()),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            r.device.subscribe_event(
+                &mut a,
+                EventType::Ctrl(bindings::V4L2_CID_BRIGHTNESS),
+                SubscribeEventFlags::empty()
+            ),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            r.device
+                .subscribe_event(&mut a, EventType::VSync, SubscribeEventFlags::empty()),
+            Err(libc::EINVAL)
+        );
+
+        // A sets zoom: B hears, A does not.
+        r.device
+            .subscribe_event(&mut a, EventType::Ctrl(zoom), SubscribeEventFlags::empty())
+            .unwrap();
+        let before = ctrl_events(&r.events.borrow()).len();
+        r.device.s_ctrl(&mut a, zoom, 150).unwrap();
+        let events = ctrl_events(&r.events.borrow());
+        assert_eq!(
+            &events[before..],
+            &[CtrlEv {
+                session: 1,
+                id: zoom,
+                changes: CH_VALUE,
+                value: 150,
+                flags: 0,
+            }]
+        );
+        // With feedback, A hears its own set too.
+        r.device
+            .unsubscribe_event(
+                &mut a,
+                v4l2_event_subscription {
+                    type_: bindings::V4L2_EVENT_CTRL,
+                    id: zoom,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        r.device
+            .subscribe_event(
+                &mut a,
+                EventType::Ctrl(zoom),
+                SubscribeEventFlags::ALLOW_FEEDBACK,
+            )
+            .unwrap();
+        let before = ctrl_events(&r.events.borrow()).len();
+        r.device.s_ctrl(&mut a, zoom, 160).unwrap();
+        let events = ctrl_events(&r.events.borrow());
+        let mut heard: Vec<u32> = events[before..].iter().map(|e| e.session).collect();
+        heard.sort_unstable();
+        assert_eq!(heard, vec![0, 1]);
+        assert!(events[before..].iter().all(|e| e.value == 160));
+        // The same value again is no event.
+        let before = events.len();
+        r.device.s_ctrl(&mut a, zoom, 160).unwrap();
+        assert_eq!(ctrl_events(&r.events.borrow()).len(), before);
+
+        // A flag change goes to everyone subscribed to the control whose flags changed, the
+        // setter included, with the new flags.
+        r.device
+            .subscribe_event(
+                &mut b,
+                EventType::Ctrl(bindings::V4L2_CID_EXPOSURE_ABSOLUTE),
+                SubscribeEventFlags::empty(),
+            )
+            .unwrap();
+        let before = ctrl_events(&r.events.borrow()).len();
+        r.device
+            .s_ctrl(
+                &mut b,
+                bindings::V4L2_CID_EXPOSURE_AUTO,
+                ExposureMode::Manual as i32,
+            )
+            .unwrap();
+        let events = ctrl_events(&r.events.borrow());
+        assert_eq!(
+            &events[before..],
+            &[CtrlEv {
+                session: 1,
+                id: bindings::V4L2_CID_EXPOSURE_ABSOLUTE,
+                changes: CH_FLAGS,
+                value: 333,
+                flags: 0,
+            }]
+        );
+        let before = events.len();
+        r.device
+            .s_ctrl(
+                &mut b,
+                bindings::V4L2_CID_EXPOSURE_AUTO,
+                ExposureMode::Auto as i32,
+            )
+            .unwrap();
+        let events = ctrl_events(&r.events.borrow());
+        assert_eq!(events[before..].len(), 1);
+        assert_eq!(events[before].flags, bindings::V4L2_CTRL_FLAG_INACTIVE);
+
+        // `V4L2_EVENT_ALL` drops B's subscriptions; unsubscribing what was never subscribed is
+        // fine; a closed session's subscriptions go with it.
+        r.device
+            .unsubscribe_event(
+                &mut b,
+                v4l2_event_subscription {
+                    type_: bindings::V4L2_EVENT_ALL,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        r.device
+            .unsubscribe_event(
+                &mut b,
+                v4l2_event_subscription {
+                    type_: bindings::V4L2_EVENT_CTRL,
+                    id: bindings::V4L2_CID_COLORFX,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = ctrl_events(&r.events.borrow()).len();
+        r.device.s_ctrl(&mut a, zoom, 170).unwrap();
+        let events = ctrl_events(&r.events.borrow());
+        assert_eq!(events[before..].len(), 1);
+        assert_eq!(events[before].session, 0);
+        assert!(r.device.subscriptions.contains_key(&0));
+        close(&mut r.device, a);
+        assert!(!r.device.subscriptions.contains_key(&0));
+        close(&mut r.device, b);
+    }
+
+    /// The regions control round trip: its payload is read from and written into the guest
+    /// memory the ioctl names, a buffer too small is `ENOSPC` with the size filled in for a
+    /// get and `EFAULT` for a set, a rectangle outside the frame or an over-weighted one is
+    /// `ERANGE`, and the regions reach the camera and open the stream.
+    #[test]
+    fn the_regions_control_round_trips_through_its_payload() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let words = REGION_WORDS * 4;
+        let gpa = 4 * 0x1000u64;
+        let region = Region {
+            x: 2500,
+            y: 2500,
+            width: 5000,
+            height: 5000,
+            weight: 1000,
+        };
+        let put = |r: &Rig, at: u64, region: Region| {
+            let mut mem = r.guest.memory.borrow_mut();
+            let bytes: Vec<u8> = [
+                region.x,
+                region.y,
+                region.width,
+                region.height,
+                region.weight,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+            mem[at as usize..at as usize + words].copy_from_slice(&bytes);
+        };
+        let get = |r: &Rig, at: u64| -> Region {
+            let mem = r.guest.memory.borrow();
+            let w: Vec<u32> = mem[at as usize..at as usize + words]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            Region {
+                x: w[0],
+                y: w[1],
+                width: w[2],
+                height: w[3],
+                weight: w[4],
+            }
+        };
+
+        // "How big": a get with no room answers the size and `ENOSPC`.
+        let mut ctrls = ext_controls(1);
+        let mut array = vec![ext_payload(VCAM_CID_AF_REGIONS, 0)];
+        assert_eq!(
+            r.device
+                .g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut array, vec![]),
+            Err(libc::ENOSPC)
+        );
+        let size = array[0].size;
+        assert_eq!(size, words as u32);
+        assert_eq!(ctrls.error_idx, 1);
+        // The default is no region.
+        let mut array = vec![ext_payload(VCAM_CID_AF_REGIONS, words as u32)];
+        r.device
+            .g_ext_ctrls(
+                &s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut array,
+                vec![vec![SgEntry::new(gpa, words as u32)]],
+            )
+            .unwrap();
+        assert_eq!(get(&r, gpa), Region::default());
+        assert_eq!(*r.guest.live_mappings.borrow(), 0);
+
+        // Set the centre quarter as the focus region.
+        put(&r, gpa, region);
+        let mut array = vec![ext_payload(VCAM_CID_AF_REGIONS, words as u32 + 4)];
+        r.device
+            .s_ext_ctrls(
+                &mut s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut array,
+                vec![vec![SgEntry::new(gpa, words as u32 + 4)]],
+            )
+            .unwrap();
+        let size = array[0].size;
+        assert_eq!(size, words as u32, "the size is normalised");
+        assert_eq!(
+            r.log.lock().unwrap().backend_controls.last().unwrap(),
+            &(false, vec![CameraControl::AfRegions(vec![region])])
+        );
+        // Read back into other guest memory.
+        let gpa2 = gpa + 0x1000;
+        let mut array = vec![ext_payload(VCAM_CID_AF_REGIONS, words as u32)];
+        r.device
+            .g_ext_ctrls(
+                &s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut array,
+                vec![vec![SgEntry::new(gpa2, words as u32)]],
+            )
+            .unwrap();
+        assert_eq!(get(&r, gpa2), region);
+        // ... and the default is still empty.
+        r.device
+            .g_ext_ctrls(
+                &s,
+                CtrlWhich::Default,
+                &mut ctrls,
+                &mut array,
+                vec![vec![SgEntry::new(gpa2, words as u32)]],
+            )
+            .unwrap();
+        assert_eq!(get(&r, gpa2), Region::default());
+
+        // Refused: a rectangle past the frame's edge, an over-weighted one, a payload too
+        // small, a mapping shorter than the payload claims.
+        put(
+            &r,
+            gpa,
+            Region {
+                x: 6000,
+                width: 5000,
+                ..region
+            },
+        );
+        let mut array = vec![ext_payload(VCAM_CID_AF_REGIONS, words as u32)];
+        assert_eq!(
+            r.device.try_ext_ctrls(
+                &s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut array,
+                vec![vec![SgEntry::new(gpa, words as u32)]]
+            ),
+            Err(libc::ERANGE)
+        );
+        assert_eq!(ctrls.error_idx, 0);
+        put(
+            &r,
+            gpa,
+            Region {
+                weight: REGION_MAX_WEIGHT + 1,
+                ..region
+            },
+        );
+        assert_eq!(
+            r.device.s_ext_ctrls(
+                &mut s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut array,
+                vec![vec![SgEntry::new(gpa, words as u32)]]
+            ),
+            Err(libc::ERANGE)
+        );
+        put(&r, gpa, region);
+        let mut short = vec![ext_payload(VCAM_CID_AF_REGIONS, 8)];
+        assert_eq!(
+            r.device.s_ext_ctrls(
+                &mut s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut short,
+                vec![vec![SgEntry::new(gpa, 8)]]
+            ),
+            Err(libc::EFAULT)
+        );
+        let mut array = vec![ext_payload(VCAM_CID_AF_REGIONS, words as u32)];
+        assert_eq!(
+            r.device.s_ext_ctrls(
+                &mut s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut array,
+                vec![vec![SgEntry::new(gpa, 8)]]
+            ),
+            Err(libc::EFAULT)
+        );
+        assert_eq!(
+            *r.guest.live_mappings.borrow(),
+            0,
+            "every payload mapping was released"
+        );
+        // A camera that takes no white-balance regions has no such control.
+        assert_eq!(
+            r.device.query_ext_ctrl_raw(&s, VCAM_CID_AWB_REGIONS).err(),
+            Some(libc::EINVAL)
+        );
+
+        // All zeros is "no region", and what is set opens the stream.
+        put(&r, gpa, Region::default());
+        let mut ae = vec![ext_payload(VCAM_CID_AE_REGIONS, words as u32)];
+        r.device
+            .s_ext_ctrls(
+                &mut s,
+                CtrlWhich::Current,
+                &mut ctrls,
+                &mut ae,
+                vec![vec![SgEntry::new(gpa, words as u32)]],
+            )
+            .unwrap();
+        assert_eq!(
+            r.log.lock().unwrap().backend_controls.len(),
+            1,
+            "unchanged: not sent"
+        );
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
+            .unwrap();
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        {
+            let log = r.log.lock().unwrap();
+            let opened = &log.opened[0].controls;
+            assert!(opened.contains(&CameraControl::AfRegions(vec![region])));
+            assert!(opened.contains(&CameraControl::AeRegions(vec![Region::default()])));
+        }
+        close(&mut r.device, s);
+    }
+
+    /// A camera that describes nothing but sizes gets nothing but the state the backend can
+    /// always report: no zoom, no flash, no exposure, no focus -- and a set of any of those is
+    /// an unknown control.
+    #[test]
+    fn controls_follow_what_the_camera_offers() {
+        let bare = CameraInfo {
+            id: "1".into(),
+            name: "Front camera".into(),
+            sizes: vec![FrameSize::new(640, 480)],
+            fps_ranges: vec![(30, 30)],
+            ..Default::default()
+        };
+        let mut r = rig_with(FakeCamera {
+            info: bare,
+            ..camera()
+        });
+        let mut s = session(&mut r.device);
+        let ids: Vec<u32> = walk(&mut r.device, &s, NEXT | NEXT_COMPOUND)
+            .iter()
+            .map(|q| q.id)
+            .collect();
+        assert_eq!(ids, vec![bindings::V4L2_CID_USER_CLASS, VCAM_CID_AE_STATE]);
+        for id in [
+            bindings::V4L2_CID_ZOOM_ABSOLUTE,
+            bindings::V4L2_CID_FLASH_LED_MODE,
+            bindings::V4L2_CID_EXPOSURE_AUTO,
+            bindings::V4L2_CID_FOCUS_AUTO,
+            bindings::V4L2_CID_AUTO_FOCUS_STATUS,
+            VCAM_CID_ACTIVE_PHYSICAL_ID,
+            VCAM_CID_AF_REGIONS,
+        ] {
+            assert_eq!(
+                r.device.query_ext_ctrl_raw(&s, id).err(),
+                Some(libc::EINVAL)
+            );
+            assert_eq!(r.device.s_ctrl(&mut s, id, 1).err(), Some(libc::EINVAL));
+            assert_eq!(
+                r.device
+                    .subscribe_event(&mut s, EventType::Ctrl(id), SubscribeEventFlags::empty()),
+                Err(libc::EINVAL)
+            );
+        }
+        // No camera class, no flash class either.
+        let mut none = ext_controls(0);
+        assert_eq!(
+            r.device.g_ext_ctrls(
+                &s,
+                CtrlWhich::Class(bindings::V4L2_CTRL_CLASS_CAMERA),
+                &mut none,
+                &mut vec![],
+                vec![]
+            ),
+            Err(libc::EINVAL)
+        );
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
+            .unwrap();
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        assert!(r.log.lock().unwrap().opened[0].controls.is_empty());
         close(&mut r.device, s);
     }
 }

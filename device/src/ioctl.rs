@@ -767,6 +767,28 @@ pub trait VirtioMediaIoctlHandler {
     ) -> IoctlResult<v4l2_query_ext_ctrl> {
         unhandled_ioctl!()
     }
+
+    /// `VIDIOC_QUERYCTRL` with the `id` word as the guest sent it: the control id with the
+    /// `V4L2_CTRL_FLAG_NEXT_*` bits still in it. The default splits it and calls
+    /// [`Self::queryctrl`], which is what a device forwarding to a host V4L2 node wants
+    /// (`CtrlId` is v4l2r's newtype for its own ioctl wrappers and keeps the number to itself).
+    /// A device that answers from a control table of its own, and so must compare and order
+    /// ids, implements this one instead.
+    fn queryctrl_raw(&mut self, session: &Self::Session, id: u32) -> IoctlResult<v4l2_queryctrl> {
+        let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(id);
+        self.queryctrl(session, id, flags)
+    }
+
+    /// `VIDIOC_QUERY_EXT_CTRL` with the `id` word as the guest sent it; see
+    /// [`Self::queryctrl_raw`].
+    fn query_ext_ctrl_raw(
+        &mut self,
+        session: &Self::Session,
+        id: u32,
+    ) -> IoctlResult<v4l2_query_ext_ctrl> {
+        let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(id);
+        self.query_ext_ctrl(session, id, flags)
+    }
 }
 
 /// Writes a `ENOTTY` error response into `writer` to signal that an ioctl is not implemented by
@@ -1034,9 +1056,7 @@ where
             handler.s_audio(session, input.index, AudioMode::n(input.mode))
         }),
         VIDIOC_QUERYCTRL => wr_ioctl(ioctl, reader, writer, |input: v4l2_queryctrl| {
-            let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(input.id);
-
-            handler.queryctrl(session, id, flags)
+            handler.queryctrl_raw(session, input.id)
         }),
         VIDIOC_QUERYMENU => wr_ioctl(ioctl, reader, writer, |input: v4l2_querymenu| {
             handler.querymenu(session, input.id, input.index)
@@ -1284,8 +1304,7 @@ where
         // Doesn't make sense in a virtual context.
         VIDIOC_DBG_G_CHIP_INFO => invalid_ioctl(ioctl, writer),
         VIDIOC_QUERY_EXT_CTRL => wr_ioctl(ioctl, reader, writer, |ctrl: v4l2_query_ext_ctrl| {
-            let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(ctrl.id);
-            handler.query_ext_ctrl(session, id, flags)
+            handler.query_ext_ctrl_raw(session, ctrl.id)
         }),
     }
 }

@@ -366,12 +366,12 @@ impl VideoDecoderBackend for FakeBackend {
                         first_byte,
                         timestamp,
                     } => {
-                        // The input is consumed at once.
-                        emit(DecoderEvent::InputBufferDone(index));
                         if first_byte == DRC_MAGIC
                             || first_byte == DRC_LAST_MAGIC
                             || first_byte == DRC_LAST_AFTER_MAGIC
                         {
+                            // The input is consumed at once.
+                            emit(DecoderEvent::InputBufferDone(index));
                             // Mid-stream resolution change: halve the size (kept even).
                             let new_size = (
                                 (coded_size.0 / 2).max(2) & !1,
@@ -417,6 +417,13 @@ impl VideoDecoderBackend for FakeBackend {
                             );
                             continue;
                         }
+                        // The initial format is announced BEFORE the OUTPUT (bitstream) buffer is
+                        // returned, so a client polling for `SOURCE_CHANGE` sees it while its
+                        // OUTPUT queue is still non-empty: this models the MediaCodec backend
+                        // holding `InputBufferDone` until the announcement has been queued (D45,
+                        // the `pollrace.py` measurement -- `POLLPRI` before `POLLOUT`). A backend
+                        // that returned the buffer first would let the client empty the OUTPUT
+                        // queue and take `POLLPRI|POLLERR` on the still-idle CAPTURE side.
                         if !format_announced {
                             format_announced = true;
                             // A real decoder reports the size it parsed, not the placeholder.
@@ -427,6 +434,8 @@ impl VideoDecoderBackend for FakeBackend {
                                 min_capture_buffers: 4,
                             });
                         }
+                        // The input is consumed at once, behind the announcement above.
+                        emit(DecoderEvent::InputBufferDone(index));
                         ready.push_back(ReadyFrame {
                             luma: luma_of(first_byte),
                             timestamp,
@@ -1209,6 +1218,79 @@ fn gstreamer_v4l2videodec_sequence() {
     let frame = dequeued_on(&r.events.borrow(), CAPTURE).remove(0);
     assert_eq!(frame.timestamp().tv_sec, 7);
 
+    close(&mut r.device, s);
+}
+
+/// D27b: after a `V4L2_DEC_CMD_STOP` drain reaches its empty `LAST` buffer the decoder is
+/// `Stopped` and "will accept, but not process, any newly queued OUTPUT buffers until the client
+/// issues" a resume (`dev-decoder.rst`, "Drain" step 3). `V4L2_DEC_CMD_START` is the resume: it
+/// clears the stop, tells the backend (`resume`), and a new stream decodes on the same codec.
+///
+/// This is the sequence a well-behaved looping client uses. ffmpeg's `-stream_loop` does **not**:
+/// its `v4l2m2m` decoder has no `flush` callback, so after the first EOF `s->draining` stays set
+/// and it never issues `START` again (`v4l2_m2m_dec.c` `v4l2_receive_frame`: `if (s->draining)
+/// goto dequeue;`). That stall (B8 §3.2) is an ffmpeg limitation, not a device one -- the device
+/// resumes exactly as the kernel says, which this test pins.
+#[test]
+fn a_drained_decoder_resumes_on_dec_cmd_start() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let sizeimage = start_streaming_320x240(&mut r, &mut s);
+
+    // Decode one frame (ts 1), then drain to the empty LAST buffer.
+    poke_mmap_output(&mut s, 0, 0x21);
+    let mut ob = mmap_buffer(OUTPUT, 0, 1 << 20);
+    ob.set_timestamp(ts(1));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    r.device.decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_STOP)).unwrap();
+    while !dequeued_on(&r.events.borrow(), CAPTURE).iter().any(|b| b.flags().contains(BufferFlags::LAST)) {
+        assert!(wait_ready(&s), "no LAST buffer within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert_eq!(s.drain, Drain::Stopped, "the decoder is stopped after the drain");
+    assert_eq!(eos_events(&r.events.borrow()), 1);
+
+    // A new OUTPUT buffer queued now must NOT decode into a CAPTURE buffer: the decoder is
+    // stopped (accept, but do not process).
+    poke_mmap_output(&mut s, 1, 0x22);
+    let mut ob = mmap_buffer(OUTPUT, 1, 1 << 20);
+    ob.set_timestamp(ts(2));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    // Requeue a CAPTURE buffer too; while stopped it is not lent.
+    r.device.qbuf(&mut s, mmap_buffer(CAPTURE, 0, sizeimage), vec![], PayloadValidity::ALL).unwrap();
+    let non_last_before = dequeued_on(&r.events.borrow(), CAPTURE)
+        .iter()
+        .filter(|b| !b.flags().contains(BufferFlags::LAST))
+        .count();
+    drain_events(&mut r, &mut s);
+    let non_last_stopped = dequeued_on(&r.events.borrow(), CAPTURE)
+        .iter()
+        .filter(|b| !b.flags().contains(BufferFlags::LAST))
+        .count();
+    assert_eq!(non_last_stopped, non_last_before, "a stopped decoder processes no new frame");
+
+    // The resume: V4L2_DEC_CMD_START clears the stop and tells the backend.
+    let resumes_before = r.log.lock().unwrap().resumes;
+    r.device.decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START)).unwrap();
+    assert_eq!(s.drain, Drain::None, "START resumes the decoder");
+    assert_eq!(r.log.lock().unwrap().resumes, resumes_before + 1, "the backend heard the resume");
+    assert_eq!(r.log.lock().unwrap().started.len(), 1, "the same codec, not a new one");
+
+    // The new stream now decodes: a frame carrying the post-drain OUTPUT timestamp comes out.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if dequeued_on(&r.events.borrow(), CAPTURE)
+            .iter()
+            .any(|b| !b.flags().contains(BufferFlags::LAST) && b.timestamp().tv_sec == 2)
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no post-resume frame within 2s");
+        if wait_ready(&s) {
+            process(&mut r.device, &mut s);
+        }
+    }
     close(&mut r.device, s);
 }
 
@@ -2583,7 +2665,199 @@ fn nv12_sizeimage_saturates_instead_of_aborting() {
     assert_eq!(nv12_sizeimage(u32::MAX, 1), u32::MAX);
 }
 
+/// D45: the initial `SOURCE_CHANGE` reaches the guest **before** the OUTPUT (bitstream) buffer
+/// that produced it comes back. The B8 `pollrace.py` measurement showed the MediaCodec backend
+/// returning the OUTPUT buffer 16--19 ms *before* it emitted `SOURCE_CHANGE`; a GStreamer client
+/// that dequeued it emptied its OUTPUT queue and took `POLLPRI|POLLERR` on the still-idle CAPTURE
+/// side, and discarded the event. With the backend holding `InputBufferDone` until the
+/// announcement is queued, the device sends the `SOURCE_CHANGE` event first and the OUTPUT
+/// `DQBUF` second -- `POLLPRI` before `POLLOUT`. A client that has queued no CAPTURE buffer yet
+/// still gets the event (it is a device event, not a buffer).
+#[test]
+fn source_change_precedes_the_output_buffer_that_produced_it() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 4).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+    // One OUTPUT buffer, no CAPTURE buffer queued yet: exactly the window pollrace measured.
+    poke_mmap_output(&mut s, 0, 0x01);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while source_changes(&r.events.borrow()) == 0 {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+
+    let events = r.events.borrow();
+    let src_at = events.iter().position(|e| {
+        matches!(e, V4l2Event::Event(se) if se.event().type_ == bindings::V4L2_EVENT_SOURCE_CHANGE)
+    });
+    let out_at = events.iter().position(|e| {
+        matches!(e, V4l2Event::DequeueBuffer(d) if d.v4l2_buffer().queue() == OUTPUT)
+    });
+    let src_at = src_at.expect("a SOURCE_CHANGE event");
+    // The OUTPUT buffer may not have come back in the same batch, but if it has it must be after.
+    if let Some(out_at) = out_at {
+        assert!(
+            src_at < out_at,
+            "SOURCE_CHANGE (idx {src_at}) must precede the OUTPUT DQBUF (idx {out_at}): POLLPRI before POLLOUT"
+        );
+    }
+    // No CAPTURE buffer was ever queued, yet the client saw the event.
+    assert_eq!(source_changes(&events), 1);
+    drop(events);
+    close(&mut r.device, s);
+}
+
+/// D29: the decoder exposes `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` through the whole control
+/// interface -- `QUERY_EXT_CTRL` / `QUERYCTRL` walk the two-entry list and end in `EINVAL`,
+/// `QUERYMENU` is `EINVAL` (never `ENOTTY`), and `G_EXT_CTRLS` / `G_CTRL` read the value. On a
+/// 6.15+ guest kernel `G_CTRL` arrives as `G_EXT_CTRLS`, which is why answering only `g_ctrl`
+/// (the old code) left the control invisible.
+#[test]
+fn min_buffers_for_capture_is_enumerated_and_readable() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    const CID_MIN_CAP: u32 = bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
+
+    // The NEXT_CTRL walk: id 0 -> the User Controls class marker -> MIN_BUFFERS_FOR_CAPTURE ->
+    // EINVAL (the end).
+    let walk = |r: &mut Rig, s: &Session, from: u32| -> Result<u32, i32> {
+        let (id, flags) =
+            v4l2r::ioctl::parse_ctrl_id_and_flags(from | bindings::V4L2_CTRL_FLAG_NEXT_CTRL);
+        r.device.query_ext_ctrl(s, id, flags).map(|q| q.id)
+    };
+    assert_eq!(walk(&mut r, &s, 0).unwrap(), bindings::V4L2_CID_USER_CLASS);
+    assert_eq!(
+        walk(&mut r, &s, bindings::V4L2_CID_USER_CLASS).unwrap(),
+        CID_MIN_CAP
+    );
+    assert_eq!(walk(&mut r, &s, CID_MIN_CAP), Err(libc::EINVAL), "walk ends");
+
+    // QUERY_EXT_CTRL of the control itself: read-only integer, 1..=MAX_BUFFERS.
+    let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(CID_MIN_CAP);
+    let q = r.device.query_ext_ctrl(&s, id, flags).unwrap();
+    assert_eq!(q.type_, bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER);
+    assert_eq!((q.minimum, q.maximum, q.step), (1, MAX_BUFFERS as i64, 1));
+    assert_ne!(q.flags & bindings::V4L2_CTRL_FLAG_READ_ONLY, 0, "read-only");
+    let name: Vec<u8> = q.name.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    assert_eq!(&name, b"Min Number of Capture Buffers");
+
+    // The old QUERYCTRL says the same and walks the same list.
+    let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(CID_MIN_CAP);
+    let qc = r.device.queryctrl(&s, id, flags).unwrap();
+    assert_eq!((qc.minimum, qc.maximum, qc.step), (1, MAX_BUFFERS as i32, 1));
+    // QUERYMENU is EINVAL for the integer control, not ENOTTY.
+    assert_eq!(r.device.querymenu(&s, CID_MIN_CAP, 0).map(|_| ()), Err(libc::EINVAL));
+    // A control the decoder does not have: EINVAL, never ENOTTY.
+    let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(bindings::V4L2_CID_BRIGHTNESS);
+    assert_eq!(r.device.query_ext_ctrl(&s, id, flags).map(|_| ()), Err(libc::EINVAL));
+
+    // Before any SOURCE_CHANGE the value is the floor (1); after it, the backend's number.
+    assert_eq!(r.device.g_ctrl(&s, CID_MIN_CAP).unwrap().value, 1);
+    assert_eq!(g_ctrl_ext(&mut r, &mut s, CID_MIN_CAP), Ok(1));
+    start_streaming_320x240(&mut r, &mut s);
+    // The FakeDecoderBackend announces min_capture_buffers = 4.
+    assert_eq!(r.device.g_ctrl(&s, CID_MIN_CAP).unwrap().value, 4);
+    assert_eq!(g_ctrl_ext(&mut r, &mut s, CID_MIN_CAP), Ok(4), "via G_EXT_CTRLS");
+    close(&mut r.device, s);
+}
+
+/// D29, the write side: `MIN_BUFFERS_FOR_CAPTURE` is read-only, so `S_CTRL` / `S_EXT_CTRLS` /
+/// `TRY_EXT_CTRLS` of it answer `EACCES`, and the class marker in `G_EXT_CTRLS` answers `EACCES`
+/// too (it carries `WRITE_ONLY`) -- exactly the kernel's rules `v4l2-compliance` checks.
+#[test]
+fn decoder_controls_reject_writes_and_the_class_marker() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    const CID_MIN_CAP: u32 = bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
+
+    assert_eq!(r.device.s_ctrl(&mut s, CID_MIN_CAP, 8).map(|_| ()), Err(libc::EACCES));
+    assert_eq!(
+        r.device.s_ctrl(&mut s, bindings::V4L2_CID_USER_CLASS, 0).map(|_| ()),
+        Err(libc::EINVAL),
+        "the class marker is not an int"
+    );
+    assert_eq!(
+        r.device.s_ctrl(&mut s, bindings::V4L2_CID_BRIGHTNESS, 0).map(|_| ()),
+        Err(libc::EINVAL)
+    );
+
+    // S/TRY_EXT_CTRLS of the read-only control: EACCES, error_idx = count (1).
+    let mut ctrls = ext_controls_current(1);
+    let mut arr = vec![ext_ctrl(CID_MIN_CAP, 8)];
+    assert_eq!(
+        r.device.s_ext_ctrls(&mut s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![]),
+        Err(libc::EACCES)
+    );
+    assert_eq!(ctrls.error_idx, 1);
+    let mut ctrls = ext_controls_current(1);
+    let mut arr = vec![ext_ctrl(CID_MIN_CAP, 8)];
+    assert_eq!(
+        r.device.try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![]),
+        Err(libc::EACCES),
+        "TRY names the failing control"
+    );
+    assert_eq!(ctrls.error_idx, 0, "the first (only) control, index 0");
+
+    // G_EXT_CTRLS of the class marker: EACCES (WRITE_ONLY), unlike G_CTRL of it (EINVAL).
+    let mut ctrls = ext_controls_current(1);
+    let mut arr = vec![ext_ctrl(bindings::V4L2_CID_USER_CLASS, 0)];
+    assert_eq!(
+        r.device.g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![]),
+        Err(libc::EACCES)
+    );
+    assert_eq!(
+        r.device.g_ctrl(&s, bindings::V4L2_CID_USER_CLASS).map(|_| ()),
+        Err(libc::EINVAL)
+    );
+    close(&mut r.device, s);
+}
+
 // helpers used by several tests ---------------------------------------------------------------
+
+/// A `v4l2_ext_control` for a plain (value) control.
+fn ext_ctrl(id: u32, value: i32) -> bindings::v4l2_ext_control {
+    bindings::v4l2_ext_control {
+        id,
+        size: 0,
+        reserved2: [0],
+        __bindgen_anon_1: bindings::v4l2_ext_control__bindgen_ty_1 { value },
+    }
+}
+
+/// A `v4l2_ext_controls` header for `count` controls (the `which` the handler acts on is passed
+/// to the ioctl separately, so the union value here is immaterial).
+fn ext_controls_current(count: u32) -> bindings::v4l2_ext_controls {
+    bindings::v4l2_ext_controls {
+        __bindgen_anon_1: bindings::v4l2_ext_controls__bindgen_ty_1 {
+            ctrl_class: bindings::V4L2_CTRL_WHICH_CUR_VAL,
+        },
+        count,
+        error_idx: 0,
+        request_fd: 0,
+        reserved: [0],
+        controls: std::ptr::null_mut(),
+    }
+}
+
+/// Read one control through `G_EXT_CTRLS`, the path a 6.15+ guest kernel turns `G_CTRL` into.
+fn g_ctrl_ext(r: &mut Rig, s: &mut Session, id: u32) -> Result<i32, i32> {
+    let mut ctrls = ext_controls_current(1);
+    let mut arr = vec![ext_ctrl(id, 0)];
+    r.device
+        .g_ext_ctrls(s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![])
+        .map(|()| {
+            let anon = arr[0].__bindgen_anon_1;
+            // SAFETY: plain value control.
+            unsafe { anon.value }
+        })
+}
 
 fn dec_cmd(cmd: u32) -> bindings::v4l2_decoder_cmd {
     bindings::v4l2_decoder_cmd {

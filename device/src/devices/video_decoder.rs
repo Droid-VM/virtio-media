@@ -77,14 +77,22 @@ use v4l2r::bindings::v4l2_control;
 use v4l2r::bindings::v4l2_create_buffers;
 use v4l2r::bindings::v4l2_decoder_cmd;
 use v4l2r::bindings::v4l2_event_subscription;
+use v4l2r::bindings::v4l2_ext_control;
+use v4l2r::bindings::v4l2_ext_controls;
 use v4l2r::bindings::v4l2_fmtdesc;
 use v4l2r::bindings::v4l2_format;
 use v4l2r::bindings::v4l2_frmsizeenum;
+use v4l2r::bindings::v4l2_query_ext_ctrl;
+use v4l2r::bindings::v4l2_queryctrl;
+use v4l2r::bindings::v4l2_querymenu;
 use v4l2r::bindings::v4l2_requestbuffers;
 use v4l2r::ioctl::BufferCapabilities;
 use v4l2r::ioctl::BufferField;
 use v4l2r::ioctl::BufferFlags;
+use v4l2r::ioctl::CtrlId;
+use v4l2r::ioctl::CtrlWhich;
 use v4l2r::ioctl::EventType;
+use v4l2r::ioctl::QueryCtrlFlags;
 use v4l2r::ioctl::SelectionFlags;
 use v4l2r::ioctl::SelectionTarget;
 use v4l2r::ioctl::SelectionType;
@@ -1990,17 +1998,153 @@ where
         }
     }
 
-    /// The only control the decoder answers: `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, which GStreamer
-    /// reads to size its CAPTURE pool. Full control enumeration (`QUERYCTRL` / the codec control
-    /// class) is M5; see the report.
+    /// Enumerate a control by id, walking with `V4L2_CTRL_FLAG_NEXT_CTRL`. The decoder exposes the
+    /// user-control class marker and the read-only `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` (D29); the
+    /// walk from the last one ends in `EINVAL`, as `v4l2-compliance` expects.
+    fn queryctrl(
+        &mut self,
+        _session: &Self::Session,
+        id: CtrlId,
+        flags: QueryCtrlFlags,
+    ) -> IoctlResult<v4l2_queryctrl> {
+        let def = decoder_query_control(id, flags)?;
+        let (minimum, maximum, step, default_value) = def.bounds();
+        let mut out = v4l2_queryctrl {
+            id: def.id,
+            type_: def.v4l2_type(),
+            minimum,
+            maximum,
+            step,
+            default_value,
+            flags: def.flags(),
+            ..Default::default()
+        };
+        copy_name(&mut out.name, def.name);
+        Ok(out)
+    }
+
+    fn query_ext_ctrl(
+        &mut self,
+        _session: &Self::Session,
+        id: CtrlId,
+        flags: QueryCtrlFlags,
+    ) -> IoctlResult<v4l2_query_ext_ctrl> {
+        let def = decoder_query_control(id, flags)?;
+        let (minimum, maximum, step, default_value) = def.bounds();
+        let mut out = v4l2_query_ext_ctrl {
+            id: def.id,
+            type_: def.v4l2_type(),
+            minimum: minimum as i64,
+            maximum: maximum as i64,
+            step: step as u64,
+            default_value: default_value as i64,
+            flags: def.flags(),
+            elem_size: std::mem::size_of::<i32>() as u32,
+            elems: 1,
+            ..Default::default()
+        };
+        copy_c_name(&mut out.name, def.name);
+        Ok(out)
+    }
+
+    /// The decoder has no menu control, so every `QUERYMENU` is `EINVAL` (never `ENOTTY`, which
+    /// hid the whole control interface before D29).
+    fn querymenu(
+        &mut self,
+        _session: &Self::Session,
+        _id: u32,
+        _index: u32,
+    ) -> IoctlResult<v4l2_querymenu> {
+        Err(libc::EINVAL)
+    }
+
+    /// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, which GStreamer reads to size its CAPTURE pool. Its
+    /// value follows the last `SOURCE_CHANGE` (`min_capture_buffers`). Full codec-control
+    /// enumeration (the codec control class, profile/level menus) is M5; see the report.
+    ///
+    /// On a 6.15+ guest kernel `VIDIOC_G_CTRL` reaches the device as `G_EXT_CTRLS`, so this is
+    /// answered by [`Self::g_ext_ctrls`] there; it stays for an older kernel that forwards the
+    /// legacy ioctl directly.
     fn g_ctrl(&mut self, session: &Self::Session, id: u32) -> IoctlResult<v4l2_control> {
-        if id == bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE {
-            Ok(v4l2_control {
-                id,
-                value: session.min_capture_buffers.max(1) as i32,
-            })
-        } else {
-            Err(libc::EINVAL)
+        Ok(v4l2_control {
+            id,
+            value: decoder_control_value(session, id)?,
+        })
+    }
+
+    /// Every decoder control is read-only (`MIN_BUFFERS_FOR_CAPTURE`) or a class marker, so a
+    /// `S_CTRL` is `EACCES` for a known control and `EINVAL` otherwise -- what the kernel answers,
+    /// and what `v4l2-compliance` checks of a read-only control.
+    fn s_ctrl(
+        &mut self,
+        _session: &mut Self::Session,
+        id: u32,
+        _value: i32,
+    ) -> IoctlResult<v4l2_control> {
+        match decoder_control(id) {
+            Some(def) if def.is_class => Err(libc::EINVAL),
+            Some(_) => Err(libc::EACCES),
+            None => Err(libc::EINVAL),
+        }
+    }
+
+    fn g_ext_ctrls(
+        &mut self,
+        session: &Self::Session,
+        which: CtrlWhich,
+        ctrls: &mut v4l2_ext_controls,
+        ctrl_array: &mut Vec<v4l2_ext_control>,
+        _user_regions: Vec<Vec<SgEntry>>,
+    ) -> IoctlResult<()> {
+        match check_ext_ctrls(session, ExtCtrlOp::Get, which, ctrl_array) {
+            Ok(values) => {
+                write_back_ext_ctrls(ctrls, ctrl_array, &values);
+                Ok(())
+            }
+            Err((errno, error_idx)) => {
+                ctrls.error_idx = error_idx;
+                Err(errno)
+            }
+        }
+    }
+
+    fn s_ext_ctrls(
+        &mut self,
+        session: &mut Self::Session,
+        which: CtrlWhich,
+        ctrls: &mut v4l2_ext_controls,
+        ctrl_array: &mut Vec<v4l2_ext_control>,
+        _user_regions: Vec<Vec<SgEntry>>,
+    ) -> IoctlResult<()> {
+        match check_ext_ctrls(session, ExtCtrlOp::Set, which, ctrl_array) {
+            Ok(values) => {
+                write_back_ext_ctrls(ctrls, ctrl_array, &values);
+                Ok(())
+            }
+            Err((errno, error_idx)) => {
+                ctrls.error_idx = error_idx;
+                Err(errno)
+            }
+        }
+    }
+
+    fn try_ext_ctrls(
+        &mut self,
+        session: &Self::Session,
+        which: CtrlWhich,
+        ctrls: &mut v4l2_ext_controls,
+        ctrl_array: &mut Vec<v4l2_ext_control>,
+        _user_regions: Vec<Vec<SgEntry>>,
+    ) -> IoctlResult<()> {
+        match check_ext_ctrls(session, ExtCtrlOp::Try, which, ctrl_array) {
+            Ok(values) => {
+                write_back_ext_ctrls(ctrls, ctrl_array, &values);
+                Ok(())
+            }
+            Err((errno, error_idx)) => {
+                ctrls.error_idx = error_idx;
+                Err(errno)
+            }
         }
     }
 
@@ -2046,6 +2190,208 @@ where
             _ => return Err(libc::EINVAL),
         }
         Ok(cmd)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------------------------
+
+/// One control a stateful decoder answers for. The decoder exposes only the user-control class
+/// marker and the read-only `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` that GStreamer reads to size its
+/// `CAPTURE` pool (`M6-crate` §9 item 1); full codec-control enumeration (profile/level menus) is
+/// M5.
+///
+/// Answering these at all matters on a 6.15+ guest kernel: the virtio-media driver stops defining
+/// `.vidioc_g_ctrl` / `.vidioc_queryctrl` there and lets the V4L2 core emulate the legacy ioctls
+/// through their `EXT` forms (`driver/virtio_media_ioctls.c:1879`), so a decoder that answered only
+/// `g_ctrl` was invisible to every client -- `QUERYCTRL`, `QUERY_EXT_CTRL`, `QUERYMENU` and
+/// `G_CTRL` all `ENOTTY`, and GStreamer never read its pool size (defect D29). The entries are in
+/// ascending id order, which is the order `V4L2_CTRL_FLAG_NEXT_CTRL` walks.
+struct DecoderControl {
+    id: u32,
+    name: &'static str,
+    /// A `V4L2_CTRL_TYPE_CTRL_CLASS` marker: neither readable nor writable.
+    is_class: bool,
+}
+
+const DECODER_CONTROLS: [DecoderControl; 2] = [
+    DecoderControl {
+        id: bindings::V4L2_CID_USER_CLASS,
+        name: "User Controls",
+        is_class: true,
+    },
+    DecoderControl {
+        id: bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+        name: "Min Number of Capture Buffers",
+        is_class: false,
+    },
+];
+
+impl DecoderControl {
+    fn v4l2_type(&self) -> u32 {
+        if self.is_class {
+            bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_CTRL_CLASS
+        } else {
+            bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER
+        }
+    }
+
+    fn flags(&self) -> u32 {
+        if self.is_class {
+            // "You can neither read nor write these" (the kernel's `v4l2_ctrl_fill`).
+            bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_WRITE_ONLY
+        } else {
+            // `MIN_BUFFERS_FOR_CAPTURE` is read-only and changes with every `SOURCE_CHANGE`, so
+            // it is volatile: a client must re-read it rather than trust a cached value.
+            bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE
+        }
+    }
+
+    /// `(minimum, maximum, step, default)`.
+    fn bounds(&self) -> (i32, i32, i32, i32) {
+        if self.is_class {
+            (0, 0, 0, 0)
+        } else {
+            // A stateful decoder never needs more than the queue's ceiling; the live value comes
+            // from `G_CTRL` / `G_EXT_CTRLS`, not from this default.
+            (1, MAX_BUFFERS as i32, 1, 1)
+        }
+    }
+}
+
+/// The control class an id belongs to (`V4L2_CTRL_ID2WHICH`).
+fn ctrl_class(id: u32) -> u32 {
+    id & 0x0fff_0000
+}
+
+/// The exact control an id names, if the decoder has it.
+fn decoder_control(id: u32) -> Option<&'static DecoderControl> {
+    DECODER_CONTROLS.iter().find(|c| c.id == id)
+}
+
+/// The control an id with query flags names: the exact one, or -- with `NEXT_CTRL` -- the first
+/// with a greater id, ending in `EINVAL` past the last. `NEXT_COMPOUND` alone finds nothing (the
+/// decoder has no compound control).
+fn decoder_query_control(
+    id: CtrlId,
+    flags: QueryCtrlFlags,
+) -> IoctlResult<&'static DecoderControl> {
+    let id: u32 = id.into();
+    if flags.contains(QueryCtrlFlags::NEXT) {
+        DECODER_CONTROLS
+            .iter()
+            .find(|c| c.id > id)
+            .ok_or(libc::EINVAL)
+    } else if flags.contains(QueryCtrlFlags::COMPOUND) {
+        Err(libc::EINVAL)
+    } else {
+        decoder_control(id).ok_or(libc::EINVAL)
+    }
+}
+
+/// What `G_CTRL` / `G_EXT_CTRLS` answer for a control: `EINVAL` for a class marker (the kernel's
+/// `is_int` check), the live value otherwise. `MIN_BUFFERS_FOR_CAPTURE` reads the session's value.
+fn decoder_control_value<GM, S>(session: &VideoDecoderSession<GM, S>, id: u32) -> IoctlResult<i32> {
+    match id {
+        bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE => Ok(session.min_capture_buffers.max(1) as i32),
+        _ => match decoder_control(id) {
+            Some(def) if def.is_class => Err(libc::EINVAL),
+            // No other readable control exists yet (codec controls are M5).
+            Some(_) => Ok(0),
+            None => Err(libc::EINVAL),
+        },
+    }
+}
+
+/// Which of the three ext-control ioctls is being served.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtCtrlOp {
+    Get,
+    Set,
+    Try,
+}
+
+/// The read/validate half of `G/S/TRY_EXT_CTRLS`: the value each control of the array would
+/// answer, or the errno and the `error_idx` the kernel would report -- the failing control's
+/// index for `TRY`, `count` for `G`/`S`. `which` selects the values: current, default (`G` only)
+/// or a class every control must belong to. The decoder has no writable control, so every `SET`
+/// or `TRY` of a real control is refused with `EACCES` (read-only), which is what the kernel does.
+fn check_ext_ctrls<GM, S>(
+    session: &VideoDecoderSession<GM, S>,
+    op: ExtCtrlOp,
+    which: CtrlWhich,
+    ctrl_array: &[v4l2_ext_control],
+) -> Result<Vec<i32>, (i32, u32)> {
+    let count = ctrl_array.len() as u32;
+    let fail_idx = |i: usize| {
+        if op == ExtCtrlOp::Try {
+            i as u32
+        } else {
+            count
+        }
+    };
+    let (defaults, class) = match which {
+        CtrlWhich::Current => (false, None),
+        CtrlWhich::Default if op == ExtCtrlOp::Get => (true, None),
+        CtrlWhich::Class(c) => (false, Some(c)),
+        _ => return Err((libc::EINVAL, count)),
+    };
+    let mut values = Vec::with_capacity(ctrl_array.len());
+    for (i, ctrl) in ctrl_array.iter().enumerate() {
+        let id = ctrl.id;
+        if class.is_some_and(|c| ctrl_class(id) != c) {
+            return Err((libc::EINVAL, fail_idx(i)));
+        }
+        // The access flags are checked before what the control is, as the kernel does: a
+        // `WRITE_ONLY` control (the class marker carries the flag) is refused for a get, a
+        // `READ_ONLY` one for a set or try, both with `EACCES`.
+        let flags = match decoder_control(id) {
+            Some(def) => def.flags(),
+            None => return Err((libc::EINVAL, fail_idx(i))),
+        };
+        let refused = match op {
+            ExtCtrlOp::Get => flags & bindings::V4L2_CTRL_FLAG_WRITE_ONLY != 0,
+            ExtCtrlOp::Try | ExtCtrlOp::Set => flags & bindings::V4L2_CTRL_FLAG_READ_ONLY != 0,
+        };
+        if refused {
+            return Err((libc::EACCES, fail_idx(i)));
+        }
+        // Only a readable, non-class control reaches here (a get of `MIN_BUFFERS_FOR_CAPTURE`).
+        let value = if defaults {
+            decoder_control(id).map(|def| def.bounds().3).unwrap_or(0)
+        } else {
+            decoder_control_value(session, id).map_err(|e| (e, fail_idx(i)))?
+        };
+        values.push(value);
+    }
+    Ok(values)
+}
+
+/// Write the values back into the array, `error_idx` cleared.
+fn write_back_ext_ctrls(
+    ctrls: &mut v4l2_ext_controls,
+    ctrl_array: &mut [v4l2_ext_control],
+    values: &[i32],
+) {
+    for (ctrl, value) in ctrl_array.iter_mut().zip(values) {
+        ctrl.__bindgen_anon_1 = bindings::v4l2_ext_control__bindgen_ty_1 { value: *value };
+    }
+    ctrls.error_idx = 0;
+}
+
+/// Fill a `[u8; 32]`-shaped name field (`v4l2_queryctrl`, `v4l2_querymenu`).
+fn copy_name(dst: &mut [u8], name: &str) {
+    let n = name.len().min(dst.len() - 1);
+    dst[..n].copy_from_slice(&name.as_bytes()[..n]);
+}
+
+/// Fill a `[c_char; 32]`-shaped name field (`v4l2_query_ext_ctrl`; `c_char` is `u8` on aarch64
+/// and `i8` on x86-64).
+fn copy_c_name(dst: &mut [std::os::raw::c_char], name: &str) {
+    let n = name.len().min(dst.len() - 1);
+    for (d, s) in dst.iter_mut().zip(name.as_bytes()[..n].iter()) {
+        *d = *s as std::os::raw::c_char;
     }
 }
 

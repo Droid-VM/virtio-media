@@ -51,4 +51,7 @@ pub use camera::CameraDevice;
 pub mod v4l2_device_proxy;
 pub use v4l2_device_proxy::V4l2ProxyDevice;
 
+#[cfg(feature = "video-decoder-device")]
 pub mod video_decoder;
+#[cfg(feature = "video-decoder-device")]
+pub use video_decoder::VideoDecoder;

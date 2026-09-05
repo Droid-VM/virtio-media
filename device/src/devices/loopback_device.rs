@@ -924,6 +924,30 @@ where
         if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
         }
+        // `CREATE_BUFS(count = 0)` is V4L2's capability probe, and vb2 answers it without ever
+        // looking at the format: `vb2_ioctl_create_bufs` verifies the memory and buffer types,
+        // fills in the index the next buffer would take and the queue's `V4L2_BUF_CAP_*` word,
+        // and returns -- "If count == 0, then just check if memory and type are valid",
+        // videobuf2-v4l2.c:1054-1059, and `vb2_create_bufs` returns at :757-758 before the
+        // switch that reads `num_planes` and `sizeimage` (GKI 6.18). It takes no resources, so
+        // it does not contend for the queue either: vb2's owner check (`vb2_queue_is_busy`) sits
+        // after that return, and so does this one. `v4l2-ctl --stream-mmap` sends exactly this
+        // probe -- a zeroed format -- before every stream, and warned on each one while it was
+        // answered `EINVAL` (D19). The format goes back untouched, as the kernel leaves it.
+        if count == 0 {
+            let queue = session.queue(queue_type)?;
+            return Ok(v4l2_create_buffers {
+                index: queue.buffers.len() as u32,
+                count: 0,
+                memory: memory as u32,
+                format,
+                capabilities: (BufferCapabilities::SUPPORTS_MMAP
+                    | BufferCapabilities::SUPPORTS_USERPTR
+                    | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
+                    .bits(),
+                ..Default::default()
+            });
+        }
         match self.active_session {
             Some(id) if id != session.id => return Err(libc::EBUSY),
             _ => (),
@@ -973,7 +997,7 @@ where
         }
 
         let first = queue.buffers.len();
-        let count = (count as usize).min(MAX_BUFFERS - first);
+        let count = (count as usize).min(MAX_BUFFERS.saturating_sub(first));
         // What the guest asked for; the checks above already put it at or above both the
         // requested format's and the queue's own `sizeimage`.
         let sizeimage = asked;
@@ -1811,6 +1835,74 @@ mod tests {
         assert_eq!(*r.released.borrow(), 0);
         munmap(&mut r.device, guest_addr).unwrap();
         assert_eq!(*r.released.borrow(), 1);
+
+        close(&mut r.device, s);
+    }
+
+    /// D19: `CREATE_BUFS(count = 0)` is the capability probe `v4l2-ctl --stream-mmap` sends
+    /// before every stream. vb2 answers it from the memory and buffer types alone -- see
+    /// `create_bufs` for the kernel lines -- so the zeroed format it carries is not an error.
+    #[test]
+    fn create_bufs_with_count_zero_is_a_capability_probe() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        let caps = (BufferCapabilities::SUPPORTS_MMAP
+            | BufferCapabilities::SUPPORTS_USERPTR
+            | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
+            .bits();
+        // What v4l2-ctl sends: the queue type, and nothing else filled in.
+        let zeroed = |queue: QueueType| v4l2_format {
+            type_: queue as u32,
+            fmt: bindings::v4l2_format__bindgen_ty_1 {
+                pix_mp: Default::default(),
+            },
+        };
+
+        for queue in [QueueType::VideoOutputMplane, QueueType::VideoCaptureMplane] {
+            let reply = r
+                .device
+                .create_bufs(&mut s, 0, queue, MemoryType::Mmap, zeroed(queue))
+                .unwrap();
+            assert_eq!((reply.index, reply.count), (0, 0));
+            assert_eq!(reply.capabilities, caps);
+        }
+        assert!(s.output.buffers.is_empty());
+        assert!(s.capture.buffers.is_empty());
+
+        // With buffers on the queue the probe reports the index the next one would take, and
+        // still allocates nothing.
+        let output = QueueType::VideoOutputMplane;
+        r.device
+            .reqbufs(&mut s, output, MemoryType::Mmap, 2)
+            .unwrap();
+        let reply = r
+            .device
+            .create_bufs(&mut s, 0, output, MemoryType::Mmap, zeroed(output))
+            .unwrap();
+        assert_eq!((reply.index, reply.count), (2, 0));
+        assert_eq!(s.output.buffers.len(), 2);
+        // Nor is it the "one memory type per queue" error: vb2 checks only that the memory type
+        // is one the queue can do.
+        assert!(r
+            .device
+            .create_bufs(&mut s, 0, output, MemoryType::UserPtr, zeroed(output))
+            .is_ok());
+
+        // A memory type this device has no backing for, and a queue it does not have, are still
+        // refused.
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 0, output, MemoryType::DmaBuf, zeroed(output))
+                .err(),
+            Some(libc::EINVAL)
+        );
+        let splane = QueueType::VideoCapture;
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 0, splane, MemoryType::Mmap, zeroed(splane))
+                .err(),
+            Some(libc::EINVAL)
+        );
 
         close(&mut r.device, s);
     }

@@ -147,8 +147,21 @@ impl FrameSize {
     }
 
     /// Bytes of one tightly packed NV12 frame. Odd dimensions round the chroma plane up.
+    ///
+    /// Saturating, not because a guest reaches this -- every `FrameSize` here comes from the
+    /// camera's own list, and a guest request is snapped to one of those by [`nearest_size`]
+    /// first -- but because a plain `u32` product of two dimensions is one host camera away from
+    /// aborting the helper, and a saturated size merely fails to allocate (D18's shape).
+    ///
+    /// [`nearest_size`]: CameraInfo::nearest_size
     fn sizeimage(&self) -> u32 {
-        self.width * self.height + 2 * self.width.div_ceil(2) * self.height.div_ceil(2)
+        let luma = self.width.saturating_mul(self.height);
+        let chroma = self
+            .width
+            .div_ceil(2)
+            .saturating_mul(self.height.div_ceil(2))
+            .saturating_mul(2);
+        luma.saturating_add(chroma)
     }
 }
 
@@ -233,10 +246,21 @@ impl CameraInfo {
 
     /// The size nearest to `width`x`height` (least squared distance in both dimensions), or
     /// `None` for a camera without sizes.
+    ///
+    /// The guest picks `width` and `height` and V4L2 puts no ceiling on either, so the metric is
+    /// computed in `u128`. It used to be `i64`, which overflows: the largest squared distance a
+    /// pair of `u32`s can produce is just under `2 * (2^32)^2`, past `i64` and past `u64` too.
+    /// The helper is built with `-C overflow-checks=on` and `panic = abort`, so the overflow was
+    /// an abort of the whole process -- any guest could end its own VM with one `TRY_FMT`, and
+    /// `v4l2-compliance` did it by accident (D18).
+    ///
+    /// `u128` needs no clamp in front of it: the metric is then exact for every pair a guest can
+    /// send, and since it only grows past the largest listed size, an absurd request snaps to
+    /// that size, which is what a clamp would have arranged anyway.
     fn nearest_size(&self, width: u32, height: u32) -> Option<FrameSize> {
         self.sizes.iter().copied().min_by_key(|s| {
-            let dw = s.width as i64 - width as i64;
-            let dh = s.height as i64 - height as i64;
+            let dw = s.width.abs_diff(width) as u128;
+            let dh = s.height.abs_diff(height) as u128;
             dw * dw + dh * dh
         })
     }
@@ -937,10 +961,23 @@ fn to_v4l2(size: FrameSize) -> v4l2_format {
     to_v4l2_sized(size, size.sizeimage())
 }
 
-/// `G_PARM`'s answer for a session running at `fps`.
-fn streamparm(fps: u32) -> v4l2_streamparm {
+/// Whether `queue` is a buffer type `G_PARM` and `S_PARM` answer for.
+///
+/// The frame rate belongs to the camera, not to a queue's plane layout, so both capture types
+/// name the same thing here. A vb2 driver behaves the same way: the V4L2 core's `check_fmt()`
+/// lets `V4L2_BUF_TYPE_VIDEO_CAPTURE` reach a driver that only implements
+/// `vidioc_g_fmt_vid_cap_mplane`, and nothing under it looks at the type again. It matters
+/// because v4l-utils 1.32.0 hardcodes the single-planar type in `v4l2-ctl --get-parm` and
+/// `--set-parm`, so with only the mplane type accepted both failed with `EINVAL` while
+/// `v4l2-compliance`, which sends the mplane type, passed (D16).
+fn is_parm_queue(queue: QueueType) -> bool {
+    matches!(queue, QUEUE | QueueType::VideoCapture)
+}
+
+/// `G_PARM`'s answer for a session running at `fps`, in the buffer type the caller asked with.
+fn streamparm(queue: QueueType, fps: u32) -> v4l2_streamparm {
     v4l2_streamparm {
-        type_: QUEUE as u32,
+        type_: queue as u32,
         parm: bindings::v4l2_streamparm__bindgen_ty_1 {
             capture: bindings::v4l2_captureparm {
                 capability: bindings::V4L2_CAP_TIMEPERFRAME,
@@ -1164,6 +1201,29 @@ where
         if session.dead {
             return Err(libc::ENODEV);
         }
+        // `CREATE_BUFS(count = 0)` is V4L2's capability probe, and vb2 answers it without ever
+        // looking at the format: `vb2_ioctl_create_bufs` verifies the memory and buffer types,
+        // fills in the index the next buffer would take and the queue's `V4L2_BUF_CAP_*` word,
+        // and returns -- "If count == 0, then just check if memory and type are valid",
+        // videobuf2-v4l2.c:1054-1059, and `vb2_create_bufs` returns at :757-758 before the
+        // switch that reads `num_planes` and `sizeimage` (GKI 6.18). It takes no resources, so
+        // it does not contend for the queue either: vb2's owner check (`vb2_queue_is_busy`) sits
+        // after that return, and so does this one. `v4l2-ctl --stream-mmap` sends exactly this
+        // probe -- a zeroed format -- before every stream, and warned on each one while it was
+        // answered `EINVAL` (D19). The format goes back untouched, as the kernel leaves it.
+        if count == 0 {
+            return Ok(v4l2_create_buffers {
+                index: session.buffers.len() as u32,
+                count: 0,
+                memory: memory as u32,
+                format,
+                capabilities: (BufferCapabilities::SUPPORTS_MMAP
+                    | BufferCapabilities::SUPPORTS_USERPTR
+                    | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
+                    .bits(),
+                ..Default::default()
+            });
+        }
         match self.active_session {
             Some(id) if id != session.id => return Err(libc::EBUSY),
             _ => (),
@@ -1196,7 +1256,7 @@ where
         }
 
         let first = session.buffers.len();
-        let count = (count as usize).min(MAX_BUFFERS - first);
+        let count = (count as usize).min(MAX_BUFFERS.saturating_sub(first));
         if count > 0 {
             self.add_buffers(session, memory, count, asked)?;
             session.memory = Some(memory);
@@ -1469,11 +1529,11 @@ where
         session: &Self::Session,
         queue: QueueType,
     ) -> IoctlResult<v4l2_streamparm> {
-        if queue != QUEUE {
+        if !is_parm_queue(queue) {
             return Err(libc::EINVAL);
         }
         let (_, max) = self.backend.info().range_at(&session.size, session.fps);
-        Ok(streamparm(max))
+        Ok(streamparm(queue, max))
     }
 
     /// A single `timeperframe` selects, by the design's rule, the widest fps range whose maximum
@@ -1485,9 +1545,9 @@ where
         session: &mut Self::Session,
         parm: v4l2_streamparm,
     ) -> IoctlResult<v4l2_streamparm> {
-        if parm.type_ != QUEUE as u32 {
-            return Err(libc::EINVAL);
-        }
+        let queue = QueueType::n(parm.type_)
+            .filter(|&queue| is_parm_queue(queue))
+            .ok_or(libc::EINVAL)?;
         // The camera is gone; see `reqbufs` (review-m4 R12).
         if session.dead {
             return Err(libc::ENODEV);
@@ -1506,7 +1566,7 @@ where
             stream.set_controls(&[CameraControl::FpsRange(range.0, range.1)])?;
         }
         session.fps = fps;
-        Ok(streamparm(range.1))
+        Ok(streamparm(queue, range.1))
     }
 
     fn enuminput(
@@ -2167,7 +2227,7 @@ mod tests {
     }
 
     fn parm_for(fps: (u32, u32)) -> v4l2_streamparm {
-        let mut parm = streamparm(1);
+        let mut parm = streamparm(QUEUE, 1);
         parm.parm.capture.timeperframe = bindings::v4l2_fract {
             numerator: fps.0,
             denominator: fps.1,
@@ -3235,6 +3295,174 @@ mod tests {
                 .subscribe_event(&mut s, EventType::VSync, SubscribeEventFlags::empty()),
             Err(libc::EINVAL)
         );
+        close(&mut r.device, s);
+    }
+
+    /// D18: the guest picks the dimensions of a `TRY_FMT`/`S_FMT` and V4L2 caps neither, so
+    /// `nearest_size`'s metric has to hold every `u32` pair. It did not: the squared distance
+    /// was computed in `i64`, `width = 3_100_000_000` overflowed it, and with overflow checks on
+    /// the panic aborted the helper -- one ioctl from any guest process ended the VM, and
+    /// `v4l2-compliance -s` hit it by accident a third of the way in.
+    #[test]
+    fn an_enormous_try_fmt_snaps_to_the_largest_size_instead_of_panicking() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+
+        // The reproduction from M4-acceptance §9 D18, and both ends of the range around it.
+        for (w, h) in [
+            (3_000_000_000, 100),
+            (3_100_000_000, 100),
+            (u32::MAX, 100),
+            (u32::MAX, u32::MAX),
+            (100, u32::MAX),
+            (u32::MAX - 1, u32::MAX - 1),
+        ] {
+            let tried = pix_mp(&r.device.try_fmt(&s, QUEUE, format(w, h)).unwrap());
+            assert_eq!(
+                (tried.width, tried.height),
+                (1920, 1080),
+                "{}x{} did not snap to the largest size",
+                w,
+                h
+            );
+            // Nothing was changed by trying, and the buffer size stays a real number.
+            assert_eq!(tried.sizeimage, 1920 * 1080 * 3 / 2);
+            assert_eq!(pix_mp(&r.device.g_fmt(&s, QUEUE).unwrap()).width, 1280);
+        }
+
+        // `S_FMT` and `CREATE_BUFS` take the same path. `CREATE_BUFS` still judges the
+        // `sizeimage` against the size the request snapped to, so an impossible geometry with a
+        // small `sizeimage` is `EINVAL` rather than a panic or a 4 GiB allocation.
+        let set = pix_mp(
+            &r.device
+                .s_fmt(&mut s, QUEUE, format(u32::MAX, u32::MAX))
+                .unwrap(),
+        );
+        assert_eq!((set.width, set.height), (1920, 1080));
+        let mut huge = format(u32::MAX, 1);
+        // SAFETY: multi-planar.
+        unsafe { huge.fmt.pix_mp.plane_fmt[0].sizeimage = 100 };
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 1, QUEUE, MemoryType::Mmap, huge)
+                .err(),
+            Some(libc::EINVAL)
+        );
+        assert!(s.buffers.is_empty());
+
+        close(&mut r.device, s);
+    }
+
+    /// D16: `G_PARM` and `S_PARM` answer for the single-planar capture type as well as the
+    /// mplane one, and echo back the type they were called with. v4l-utils 1.32.0 hardcodes
+    /// `V4L2_BUF_TYPE_VIDEO_CAPTURE` in `v4l2-ctl --get-parm` / `--set-parm`, so with only the
+    /// mplane type accepted neither could be run against this device.
+    #[test]
+    fn parm_answers_the_single_planar_capture_type_too() {
+        const SPLANE: QueueType = QueueType::VideoCapture;
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+
+        for queue in [QUEUE, SPLANE] {
+            let parm = r.device.g_parm(&s, queue).unwrap();
+            assert_eq!(parm.type_, queue as u32);
+            assert_eq!(timeperframe(&parm), (1, 30));
+        }
+
+        // A rate set through the single-planar type is the same session state the mplane type
+        // reads back, and the reply carries the caller's own type.
+        let mut asked = parm_for((1, 15));
+        asked.type_ = SPLANE as u32;
+        let set = r.device.s_parm(&mut s, asked).unwrap();
+        assert_eq!(set.type_, SPLANE as u32);
+        assert_eq!(timeperframe(&set), (1, 15));
+        assert_eq!(s.fps, 15);
+        let read_back = r.device.g_parm(&s, QUEUE).unwrap();
+        assert_eq!(read_back.type_, QUEUE as u32);
+        assert_eq!(timeperframe(&read_back), (1, 15));
+
+        // And the other way round, so neither type is a second-class citizen.
+        let set = r.device.s_parm(&mut s, parm_for((1, 24))).unwrap();
+        assert_eq!(set.type_, QUEUE as u32);
+        assert_eq!(timeperframe(&r.device.g_parm(&s, SPLANE).unwrap()), (1, 24));
+
+        // Every other buffer type is still `EINVAL`, on both ioctls.
+        for queue in [QueueType::VideoOutput, QueueType::VideoOutputMplane] {
+            assert_eq!(r.device.g_parm(&s, queue).err(), Some(libc::EINVAL));
+            let mut asked = parm_for((1, 30));
+            asked.type_ = queue as u32;
+            assert_eq!(r.device.s_parm(&mut s, asked).err(), Some(libc::EINVAL));
+        }
+
+        close(&mut r.device, s);
+    }
+
+    /// D19: `CREATE_BUFS(count = 0)` is the capability probe `v4l2-ctl --stream-mmap` sends
+    /// before every stream. vb2 answers it from the memory and buffer types alone -- index,
+    /// capabilities, success -- without reading the format, which is why the zeroed format it
+    /// carries is not an error.
+    #[test]
+    fn create_bufs_with_count_zero_is_a_capability_probe() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+
+        let caps = (BufferCapabilities::SUPPORTS_MMAP
+            | BufferCapabilities::SUPPORTS_USERPTR
+            | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
+            .bits();
+        // Exactly what v4l2-ctl sends: the queue type and nothing else.
+        let zeroed = v4l2_format {
+            type_: QUEUE as u32,
+            fmt: bindings::v4l2_format__bindgen_ty_1 {
+                pix_mp: Default::default(),
+            },
+        };
+
+        let reply = r
+            .device
+            .create_bufs(&mut s, 0, QUEUE, MemoryType::Mmap, zeroed)
+            .unwrap();
+        assert_eq!((reply.index, reply.count), (0, 0));
+        assert_eq!(reply.capabilities, caps);
+        // No buffers were made, and the session's own format is untouched.
+        assert!(s.buffers.is_empty());
+        assert!(s.memory.is_none());
+        assert_eq!(pix_mp(&r.device.g_fmt(&s, QUEUE).unwrap()).width, 1280);
+
+        // With buffers on the queue the probe reports the index the next one would take, and
+        // still allocates nothing.
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 3)
+            .unwrap();
+        let reply = r
+            .device
+            .create_bufs(&mut s, 0, QUEUE, MemoryType::Mmap, zeroed)
+            .unwrap();
+        assert_eq!((reply.index, reply.count), (3, 0));
+        assert_eq!(s.buffers.len(), 3);
+        // A probe with the other memory type is not the "one memory type per queue" error
+        // either: vb2 checks only that the type is one it supports.
+        assert!(r
+            .device
+            .create_bufs(&mut s, 0, QUEUE, MemoryType::UserPtr, zeroed)
+            .is_ok());
+
+        // What is still refused: a memory type the device has no backing for, and a buffer type
+        // that is not this queue.
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 0, QUEUE, MemoryType::DmaBuf, zeroed)
+                .err(),
+            Some(libc::EINVAL)
+        );
+        let output = QueueType::VideoOutputMplane;
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 0, output, MemoryType::Mmap, zeroed)
+                .err(),
+            Some(libc::EINVAL)
+        );
+
         close(&mut r.device, s);
     }
 }

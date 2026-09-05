@@ -175,6 +175,15 @@ impl FromDescriptorChain for GuestV4l2Buffer {
         // inside its payload, is refused by `V4l2Buffer`'s invariants -- but it is a legal thing
         // for a guest to send on a prepared buffer, where V4L2 says both fields are ignored. Zero
         // them and try again, and let the device decide (`payload_valid` below).
+        //
+        // The third way this conversion used to fail was `InvalidNumberOfPlanes` for a `length`
+        // of exactly `VIDEO_MAX_PLANES`, which is the plane array size ffmpeg puts on every
+        // multiplanar buffer ioctl (`libavdevice/v4l2.c`) and which V4L2 allows -- the kernel's
+        // `__verify_planes_array` takes `num_planes <= length <= VB2_MAX_PLANES`. It is fixed in
+        // the v4l2r fork (Droid-VM/v4l2r wip/vpu, `lib/src/ioctl.rs`), not forgiven here: unlike
+        // the two above it is not a field a device could reinterpret, and letting it through
+        // with the plane array clamped would have hidden a real out-of-range `length` too. It is
+        // why `ffmpeg -f v4l2 -i /dev/video0` could not queue a single buffer (D17).
         let (v4l2_buffer, payload_valid) =
             match V4l2Buffer::try_from(UncheckedV4l2Buffer(v4l2_buffer, v4l2_planes)) {
                 Ok(buffer) => (buffer, true),

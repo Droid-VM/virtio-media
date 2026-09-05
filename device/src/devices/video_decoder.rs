@@ -1,373 +1,440 @@
 // Copyright 2024 The ChromiumOS Authors
+// Copyright 2026 The DroidVM Authors
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::ops::Deref;
+//! A stateful V4L2 memory-to-memory video decoder over a [`VideoDecoderBackend`]
+//! (`VPU_DESIGN.md` §7.2).
+//!
+//! This module is the V4L2 half of the decoder and knows nothing about how the bitstream is
+//! actually decoded: a [`VideoDecoderBackend`] enumerates what it can decode
+//! ([`DecoderCapabilities`]) and, when the guest starts streaming, opens a
+//! [`VideoDecoderBackendSession`] that turns `OUTPUT` (bitstream) buffers into `CAPTURE` (NV12)
+//! frames. On DroidVM the backend is `MediaCodecDecoderBackend` in crosvm over the Android
+//! MediaCodec NDK, so this crate stays free of Android.
+//!
+//! # What the guest sees
+//!
+//! `V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING`, the kernel's stateful decoder interface
+//! (`Documentation/userspace-api/media/v4l/dev-decoder.rst`): the `OUTPUT` queue advertises the
+//! backend's coded formats (`ENUM_FMT`, `ENUM_FRAMESIZES` stepwise; a decoder has no frame rate,
+//! so `ENUM_FRAMEINTERVALS` and `G/S_PARM` answer `ENOTTY`), the `CAPTURE` queue advertises
+//! **NV12 single-plane, tightly packed** only (`bytesperline = width`,
+//! `sizeimage = w*h*3/2` for even dimensions). `S_FMT(OUTPUT)` selects the coded format; the
+//! backend session -- the actual codec -- is created at `STREAMON(OUTPUT)`. Once the backend has
+//! parsed the stream it sends a `V4L2_EVENT_SOURCE_CHANGE`, from which the client sets the
+//! `CAPTURE` queue up. Seek is `STREAMOFF(OUTPUT)`, drain is `V4L2_DEC_CMD_STOP` (a `LAST` buffer
+//! then `V4L2_EVENT_EOS`), and a mid-stream resolution change is another `SOURCE_CHANGE`.
+//!
+//! Buffers are host-owned (`MMAP`, from the device's [`VirtioMediaBufferAllocator`] -- the
+//! `media_host` pool on DroidVM) or guest-owned (`USERPTR`): an `OUTPUT` bitstream buffer is
+//! guest-owned in the usual mode (`VPU_DESIGN.md` §2.1), a `CAPTURE` frame buffer is guest-owned
+//! only in `driver_owned_queues=all`. Only one decoding session per device instance is allowed;
+//! a second session's `REQBUFS`/`STREAMON` is refused with `EBUSY`.
+//!
+//! # Threads and buffers
+//!
+//! Frames arrive on a thread the backend owns -- a codec is a stream of async callbacks -- while
+//! every ioctl runs on the device's worker thread. The two meet in three places, none of which
+//! blocks the worker, mirroring `camera.rs`:
+//!
+//! * a bitstream buffer the guest queues is *lent* to the backend ([`InputBuffer`]) as a raw
+//!   read-only pointer; the backend owns those bytes until it reports [`DecoderEvent::InputBufferDone`],
+//!   and the device holds the buffer's guest mapping until then (`VPU_DESIGN.md` §2.5);
+//! * a `CAPTURE` buffer the guest queues is lent to the backend ([`OutputBuffer`]) as a writable
+//!   pointer -- into the `media_host` pool or into a writable guest mapping -- and the backend
+//!   decodes into it and reports [`DecoderEvent::FrameDecoded`];
+//! * `STREAMOFF`, `REQBUFS(0)`, a session close and a decode error all stop the backend from
+//!   touching a queue's buffers *before* the device unqueues or frees them
+//!   ([`VideoDecoderBackendSession::flush`] for `OUTPUT`,
+//!   [`VideoDecoderBackendSession::clear_capture_buffers`] for `CAPTURE`,
+//!   [`VideoDecoderBackendSession::stop`] for the whole session): a lent buffer is never released
+//!   while the thread that may be writing into it is alive.
+//!
+//! # The frame copy contract
+//!
+//! An [`OutputBuffer`] is `len` bytes at `ptr`, sized for one NV12 frame of the coded size, and
+//! the backend fills it as tightly packed NV12: `height` rows of `width` luma bytes, then
+//! `height / 2` rows of `width` interleaved Cb/Cr bytes. `bytesused` of the returned
+//! [`DecoderEvent::FrameDecoded`] is the number of bytes written, normally exactly
+//! `width * height * 3 / 2`. Converting from whatever the codec produces (padded rows, tiled
+//! layouts) is the backend's job; the device never looks at the pixels.
+
+use std::collections::VecDeque;
+use std::io::Result as IoResult;
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
 use v4l2r::bindings;
+use v4l2r::bindings::v4l2_control;
+use v4l2r::bindings::v4l2_create_buffers;
+use v4l2r::bindings::v4l2_decoder_cmd;
+use v4l2r::bindings::v4l2_event_subscription;
+use v4l2r::bindings::v4l2_fmtdesc;
+use v4l2r::bindings::v4l2_format;
+use v4l2r::bindings::v4l2_frmsizeenum;
+use v4l2r::bindings::v4l2_requestbuffers;
 use v4l2r::ioctl::BufferCapabilities;
 use v4l2r::ioctl::BufferField;
 use v4l2r::ioctl::BufferFlags;
-use v4l2r::ioctl::DecoderCmd;
 use v4l2r::ioctl::EventType;
+use v4l2r::ioctl::SelectionFlags;
 use v4l2r::ioctl::SelectionTarget;
 use v4l2r::ioctl::SelectionType;
 use v4l2r::ioctl::SrcChanges;
+use v4l2r::ioctl::SubscribeEventFlags;
 use v4l2r::ioctl::V4l2Buffer;
-use v4l2r::ioctl::V4l2MplaneFormat;
-use v4l2r::ioctl::V4l2PlanesWithBacking;
 use v4l2r::ioctl::V4l2PlanesWithBackingMut;
 use v4l2r::memory::MemoryType;
-use v4l2r::Colorspace;
-use v4l2r::Quantization;
-use v4l2r::QueueClass;
+use v4l2r::PixelFormat;
 use v4l2r::QueueDirection;
 use v4l2r::QueueType;
-use v4l2r::XferFunc;
-use v4l2r::YCbCrEncoding;
 
-use crate::io::ReadFromDescriptorChain;
-use crate::io::WriteToDescriptorChain;
+use crate::guest_mapping_errno;
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::mmap::MmapMappingManager;
 use crate::mmap::RetiredBuffers;
-use crate::DequeueBufferEvent;
+use crate::protocol::DequeueBufferEvent;
+use crate::protocol::SessionEvent;
+use crate::protocol::SgEntry;
+use crate::protocol::V4l2Event;
+use crate::protocol::V4l2Ioctl;
+use crate::protocol::VIRTIO_MEDIA_MMAP_FLAG_RW;
+use crate::GuestMemoryRange;
 use crate::HostBuffer;
-use crate::SessionEvent;
-use crate::SgEntry;
-use crate::V4l2Event;
-use crate::V4l2Ioctl;
+use crate::ReadFromDescriptorChain;
 use crate::VirtioMediaBufferAllocator;
 use crate::VirtioMediaDevice;
 use crate::VirtioMediaDeviceSession;
 use crate::VirtioMediaEventQueue;
+use crate::VirtioMediaGuestMemoryMapper;
 use crate::VirtioMediaHostMemoryMapper;
-use crate::VIRTIO_MEDIA_MMAP_FLAG_RW;
+use crate::WriteToDescriptorChain;
 
-/// Backing MMAP memory for `VirtioVideoMediaDecoderBuffer`.
+/// The one CAPTURE (raw) format offered: Y plane then interleaved Cb/Cr, tightly packed.
+pub const NV12: PixelFormat = PixelFormat::from_fourcc(b"NV12");
+/// Most buffers on a queue, the usual V4L2 ceiling.
+pub const MAX_BUFFERS: usize = 32;
+/// Where a session's coded size starts before the stream is parsed: what `G_FMT`/`G_SELECTION`
+/// answer so `v4l2-compliance` sees a non-empty rectangle before any `SOURCE_CHANGE`.
+const DEFAULT_CODED_SIZE: (u32, u32) = (640, 480);
+/// Floor for an `OUTPUT` (bitstream) buffer, when the client does not size it itself.
+const MIN_BITSTREAM_SIZE: u32 = 1 << 20;
+
+// ---------------------------------------------------------------------------------------------
+// What a backend provides
+// ---------------------------------------------------------------------------------------------
+
+/// A `[min, max]` range with an alignment `step`, as `ENUM_FRAMESIZES` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizeRange {
+    pub min: u32,
+    pub max: u32,
+    pub step: u32,
+}
+
+impl SizeRange {
+    pub const fn new(min: u32, max: u32, step: u32) -> Self {
+        Self { min, max, step }
+    }
+
+    /// `v` clamped into the range and rounded down to a multiple of the step.
+    fn clamp(&self, v: u32) -> u32 {
+        let step = self.step.max(1);
+        let v = v.clamp(self.min, self.max);
+        (v / step) * step
+    }
+}
+
+/// One coded (compressed) format the backend accepts on the `OUTPUT` queue, in the terms
+/// `ENUM_FMT(OUTPUT)` and `ENUM_FRAMESIZES` are answered with. The device advertises nothing of
+/// its own: everything comes from here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodedFormat {
+    /// The V4L2 OUTPUT fourcc: `H264`, `HEVC`, `VP80`, `VP90` or `AV10`.
+    pub fourcc: PixelFormat,
+    pub width: SizeRange,
+    pub height: SizeRange,
+    /// Whether the format carries resolution in the bitstream, i.e. whether the decoder can
+    /// raise a `SOURCE_CHANGE`. Sets `V4L2_FMT_FLAG_DYN_RESOLUTION` in `ENUM_FMT`.
+    pub dynamic_resolution: bool,
+}
+
+/// What a decoder can do, enumerated once at device creation (on Android by warming the
+/// `AMediaCodecStore` up on a single thread, `VPU_DESIGN.md` §7.2). Controls (M5) extend this.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecoderCapabilities {
+    /// The coded formats, in `ENUM_FMT(OUTPUT)` order.
+    pub coded_formats: Vec<CodedFormat>,
+}
+
+impl DecoderCapabilities {
+    fn coded_format(&self, fourcc: PixelFormat) -> Option<&CodedFormat> {
+        self.coded_formats.iter().find(|f| f.fourcc == fourcc)
+    }
+}
+
+/// The kernel's canonical `ENUM_FMT` description for a fourcc; `v4l2-compliance` checks it against
+/// its own table (`v4l2-test-formats.cpp:271`).
+fn fourcc_description(fourcc: PixelFormat) -> &'static [u8] {
+    match &fourcc.to_fourcc() {
+        b"H264" => b"H.264",
+        b"HEVC" => b"HEVC",
+        b"VP80" => b"VP8",
+        b"VP90" => b"VP9",
+        b"AV10" => b"AV1",
+        b"NV12" => b"Y/UV 4:2:0",
+        _ => b"Unknown",
+    }
+}
+
+/// A pointer into a buffer the backend fills or reads, handed to the codec thread.
 ///
-/// The planes' memory comes from the device's [`VirtioMediaBufferAllocator`] (so that on a host
-/// with a pre-shared buffer pool, CAPTURE frames are decoded straight into it), and goes back to
-/// it through [`Self::into_host_buffers`] when the buffer is freed.
-pub trait VideoDecoderBufferBacking {
-    fn new(
-        queue: QueueType,
-        index: u32,
-        sizes: &[usize],
-        allocator: &mut dyn VirtioMediaBufferAllocator,
-    ) -> IoctlResult<Self>
-    where
-        Self: Sized;
+/// Raw pointers are not `Send`; this one is, because what it points at -- a host buffer from the
+/// allocator or a guest mapping held for as long as the buffer is lent -- is plain shared memory
+/// with no thread affinity, and because the device lends each buffer to exactly one backend
+/// session and takes it back only after that session has stopped touching it.
+#[derive(Clone, Copy, Debug)]
+pub struct SendPtr(*mut u8);
 
-    /// The host buffer backing plane `plane_idx`, if there is one.
-    fn buffer_for_plane(&self, plane_idx: usize) -> Option<&HostBuffer>;
+// SAFETY: see the type's documentation: the pointee is shared memory that stays mapped for the
+// life of the loan, and the loan is exclusive.
+unsafe impl Send for SendPtr {}
 
-    /// Hand every plane's host buffer back, in plane order, so the device can return them to
-    /// the allocator.
-    fn into_host_buffers(self) -> Vec<HostBuffer>;
-}
-
-pub struct VideoDecoderBuffer<S: VideoDecoderBufferBacking> {
-    v4l2_buffer: V4l2Buffer,
-
-    /// Backend-specific storage.
-    pub backing: S,
-}
-
-impl<S: VideoDecoderBufferBacking> VideoDecoderBuffer<S> {
-    fn new(
-        queue: QueueType,
-        index: u32,
-        sizes: &[usize],
-        // TODO: need as many offsets as there are planes.
-        mmap_offset: u32,
-        allocator: &mut dyn VirtioMediaBufferAllocator,
-    ) -> IoctlResult<Self> {
-        let backing = S::new(queue, index, sizes, allocator)?;
-
-        let mut v4l2_buffer = V4l2Buffer::new(queue, index, MemoryType::Mmap);
-        if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
-            v4l2_buffer.planes_with_backing_iter_mut()
-        {
-            // SAFETY: every buffer has at least one plane.
-            let mut plane = planes.next().unwrap();
-            plane.set_mem_offset(mmap_offset);
-            *plane.length = sizes[0] as u32;
-        } else {
-            // SAFETY: we have just set the buffer type to MMAP. Reaching this point means a bug in
-            // the code.
-            panic!()
-        }
-
-        v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
-        v4l2_buffer.set_field(BufferField::None);
-
-        Ok(Self {
-            v4l2_buffer,
-            backing,
-        })
-    }
-
-    pub fn index(&self) -> u32 {
-        self.v4l2_buffer.index()
-    }
-
-    pub fn timestamp(&self) -> bindings::timeval {
-        self.v4l2_buffer.timestamp()
+impl SendPtr {
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.0
     }
 }
 
-/// Events reported by the [`VideoDecoderBackendSession::next_event`] method.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VideoDecoderBackendEvent {
-    /// Sent whenever the format of the stream has changed. The new format can be read using
-    /// [`VideoDecoderBackendSession::current_format`].
-    StreamFormatChanged,
-    /// Sent whenever an `OUTPUT` buffer is done processing and can be reused.
+/// An `OUTPUT` (bitstream) buffer lent to the backend to decode. The backend reads `len` bytes at
+/// `ptr` and reports [`DecoderEvent::InputBufferDone`] when done with them.
+#[derive(Clone, Copy, Debug)]
+pub struct InputBuffer {
+    /// The V4L2 buffer index; comes back in [`DecoderEvent::InputBufferDone`].
+    pub index: u32,
+    /// Read-only pointer to the bitstream.
+    pub ptr: SendPtr,
+    /// Bytes of bitstream at `ptr` (`bytesused`).
+    pub len: usize,
+    /// The frame's timestamp, copied to every `CAPTURE` frame produced from it
+    /// (`V4L2_BUF_FLAG_TIMESTAMP_COPY`).
+    pub timestamp: bindings::timeval,
+}
+
+/// A `CAPTURE` (frame) buffer lent to the backend to decode into. See the module's copy contract.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputBuffer {
+    /// The V4L2 buffer index; comes back in [`DecoderEvent::FrameDecoded`].
+    pub index: u32,
+    /// Writable pointer to the frame buffer.
+    pub ptr: SendPtr,
+    /// Bytes available at `ptr`: at least one NV12 frame of the coded size.
+    pub len: usize,
+}
+
+/// Something the backend reports on its event path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecoderEvent {
+    /// The `OUTPUT` buffer at `index` is done being read and can be returned to the guest.
     InputBufferDone(u32),
-    /// Sent whenever a decoded frame is ready on the `CAPTURE` queue.
-    FrameCompleted {
-        buffer_id: u32,
+    /// The `CAPTURE` buffer at `index` holds a decoded frame.
+    FrameDecoded {
+        index: u32,
+        /// Bytes written, from the start of the buffer.
+        bytesused: u32,
+        /// The `OUTPUT` timestamp the frame came from.
         timestamp: bindings::timeval,
-        bytes_used: Vec<u32>,
+        /// The last buffer of a drain or of a resolution change: carries `V4L2_BUF_FLAG_LAST`,
+        /// and may be empty (`bytesused == 0`).
         is_last: bool,
     },
+    /// The stream's format is now known, or has changed. The device raises `SOURCE_CHANGE`.
+    FormatChanged {
+        /// Coded resolution of the stream.
+        coded_size: (u32, u32),
+        /// Visible rectangle within the coded resolution (the crop / compose rectangle).
+        visible_rect: v4l2r::Rect,
+        /// Minimum `CAPTURE` buffers the backend needs to decode; answered by
+        /// `G_CTRL(V4L2_CID_MIN_BUFFERS_FOR_CAPTURE)`.
+        min_capture_buffers: u32,
+    },
+    /// The session failed and produces nothing more; the string is for the log.
+    Error(String),
 }
 
-/// Description of the current stream parameters, as parsed from the input.
+/// An eventfd a session's worker polls. Bumped once per event; drained by the device before it
+/// collects them, so a bump that lands in between leaves it readable. Same shape as
+/// `camera.rs`'s `FrameSignal`.
+pub struct DecoderSignal(OwnedFd);
+
+impl DecoderSignal {
+    pub fn new() -> Result<Self, i32> {
+        // SAFETY: eventfd takes no pointers; the descriptor is checked before it is owned.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        // SAFETY: `fd` was just returned by eventfd and is owned by no one else.
+        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Add one to the counter. Never blocks; `EAGAIN` (2^64 - 1 bumps without a drain) is ignored
+    /// because it cannot happen at frame rates.
+    pub fn signal(&self) {
+        let one: u64 = 1;
+        // SAFETY: writing 8 bytes from a live u64 to a descriptor we own.
+        unsafe {
+            libc::write(
+                self.0.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+
+    /// Reset the counter, so the descriptor stops being readable until the next bump.
+    pub fn drain(&self) {
+        let mut count: u64 = 0;
+        // SAFETY: reading 8 bytes into a live u64 from a non-blocking descriptor we own; an empty
+        // counter is `EAGAIN`, which is the wanted outcome.
+        unsafe {
+            libc::read(
+                self.0.as_raw_fd(),
+                &mut count as *mut u64 as *mut libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+}
+
+impl AsFd for DecoderSignal {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+/// The session's end of the wake-up path, cloned into whatever thread the backend runs. Bump it
+/// after every [`DecoderEvent`] made available.
 #[derive(Clone)]
-pub struct StreamParams {
-    /// Minimum number of output buffers necessary to decode the stream.
-    pub min_output_buffers: u32,
-    /// Coded size of the stream.
-    pub coded_size: (u32, u32),
-    /// Visible rectangle containing the part of the frame to display.
-    pub visible_rect: v4l2r::Rect,
+pub struct DecoderSink(Arc<DecoderSignal>);
+
+impl DecoderSink {
+    pub fn signal(&self) {
+        self.0.signal()
+    }
 }
 
-/// Trait for a video decoding session.
+/// A decoding session's backend: the actual codec. Every method here is called on the device's
+/// worker thread and must return promptly; the codec runs on a thread of its own and reports back
+/// through [`Self::take_events`], bumping the [`DecoderSink`] it was given at creation.
 pub trait VideoDecoderBackendSession {
-    type BufferStorage: VideoDecoderBufferBacking;
+    /// Create the codec for `coded_format` at `coded_size` and start it. Called once, at the
+    /// first `STREAMON(OUTPUT)`. Errors become the guest's `STREAMON` result.
+    fn start(&mut self, coded_format: PixelFormat, coded_size: (u32, u32)) -> IoctlResult<()>;
 
-    /// Decode the encoded stream in `input`, of length `bytes_used`, which corresponds to
-    /// OUTPUT buffer `index`.
-    ///
-    /// `timestamp` is the timestamp of the frame, to be reported in any frame produced from this
-    /// call.
-    fn decode(
-        &mut self,
-        input: &Self::BufferStorage,
-        index: u32,
-        timestamp: bindings::timeval,
-        bytes_used: u32,
-    ) -> IoctlResult<()>;
+    /// Lend an `OUTPUT` bitstream buffer to be decoded. The backend owns the bytes until it
+    /// reports [`DecoderEvent::InputBufferDone`] for the same index.
+    fn decode(&mut self, buffer: InputBuffer) -> IoctlResult<()>;
 
-    /// Use `backing` as the backing storage for output buffer `index`.
-    fn use_as_output(&mut self, index: u32, backing: &mut Self::BufferStorage) -> IoctlResult<()>;
+    /// Lend a `CAPTURE` buffer to be decoded into. The backend owns the bytes until it reports a
+    /// [`DecoderEvent::FrameDecoded`] for the same index, or until [`Self::clear_capture_buffers`].
+    fn use_as_capture(&mut self, buffer: OutputBuffer) -> IoctlResult<()>;
 
-    /// Start draining the decoder pipeline for all buffers still in it.
-    ///
-    /// The backend will report a frame with the `V4L2_BUF_FLAG_LAST` once the drain
-    /// process is completed.
+    /// `STREAMOFF(CAPTURE)`: stop decoding into every lent `CAPTURE` buffer and forget them. When
+    /// this returns the backend touches no `CAPTURE` buffer any more, so the device may free them.
+    fn clear_capture_buffers(&mut self) -> IoctlResult<()>;
+
+    /// `STREAMOFF(OUTPUT)` = seek: drop every pending `OUTPUT` buffer (reporting each as
+    /// [`DecoderEvent::InputBufferDone`]) and be ready to decode from a new resume point. The
+    /// `CAPTURE` queue keeps streaming. On an async codec this is flush-then-start.
+    fn flush(&mut self) -> IoctlResult<()>;
+
+    /// `V4L2_DEC_CMD_STOP`: decode everything queued so far, then report the last `CAPTURE`
+    /// buffer with [`DecoderEvent::FrameDecoded`] `is_last = true` (empty if there is no frame
+    /// left).
     fn drain(&mut self) -> IoctlResult<()>;
 
-    /// Remove any output buffer that has been previously added using [`use_as_output`].
-    fn clear_output_buffers(&mut self) -> IoctlResult<()>;
+    /// Tear the codec down and join its thread. When this returns the backend touches nothing.
+    fn stop(&mut self);
 
-    /// Returns the next pending event if there is one, or `None` if there aren't any.
-    fn next_event(&mut self) -> Option<VideoDecoderBackendEvent>;
-
-    /// Returns the current format set for the given `direction`, in a form suitable as a reply to
-    /// `VIDIOC_G_FMT`.
-    fn current_format(&self, direction: QueueDirection) -> V4l2MplaneFormat;
-
-    /// Returns the stream parameters as read from the input.
-    fn stream_params(&self) -> StreamParams;
-
-    /// Called whenever the decoder device has allocated buffers for a given queue.
-    ///
-    /// This can be useful for some backends that need to know how many buffers they will work
-    /// with. The default implementation does nothing, which should be suitable for backends that
-    /// don't care.
-    fn buffers_allocated(&mut self, _direction: QueueDirection, _num_buffers: u32) {}
-
-    /// Returns a file descriptor that signals `POLLIN` whenever an event is pending and can be
-    /// read using [`next_event`], or `None` if the backend does not support this.
-    fn poll_fd(&self) -> Option<BorrowedFd> {
-        None
-    }
-
-    /// Optional hook called whenever the streaming state of a queue changes. Some backends may
-    /// need this information to operate properly.
-    fn streaming_state(&mut self, _direction: QueueDirection, _streaming: bool) {}
-
-    /// Optional hook called by the decoder to signal it has processed a pausing event
-    /// sent by the backend.
-    ///
-    /// Pausing event are currently limited to [`VideoDecoderBackendEvent::StreamFormatChanged`].
-    /// Whenever the resolution changes, the backend must stop processing until the decoder has
-    /// adapted its conditions for decoding to resume (e.g. CAPTURE buffers of the proper size and
-    /// format have been allocated).
-    fn resume(&mut self) {}
+    /// Every event since the last call, oldest first.
+    fn take_events(&mut self) -> Vec<DecoderEvent>;
 }
 
-/// State of a session.
-#[derive(Debug)]
-enum VideoDecoderStreamingState {
-    /// Initial state, and state after a `STOP` command or a successful drain. Contains the
-    /// state of both streaming queues.
-    Stopped {
-        input_streaming: bool,
-        output_streaming: bool,
-    },
-    /// State when both queues are streaming.
-    Running,
-    /// State when a `PAUSE` command has been received. Both queues are streaming in this state.
-    Paused,
+/// A decoder, as a device sees it: what it can decode, and how to open a session.
+pub trait VideoDecoderBackend {
+    type Session: VideoDecoderBackendSession;
+
+    /// What this decoder can do. Enumerated once; must not change over the device's life.
+    fn capabilities(&self) -> &DecoderCapabilities;
+
+    /// Prepare a session with the given `id`. `sink` is what the session bumps when an event is
+    /// pending. The codec itself is not created until [`VideoDecoderBackendSession::start`].
+    fn new_session(&mut self, id: u32, sink: DecoderSink) -> IoctlResult<Self::Session>;
+
+    /// Close and destroy `session`, joining its thread.
+    fn close_session(&mut self, session: Self::Session);
 }
 
-impl Default for VideoDecoderStreamingState {
-    fn default() -> Self {
-        Self::Stopped {
-            input_streaming: false,
-            output_streaming: false,
-        }
-    }
-}
+// ---------------------------------------------------------------------------------------------
+// The device
+// ---------------------------------------------------------------------------------------------
 
-impl VideoDecoderStreamingState {
-    fn input_streamon(&mut self) {
-        match self {
-            Self::Stopped {
-                ref mut input_streaming,
-                output_streaming,
-            } if !(*input_streaming) => {
-                *input_streaming = true;
-                // If we switch to a state where both queues are streaming, then the device is
-                // running.
-                if *output_streaming {
-                    *self = Self::Running;
-                }
-            }
-            Self::Stopped { .. } | Self::Running | Self::Paused => (),
-        }
-    }
-
-    fn input_streamoff(&mut self) {
-        match self {
-            Self::Stopped {
-                ref mut input_streaming,
-                ..
-            } => *input_streaming = false,
-            Self::Running | Self::Paused => {
-                *self = Self::Stopped {
-                    input_streaming: false,
-                    output_streaming: true,
-                }
-            }
-        }
-    }
-
-    fn output_streamon(&mut self) {
-        match self {
-            Self::Stopped {
-                input_streaming,
-                ref mut output_streaming,
-            } if !(*output_streaming) => {
-                *output_streaming = true;
-                // If we switch to a state where both queues are streaming, then the device is
-                // running.
-                if *input_streaming {
-                    *self = Self::Running;
-                }
-            }
-            Self::Stopped { .. } | Self::Running | Self::Paused => (),
-        }
-    }
-
-    fn output_streamoff(&mut self) {
-        match self {
-            Self::Stopped {
-                ref mut output_streaming,
-                ..
-            } => *output_streaming = false,
-            Self::Running | Self::Paused => {
-                *self = Self::Stopped {
-                    input_streaming: true,
-                    output_streaming: false,
-                }
-            }
-        }
-    }
-
-    fn is_output_streaming(&mut self) -> bool {
-        matches!(
-            self,
-            Self::Running
-                | Self::Stopped {
-                    output_streaming: true,
-                    ..
-                }
-        )
-    }
-}
-
-/// Management of the crop rectangle.
-///
-/// There are two ways this parameter can be set:
-///
-/// * Manually by the client, by calling `VIDIOC_S_SELECTION` with `V4L2_SEL_TGT_COMPOSE`. This has
-///   an effect only before the first resolution change event is emitted, and is the only way to
-///   properly set the crop rectangle for codecs/hardware that don't support DRC detection.
-///
-/// * From the information contained in the stream, signaled via a
-///   [`VideoDecoderBackendEvent::StreamFormatChanged`] event. Once this event has been emitted, the
-///   crop rectangle is fixed and determined by the stream.
-enum CropRectangle {
-    /// Crop rectangle has not been determined from the stream yet and can be set by the client.
-    Settable(v4l2r::Rect),
-    /// Crop rectangle has been determined from the stream and cannot be modified.
-    FromStream(v4l2r::Rect),
-}
-
-impl Deref for CropRectangle {
-    type Target = v4l2r::Rect;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            CropRectangle::Settable(r) => r,
-            CropRectangle::FromStream(r) => r,
-        }
-    }
-}
-
-/// Struct containing validated colorspace information for a format.
+/// Validated colorspace information for a format, propagated `OUTPUT` -> `CAPTURE` on an m2m
+/// device (`v4l2-compliance`'s `testM2MFormats`).
 #[derive(Debug, Clone, Copy)]
 struct V4l2FormatColorspace {
-    colorspace: Colorspace,
-    xfer_func: XferFunc,
-    ycbcr_enc: YCbCrEncoding,
-    quantization: Quantization,
+    colorspace: u32,
+    xfer_func: u32,
+    ycbcr_enc: u32,
+    quantization: u32,
 }
 
 impl Default for V4l2FormatColorspace {
     fn default() -> Self {
         Self {
-            colorspace: Colorspace::Rec709,
-            xfer_func: XferFunc::None,
-            ycbcr_enc: YCbCrEncoding::E709,
-            quantization: Quantization::LimRange,
+            colorspace: bindings::v4l2_colorspace_V4L2_COLORSPACE_REC709,
+            xfer_func: bindings::v4l2_xfer_func_V4L2_XFER_FUNC_DEFAULT,
+            ycbcr_enc: bindings::v4l2_ycbcr_encoding_V4L2_YCBCR_ENC_DEFAULT,
+            quantization: bindings::v4l2_quantization_V4L2_QUANTIZATION_DEFAULT,
         }
     }
 }
 
 impl V4l2FormatColorspace {
-    /// Apply the colorspace information of this object to `pix_mp`.
+    /// Take the colorimetry from a guest-supplied format, keeping defaults for values a
+    /// `v4l2_format` cannot carry back or that `v4l2-compliance` refuses for a non-JPEG codec.
+    fn from_pix_mp(pix_mp: &bindings::v4l2_pix_format_mplane) -> Self {
+        let default = Self::default();
+        let usable = |v: u32, fallback: u32| if v == 0 || v >= 0xff { fallback } else { v };
+        let colorspace = match pix_mp.colorspace {
+            bindings::v4l2_colorspace_V4L2_COLORSPACE_BT878
+            | bindings::v4l2_colorspace_V4L2_COLORSPACE_JPEG => default.colorspace,
+            other => usable(other, default.colorspace),
+        };
+        Self {
+            colorspace,
+            // SAFETY: `ycbcr_enc` and `hsv_enc` are the same `__u8`; only the meaning differs.
+            ycbcr_enc: usable(
+                unsafe { pix_mp.__bindgen_anon_1.ycbcr_enc } as u32,
+                default.ycbcr_enc,
+            ),
+            quantization: usable(pix_mp.quantization as u32, default.quantization),
+            xfer_func: usable(pix_mp.xfer_func as u32, default.xfer_func),
+        }
+    }
+
     fn apply(self, pix_mp: &mut bindings::v4l2_pix_format_mplane) {
-        pix_mp.colorspace = self.colorspace as u32;
+        pix_mp.colorspace = self.colorspace;
         pix_mp.__bindgen_anon_1 = bindings::v4l2_pix_format_mplane__bindgen_ty_1 {
             ycbcr_enc: self.ycbcr_enc as u8,
         };
@@ -376,291 +443,636 @@ impl V4l2FormatColorspace {
     }
 }
 
-pub struct VideoDecoderSession<S: VideoDecoderBackendSession> {
+/// The crop rectangle. Settable by the client (`S_SELECTION`) only until the stream fixes it.
+enum CropRectangle {
+    Settable(v4l2r::Rect),
+    FromStream(v4l2r::Rect),
+}
+
+impl CropRectangle {
+    fn rect(&self) -> v4l2r::Rect {
+        match self {
+            CropRectangle::Settable(r) | CropRectangle::FromStream(r) => *r,
+        }
+    }
+}
+
+/// Streaming state of the two queues, following the kernel's decoder state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingState {
+    output_streaming: bool,
+    capture_streaming: bool,
+}
+
+impl StreamingState {
+    fn running(&self) -> bool {
+        self.output_streaming && self.capture_streaming
+    }
+}
+
+/// Where a `V4L2_DEC_CMD_STOP` drain has got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    None,
+    /// `STOP` issued; waiting for the backend's `LAST` buffer.
+    Pending,
+    /// The `LAST` buffer has been returned; `DQBUF(CAPTURE)` answers `EPIPE` until a restart.
+    Done,
+}
+
+/// Bytes of one tightly packed NV12 frame of `width` x `height`. Odd dimensions round the chroma
+/// plane up.
+fn nv12_sizeimage(width: u32, height: u32) -> u32 {
+    width * height + 2 * width.div_ceil(2) * height.div_ceil(2)
+}
+
+/// Where a buffer's bytes live. Same two ownerships as `camera.rs` / `loopback_device.rs`.
+enum Backing<GM> {
+    /// Host-owned, from the allocator; mappable by the guest at `offset`.
+    Host { buffer: HostBuffer, offset: u32 },
+    /// Guest-owned; mapped from the guest's `USERPTR` SG list while the buffer is lent.
+    Guest(Option<GM>),
+}
+
+struct Buffer<GM> {
+    v4l2_buffer: V4l2Buffer,
+    backing: Backing<GM>,
+    /// Queued by the guest and not yet returned.
+    queued: bool,
+    /// Lent to the backend (implies `queued`).
+    lent: bool,
+    /// Bytes this buffer was created for: the `sizeimage` `REQBUFS`/`CREATE_BUFS` sized it with.
+    size: u32,
+    /// `(bytesused, length)` `PREPARE_BUF` accepted for this buffer, while it is prepared.
+    prepared: Option<(u32, u32)>,
+}
+
+impl<GM: GuestMemoryRange> Buffer<GM> {
+    /// Bytes the buffer can hold: the host buffer's length, or -- for a guest-owned one -- the
+    /// length the guest declared, held to what the mapping actually covers.
+    fn capacity(&self) -> u32 {
+        match &self.backing {
+            Backing::Host { buffer, .. } => buffer.len.min(u32::MAX as u64) as u32,
+            Backing::Guest(mapping) => {
+                let declared = *self.v4l2_buffer.get_first_plane().length;
+                match mapping {
+                    Some(mapping) => declared.min(mapping.len().min(u32::MAX as usize) as u32),
+                    None => declared,
+                }
+            }
+        }
+    }
+
+    fn data_ptr(&mut self) -> Option<*mut u8> {
+        match &mut self.backing {
+            Backing::Host { buffer, .. } => Some(buffer.as_mut_ptr()),
+            Backing::Guest(Some(mapping)) => Some(mapping.as_mut_ptr()),
+            Backing::Guest(None) => None,
+        }
+    }
+
+    fn drop_guest_mapping(&mut self) {
+        if let Backing::Guest(mapping) = &mut self.backing {
+            *mapping = None;
+        }
+    }
+
+    /// Return the buffer to the not-queued state, releasing any guest mapping. Only after the
+    /// backend that may have been lent it has stopped touching it.
+    fn unqueue(&mut self) {
+        self.drop_guest_mapping();
+        self.queued = false;
+        self.lent = false;
+        self.prepared = None;
+        self.v4l2_buffer
+            .clear_flags(BufferFlags::QUEUED | BufferFlags::PREPARED);
+    }
+}
+
+/// One of the two queues.
+struct Queue<GM> {
+    /// Memory type the buffers were allocated with; `None` while there are none.
+    memory: Option<MemoryType>,
+    buffers: Vec<Buffer<GM>>,
+    /// Indices queued but not yet lent to the backend, in queueing order. (Whether the queue is
+    /// streaming lives in [`StreamingState`], shared by both queues.)
+    pending: VecDeque<usize>,
+}
+
+impl<GM> Default for Queue<GM> {
+    fn default() -> Self {
+        Self {
+            memory: None,
+            buffers: Vec::new(),
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+/// Session data of [`VideoDecoder`].
+pub struct VideoDecoderSession<GM, S> {
     id: u32,
-
-    state: VideoDecoderStreamingState,
-
-    input_buffers: Vec<VideoDecoderBuffer<S::BufferStorage>>,
-    output_buffers: Vec<VideoDecoderBuffer<S::BufferStorage>>,
-    /// Indices of CAPTURE buffers that are queued but not send to the backend yet because the
-    /// decoder is not running.
-    pending_output_buffers: Vec<u32>,
-
-    sequence_cpt: u32,
-
-    /// Whether the input source change event has been subscribed to by the driver. If `true` then
-    /// the device will emit resolution change events.
-    src_change_subscribed: bool,
-    /// Whether the EOS event has been subscribed to by the driver. If `true` then the device will
-    /// emit EOS events.
-    eos_subscribed: bool,
-
-    crop_rectangle: CropRectangle,
-
-    /// Current colorspace information of the format.
+    /// What the worker polls; the backend bumps it through a [`DecoderSink`].
+    signal: Arc<DecoderSignal>,
+    backend: S,
+    /// Whether [`VideoDecoderBackendSession::start`] has been called (the codec exists).
+    codec_started: bool,
+    state: StreamingState,
+    drain: Drain,
+    /// OUTPUT (bitstream) queue.
+    input: Queue<GM>,
+    /// CAPTURE (frame) queue.
+    output: Queue<GM>,
+    /// The coded format selected by `S_FMT(OUTPUT)`.
+    coded_format: PixelFormat,
+    /// The CAPTURE frame size: the `S_FMT(OUTPUT)` placeholder until the backend parses the
+    /// stream, then the value from [`DecoderEvent::FormatChanged`].
+    coded_size: (u32, u32),
+    /// The OUTPUT bitstream buffer size, client-set via `S_FMT(OUTPUT)` or defaulted.
+    output_sizeimage: u32,
+    crop: CropRectangle,
+    min_capture_buffers: u32,
     colorspace: V4l2FormatColorspace,
-
-    /// Adapter-specific data.
-    backend_session: S,
+    src_change_subscribed: bool,
+    eos_subscribed: bool,
+    /// The codec died; every ioctl that would touch it answers `ENODEV` until the guest closes.
+    dead: bool,
+    /// Sequence number of the next CAPTURE frame.
+    sequence: u32,
 }
 
-impl<S: VideoDecoderBackendSession> VirtioMediaDeviceSession for VideoDecoderSession<S> {
+impl<GM, S> VirtioMediaDeviceSession for VideoDecoderSession<GM, S> {
     fn poll_fd(&self) -> Option<BorrowedFd> {
-        self.backend_session.poll_fd()
+        Some(self.signal.as_fd())
     }
 }
 
-impl<S: VideoDecoderBackendSession> VideoDecoderSession<S> {
-    /// Returns the current format for `direction`.
-    ///
-    /// This is essentially like calling the backend's corresponding
-    /// [`VideoDecoderBackendSession::current_format`] method, but also applies the colorspace
-    /// information potentially set by the user.
-    fn current_format(&self, direction: QueueDirection) -> V4l2MplaneFormat {
-        let format = self.backend_session.current_format(direction);
+impl<GM, S> VideoDecoderSession<GM, S> {
+    fn queue(&self, queue: QueueType) -> IoctlResult<&Queue<GM>> {
+        match queue {
+            QueueType::VideoOutputMplane => Ok(&self.input),
+            QueueType::VideoCaptureMplane => Ok(&self.output),
+            _ => Err(libc::EINVAL),
+        }
+    }
 
-        let mut pix_mp =
-            *<V4l2MplaneFormat as AsRef<bindings::v4l2_pix_format_mplane>>::as_ref(&format);
+    fn queue_mut(&mut self, queue: QueueType) -> IoctlResult<&mut Queue<GM>> {
+        match queue {
+            QueueType::VideoOutputMplane => Ok(&mut self.input),
+            QueueType::VideoCaptureMplane => Ok(&mut self.output),
+            _ => Err(libc::EINVAL),
+        }
+    }
 
+    fn has_buffers(&self) -> bool {
+        !self.input.buffers.is_empty() || !self.output.buffers.is_empty()
+    }
+
+    /// The CAPTURE (NV12) `sizeimage` for the current coded size.
+    fn capture_sizeimage(&self) -> u32 {
+        nv12_sizeimage(self.coded_size.0, self.coded_size.1)
+    }
+
+    fn sizeimage(&self, direction: QueueDirection) -> u32 {
+        match direction {
+            QueueDirection::Output => self.output_sizeimage,
+            QueueDirection::Capture => self.capture_sizeimage(),
+        }
+    }
+
+    /// The format of a queue as a single-plane multi-planar `v4l2_format`, `sizeimage` bytes per
+    /// buffer (`CREATE_BUFS` may ask for more than a frame needs).
+    fn format_sized(&self, direction: QueueDirection, sizeimage: u32) -> v4l2_format {
+        let (pixelformat, bytesperline, queue) = match direction {
+            QueueDirection::Output => (self.coded_format.to_u32(), 0, QueueType::VideoOutputMplane),
+            QueueDirection::Capture => {
+                (NV12.to_u32(), self.coded_size.0, QueueType::VideoCaptureMplane)
+            }
+        };
+        let mut pix_mp = bindings::v4l2_pix_format_mplane {
+            width: self.coded_size.0,
+            height: self.coded_size.1,
+            pixelformat,
+            field: bindings::v4l2_field_V4L2_FIELD_NONE,
+            num_planes: 1,
+            ..Default::default()
+        };
         self.colorspace.apply(&mut pix_mp);
-
-        V4l2MplaneFormat::from((direction, pix_mp))
-    }
-
-    fn try_decoder_cmd(&self, cmd: DecoderCmd) -> IoctlResult<DecoderCmd> {
-        match cmd {
-            DecoderCmd::Stop { .. } => Ok(DecoderCmd::stop()),
-            DecoderCmd::Start { .. } => Ok(DecoderCmd::start()),
-            DecoderCmd::Pause { .. } => {
-                match &self.state {
-                    // The V4L2 documentation says this should return `EPERM`, but v4l2-compliance
-                    // requires `EINVAL`...
-                    VideoDecoderStreamingState::Stopped { .. } => Err(libc::EINVAL),
-                    VideoDecoderStreamingState::Running | VideoDecoderStreamingState::Paused => {
-                        Ok(DecoderCmd::pause())
-                    }
-                }
-            }
-            DecoderCmd::Resume => {
-                match &self.state {
-                    // The V4L2 documentation says this should return `EPERM`, but v4l2-compliance
-                    // requires `EINVAL`...
-                    VideoDecoderStreamingState::Stopped { .. } => Err(libc::EINVAL),
-                    VideoDecoderStreamingState::Paused | VideoDecoderStreamingState::Running => {
-                        Ok(DecoderCmd::resume())
-                    }
-                }
-            }
+        pix_mp.plane_fmt[0] = bindings::v4l2_plane_pix_format {
+            sizeimage,
+            bytesperline,
+            ..Default::default()
+        };
+        v4l2_format {
+            type_: queue as u32,
+            fmt: bindings::v4l2_format__bindgen_ty_1 { pix_mp },
         }
     }
 
-    /// Send all the output buffers that are pending to the backend, if the decoder is running.
-    ///
-    /// In the adapter backend, if we receive buffers this means both queues are streaming - IOW we
-    /// can queue them as soon as the condition is good.
-    ///
-    /// In the decoder device, we need to keep them until both queues are streaming. Same applies
-    /// to input buffers BTW.
-    fn try_send_pending_output_buffers(&mut self) {
-        if !self.state.is_output_streaming() {
-            return;
-        }
-
-        for i in self.pending_output_buffers.drain(..) {
-            let buffer = self.output_buffers.get_mut(i as usize).unwrap();
-            self.backend_session
-                .use_as_output(buffer.index(), &mut buffer.backing)
-                .unwrap();
-        }
+    fn format(&self, direction: QueueDirection) -> v4l2_format {
+        self.format_sized(direction, self.sizeimage(direction))
     }
 }
 
-/// Trait for actual implementations of video decoding, to be used with [`VideoDecoder`].
-///
-/// [`VideoDecoder`] takes care of (mostly) abstracting V4L2 away ; implementors of this trait are
-/// the ones that provide the actual video decoding service.
-pub trait VideoDecoderBackend: Sized {
-    type Session: VideoDecoderBackendSession;
-
-    /// Create a new session with the provided `id`.
-    fn new_session(&mut self, id: u32) -> IoctlResult<Self::Session>;
-    /// Close and destroy `session`.
-    fn close_session(&mut self, session: Self::Session);
-
-    /// Returns the format at `index` for the given queue `direction`, or None if `index` is out of
-    /// bounds.
-    fn enum_formats(
-        &self,
-        session: &VideoDecoderSession<Self::Session>,
-        direction: QueueDirection,
-        index: u32,
-    ) -> Option<bindings::v4l2_fmtdesc>;
-    /// Returns the supported frame sizes for `pixel_format`, or None if the format is not
-    /// supported.
-    fn frame_sizes(&self, pixel_format: u32) -> Option<bindings::v4l2_frmsize_stepwise>;
-
-    /// Adjust `format` to make it applicable to the queue with the given `direction` for the current `session`.
-    ///
-    /// This method doesn't fail, implementations must return the closest acceptable format that
-    /// can be applied unchanged with [`Self::apply_format`].
-    fn adjust_format(
-        &self,
-        session: &Self::Session,
-        direction: QueueDirection,
-        format: V4l2MplaneFormat,
-    ) -> V4l2MplaneFormat;
-
-    /// Applies `format` to the queue of the given `direction`. The format is adjusted if needed.
-    fn apply_format(
-        &self,
-        session: &mut Self::Session,
-        direction: QueueDirection,
-        format: &V4l2MplaneFormat,
-    );
-}
-
+/// A stateful V4L2 video decoder over a [`VideoDecoderBackend`]. See the module documentation.
 pub struct VideoDecoder<
-    D: VideoDecoderBackend,
+    B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
     A: VirtioMediaBufferAllocator,
 > {
-    backend: D,
-    event_queue: Q,
-    host_mapper: MmapMappingManager<HM>,
-    /// Where the planes of `MMAP` buffers come from.
+    backend: B,
+    evt_queue: Q,
+    /// Guest memory mapper, for `USERPTR` buffers.
+    mem: M,
+    mmap_manager: MmapMappingManager<HM>,
+    /// Where `MMAP` buffers come from.
     allocator: A,
     /// Freed `MMAP` buffers the guest still maps.
     retired: RetiredBuffers,
+    /// The one session allowed to hold buffers: one decode at a time, `EBUSY` for a second
+    /// (`v4l2-compliance` checks a second session is refused).
+    active_session: Option<u32>,
 }
 
-impl<B, Q, HM, A> VideoDecoder<B, Q, HM, A>
+impl<B, Q, M, HM, A> VideoDecoder<B, Q, M, HM, A>
 where
     B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
     A: VirtioMediaBufferAllocator,
 {
-    pub fn new(backend: B, event_queue: Q, host_mapper: HM, allocator: A) -> Self {
+    pub fn new(backend: B, evt_queue: Q, mem: M, mapper: HM, allocator: A) -> Self {
         Self {
             backend,
-            event_queue,
-            host_mapper: MmapMappingManager::from(host_mapper),
+            evt_queue,
+            mem,
+            mmap_manager: MmapMappingManager::from(mapper),
             allocator,
             retired: RetiredBuffers::new(),
+            active_session: None,
         }
     }
 
-    /// Free `buffer`: unregister its MMAP offsets and return its planes to the allocator (or
-    /// hold them until the guest unmaps them).
-    fn free_buffer(&mut self, buffer: VideoDecoderBuffer<<B::Session as VideoDecoderBackendSession>::BufferStorage>) {
-        let offsets: Vec<u32> = if let V4l2PlanesWithBacking::Mmap(planes) =
-            buffer.v4l2_buffer.planes_with_backing_iter()
+    pub fn capabilities(&self) -> &DecoderCapabilities {
+        self.backend.capabilities()
+    }
+
+    /// The coded format `S_FMT(OUTPUT)` selects for `fourcc`, or the first advertised format if
+    /// the guest asked for one the backend does not have.
+    fn adjust_coded_format(&self, fourcc: u32) -> IoctlResult<CodedFormat> {
+        let caps = self.backend.capabilities();
+        let asked = PixelFormat::from_u32(fourcc);
+        caps.coded_format(asked)
+            .or_else(|| caps.coded_formats.first())
+            .cloned()
+            .ok_or(libc::EINVAL)
+    }
+
+    /// Drop every buffer of a queue, returning host buffers to the allocator (or holding them
+    /// until the guest unmaps them) and releasing guest mappings. The backend must have stopped
+    /// touching the queue already.
+    fn free_buffers(&mut self, queue: &mut Queue<M::GuestMemoryMapping>) {
+        queue.pending.clear();
+        queue.memory = None;
+        for buffer in queue.buffers.drain(..) {
+            if let Backing::Host { buffer, offset } = buffer.backing {
+                self.retired
+                    .retire(&mut self.mmap_manager, &mut self.allocator, offset, buffer);
+            }
+        }
+    }
+
+    /// Append `count` buffers of `sizeimage` bytes to `queue`. All or nothing.
+    fn add_buffers(
+        &mut self,
+        queue: &mut Queue<M::GuestMemoryMapping>,
+        queue_type: QueueType,
+        memory: MemoryType,
+        count: usize,
+        sizeimage: u32,
+    ) -> IoctlResult<()> {
+        let first = queue.buffers.len();
+        let mut added: Vec<Buffer<M::GuestMemoryMapping>> = Vec::with_capacity(count);
+
+        for index in first..first + count {
+            let mut v4l2_buffer = V4l2Buffer::new(queue_type, index as u32, memory);
+            v4l2_buffer.set_field(BufferField::None);
+            // A decoder copies the OUTPUT timestamp to the CAPTURE frame; both queues are
+            // `TIMESTAMP_COPY` (kernel decoder interface, "Decoding").
+            v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
+
+            let backing = match memory {
+                MemoryType::Mmap => {
+                    let host_buffer = match self.allocator.allocate(sizeimage as u64) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            self.undo_added(added);
+                            return Err(e);
+                        }
+                    };
+                    let offset = match self.mmap_manager.register_buffer(None, sizeimage) {
+                        Ok(offset) => offset,
+                        Err(e) => {
+                            log::error!("failed to register MMAP buffer: {:#}", e);
+                            self.allocator.release(host_buffer);
+                            self.undo_added(added);
+                            return Err(libc::EINVAL);
+                        }
+                    };
+                    if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
+                        v4l2_buffer.planes_with_backing_iter_mut()
+                    {
+                        // SAFETY: every buffer has at least one plane.
+                        let mut plane = planes.next().unwrap();
+                        plane.set_mem_offset(offset);
+                        *plane.length = sizeimage;
+                    }
+                    Backing::Host {
+                        buffer: host_buffer,
+                        offset,
+                    }
+                }
+                MemoryType::UserPtr => {
+                    *v4l2_buffer.get_first_plane_mut().length = sizeimage;
+                    Backing::Guest(None)
+                }
+                _ => {
+                    self.undo_added(added);
+                    return Err(libc::EINVAL);
+                }
+            };
+
+            added.push(Buffer {
+                v4l2_buffer,
+                backing,
+                queued: false,
+                lent: false,
+                size: sizeimage,
+                prepared: None,
+            });
+        }
+
+        queue.buffers.extend(added);
+        Ok(())
+    }
+
+    /// Give back what `add_buffers` allocated before it failed.
+    fn undo_added(&mut self, added: Vec<Buffer<M::GuestMemoryMapping>>) {
+        for buffer in added {
+            if let Backing::Host { buffer, offset } = buffer.backing {
+                self.mmap_manager.unregister_buffer(offset);
+                self.allocator.release(buffer);
+            }
+        }
+    }
+
+    /// Lend a queued OUTPUT buffer to the backend to decode.
+    fn lend_input(
+        session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
+        index: usize,
+    ) -> IoctlResult<()> {
+        let entry = session.input.buffers.get_mut(index).ok_or(libc::EINVAL)?;
+        let timestamp = entry.v4l2_buffer.timestamp();
+        let len = {
+            let plane = entry.v4l2_buffer.get_first_plane();
+            let used = if *plane.bytesused == 0 {
+                *plane.length
+            } else {
+                *plane.bytesused
+            };
+            used.min(entry.capacity()) as usize
+        };
+        let ptr = entry.data_ptr().ok_or(libc::EIO)?;
+        session.backend.decode(InputBuffer {
+            index: index as u32,
+            ptr: SendPtr(ptr),
+            len,
+            timestamp,
+        })?;
+        entry.lent = true;
+        Ok(())
+    }
+
+    /// Lend a queued CAPTURE buffer to the backend to decode into.
+    fn lend_output(
+        session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
+        index: usize,
+    ) -> IoctlResult<()> {
+        let entry = session.output.buffers.get_mut(index).ok_or(libc::EINVAL)?;
+        let len = entry.capacity() as usize;
+        let ptr = entry.data_ptr().ok_or(libc::EIO)?;
+        session.backend.use_as_capture(OutputBuffer {
+            index: index as u32,
+            ptr: SendPtr(ptr),
+            len,
+        })?;
+        entry.lent = true;
+        Ok(())
+    }
+
+    /// Send every CAPTURE buffer queued so far to the backend, if both queues stream and the
+    /// drain has not ended the queue.
+    fn try_send_pending_capture(
+        &mut self,
+        session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
+    ) -> IoctlResult<()> {
+        if !session.state.running() || session.drain == Drain::Done {
+            return Ok(());
+        }
+        while let Some(index) = session.output.pending.pop_front() {
+            Self::lend_output(session, index)?;
+        }
+        Ok(())
+    }
+
+    /// The codec died: unqueue every buffer, mark the session dead, tell the guest.
+    fn end_session(
+        &mut self,
+        session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
+        why: &str,
+    ) {
+        log::error!("decoder: session {} ends: {}", session.id, why);
+        session.backend.stop();
+        session.input.pending.clear();
+        session.output.pending.clear();
+        for buffer in session
+            .input
+            .buffers
+            .iter_mut()
+            .chain(session.output.buffers.iter_mut())
         {
-            planes.map(|p| p.mem_offset()).collect()
-        } else {
-            Vec::new()
-        };
-        let host_buffers = buffer.backing.into_host_buffers();
-        for (i, host_buffer) in host_buffers.into_iter().enumerate() {
-            match offsets.get(i) {
-                Some(&offset) => self.retired.retire(
-                    &mut self.host_mapper,
-                    &mut self.allocator,
-                    offset,
-                    host_buffer,
-                ),
-                // A plane that was never given an offset cannot be mapped by the guest.
-                None => self.allocator.release(host_buffer),
-            }
+            buffer.unqueue();
         }
+        session.dead = true;
+        self.evt_queue.send_error(session.id, libc::ENODEV);
     }
 
-    /// Validate `format` for `queue` and return the adjusted format.
-    fn try_format(
-        &self,
-        session: &VideoDecoderSession<B::Session>,
-        queue: QueueType,
-        format: bindings::v4l2_format,
-    ) -> IoctlResult<V4l2MplaneFormat> {
-        if queue.class() != QueueClass::VideoMplane {
-            return Err(libc::EINVAL);
-        }
-
-        // SAFETY: safe because we have just confirmed the queue type is mplane.
-        let pix_mp = unsafe { format.fmt.pix_mp };
-
-        // Process the colorspace now so we can restore it after applying the backend adjustment.
-        let colorspace = if queue.direction() == QueueDirection::Output {
-            V4l2FormatColorspace {
-                colorspace: Colorspace::n(pix_mp.colorspace)
-                    .unwrap_or(session.colorspace.colorspace),
-                xfer_func: XferFunc::n(pix_mp.xfer_func as u32)
-                    .unwrap_or(session.colorspace.xfer_func),
-                // TODO: safe because...
-                ycbcr_enc: YCbCrEncoding::n(unsafe { pix_mp.__bindgen_anon_1.ycbcr_enc as u32 })
-                    .unwrap_or(session.colorspace.ycbcr_enc),
-                quantization: Quantization::n(pix_mp.quantization as u32)
-                    .unwrap_or(session.colorspace.quantization),
+    /// One backend event: turn it into V4L2 events / buffer state.
+    fn handle_event(
+        &mut self,
+        session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
+        event: DecoderEvent,
+    ) {
+        match event {
+            DecoderEvent::InputBufferDone(index) => {
+                let Some(entry) = session.input.buffers.get_mut(index as usize) else {
+                    log::error!("decoder: no OUTPUT buffer {} to return", index);
+                    return;
+                };
+                if !entry.lent {
+                    return;
+                }
+                // The backend is done reading the bitstream: drop the guest mapping (§2.5) and
+                // tell the guest.
+                entry.unqueue();
+                let event = entry.v4l2_buffer.clone();
+                self.evt_queue
+                    .send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
+                        session.id, event,
+                    )));
             }
-        } else {
-            session.colorspace
-        };
-
-        let format = V4l2MplaneFormat::from((queue.direction(), pix_mp));
-
-        let format =
-            self.backend
-                .adjust_format(&session.backend_session, queue.direction(), format);
-
-        let mut pix_mp =
-            *<V4l2MplaneFormat as AsRef<bindings::v4l2_pix_format_mplane>>::as_ref(&format);
-
-        colorspace.apply(&mut pix_mp);
-
-        Ok(V4l2MplaneFormat::from((queue.direction(), pix_mp)))
+            DecoderEvent::FrameDecoded {
+                index,
+                bytesused,
+                timestamp,
+                is_last,
+            } => {
+                let seq = session.sequence;
+                let Some(entry) = session.output.buffers.get_mut(index as usize) else {
+                    log::error!("decoder: no CAPTURE buffer {} to return", index);
+                    return;
+                };
+                if !entry.lent {
+                    return;
+                }
+                let capacity = entry.capacity();
+                // The frame is written: drop the guest mapping (a shadowed one is written back
+                // here) before the guest hears the buffer is done.
+                entry.unqueue();
+                let plane = entry.v4l2_buffer.get_first_plane_mut();
+                *plane.bytesused = bytesused.min(capacity);
+                entry.v4l2_buffer.set_timestamp(timestamp);
+                entry.v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
+                entry.v4l2_buffer.set_sequence(seq);
+                if is_last {
+                    entry.v4l2_buffer.add_flags(BufferFlags::LAST);
+                }
+                session.sequence = session.sequence.wrapping_add(1);
+                let event = entry.v4l2_buffer.clone();
+                self.evt_queue
+                    .send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
+                        session.id, event,
+                    )));
+                if is_last {
+                    session.drain = Drain::Done;
+                    if session.eos_subscribed {
+                        self.evt_queue
+                            .send_event(V4l2Event::Event(SessionEvent::new(
+                                session.id,
+                                bindings::v4l2_event {
+                                    type_: bindings::V4L2_EVENT_EOS,
+                                    ..Default::default()
+                                },
+                            )));
+                    }
+                }
+            }
+            DecoderEvent::FormatChanged {
+                coded_size,
+                visible_rect,
+                min_capture_buffers,
+            } => {
+                session.coded_size = coded_size;
+                session.crop = CropRectangle::FromStream(visible_rect);
+                session.min_capture_buffers = min_capture_buffers;
+                if session.src_change_subscribed {
+                    self.evt_queue
+                        .send_event(V4l2Event::Event(SessionEvent::new(
+                            session.id,
+                            bindings::v4l2_event {
+                                type_: bindings::V4L2_EVENT_SOURCE_CHANGE,
+                                u: bindings::v4l2_event__bindgen_ty_1 {
+                                    src_change: bindings::v4l2_event_src_change {
+                                        changes: SrcChanges::RESOLUTION.bits(),
+                                    },
+                                },
+                                ..Default::default()
+                            },
+                        )));
+                }
+            }
+            DecoderEvent::Error(reason) => {
+                self.end_session(session, &reason);
+            }
+        }
     }
 }
 
-impl<B, Q, HM, A, Reader, Writer> VirtioMediaDevice<Reader, Writer> for VideoDecoder<B, Q, HM, A>
+impl<B, Q, M, HM, A, Reader, Writer> VirtioMediaDevice<Reader, Writer>
+    for VideoDecoder<B, Q, M, HM, A>
 where
     B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
     A: VirtioMediaBufferAllocator,
     Reader: ReadFromDescriptorChain,
     Writer: WriteToDescriptorChain,
 {
-    type Session = <Self as VirtioMediaIoctlHandler>::Session;
+    type Session = VideoDecoderSession<M::GuestMemoryMapping, B::Session>;
 
     fn new_session(&mut self, session_id: u32) -> Result<Self::Session, i32> {
-        let backend_session = self.backend.new_session(session_id)?;
-
+        let caps = self.backend.capabilities();
+        let first = caps.coded_formats.first().ok_or_else(|| {
+            log::error!("decoder: backend has no coded format");
+            libc::ENODEV
+        })?;
+        let coded_size = (
+            first.width.clamp(DEFAULT_CODED_SIZE.0),
+            first.height.clamp(DEFAULT_CODED_SIZE.1),
+        );
+        let fourcc = first.fourcc;
+        let signal = Arc::new(DecoderSignal::new()?);
+        let backend = self
+            .backend
+            .new_session(session_id, DecoderSink(Arc::clone(&signal)))?;
         Ok(VideoDecoderSession {
             id: session_id,
-            backend_session,
-            state: Default::default(),
-            input_buffers: Default::default(),
-            output_buffers: Default::default(),
-            pending_output_buffers: Default::default(),
-            sequence_cpt: 0,
+            signal,
+            backend,
+            codec_started: false,
+            state: StreamingState {
+                output_streaming: false,
+                capture_streaming: false,
+            },
+            drain: Drain::None,
+            input: Queue::default(),
+            output: Queue::default(),
+            coded_format: fourcc,
+            coded_size,
+            output_sizeimage: MIN_BITSTREAM_SIZE,
+            crop: CropRectangle::Settable(v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1)),
+            min_capture_buffers: 1,
+            colorspace: Default::default(),
             src_change_subscribed: false,
             eos_subscribed: false,
-            crop_rectangle: CropRectangle::Settable(v4l2r::Rect::new(0, 0, 0, 0)),
-            colorspace: Default::default(),
+            dead: false,
+            sequence: 0,
         })
     }
 
-    fn close_session(&mut self, session: Self::Session) {
-        // Unregister all MMAP buffers and return their memory.
-        for buffer in session
-            .input_buffers
-            .into_iter()
-            .chain(session.output_buffers.into_iter())
-        {
-            self.free_buffer(buffer);
+    fn close_session(&mut self, mut session: Self::Session) {
+        if self.active_session == Some(session.id) {
+            self.active_session = None;
         }
+        // The backend first, so no thread is writing into a buffer that goes away below.
+        session.backend.stop();
+        self.free_buffers(&mut session.input);
+        self.free_buffers(&mut session.output);
+        self.backend.close_session(session.backend);
     }
 
     fn do_ioctl(
@@ -669,7 +1081,7 @@ where
         ioctl: V4l2Ioctl,
         reader: &mut Reader,
         writer: &mut Writer,
-    ) -> std::io::Result<()> {
+    ) -> IoResult<()> {
         virtio_media_dispatch_ioctl(self, session, ioctl, reader, writer)
     }
 
@@ -679,251 +1091,218 @@ where
         flags: u32,
         offset: u32,
     ) -> Result<(u64, u64), i32> {
-        // Search for a MMAP plane with the right offset.
-        // TODO: O(n), not critical but not great either.
-        let (buffer, plane_idx) = session
-            .input_buffers
+        let host_buffer = session
+            .input
+            .buffers
             .iter()
-            .chain(session.output_buffers.iter())
-            .filter_map(|b| {
-                if let V4l2PlanesWithBacking::Mmap(planes) =
-                    b.v4l2_buffer.planes_with_backing_iter()
-                {
-                    Some(std::iter::repeat(b).zip(planes.enumerate()))
-                } else {
-                    None
-                }
+            .chain(session.output.buffers.iter())
+            .find_map(|b| match &b.backing {
+                Backing::Host { buffer, offset: o } if *o == offset => Some(buffer),
+                _ => None,
             })
-            .flatten()
-            .find(|(_, (_, p))| p.mem_offset() == offset)
-            .map(|(b, (i, _))| (b, i))
             .ok_or(libc::EINVAL)?;
         let rw = (flags & VIRTIO_MEDIA_MMAP_FLAG_RW) != 0;
-
-        let host_buffer = buffer
-            .backing
-            .buffer_for_plane(plane_idx)
-            .ok_or(libc::EINVAL)?;
-
-        self.host_mapper
+        self.mmap_manager
             .create_mapping(offset, host_buffer, rw)
             .map_err(|e| {
-                log::error!(
-                    "failed to map MMAP buffer at offset 0x{:x}: {:#}",
-                    offset,
-                    e
-                );
+                log::error!("failed to map MMAP buffer at offset {:#x}: {:#}", offset, e);
                 libc::EINVAL
             })
     }
 
     fn do_munmap(&mut self, guest_addr: u64) -> Result<(), i32> {
         let res = self
-            .host_mapper
+            .mmap_manager
             .remove_mapping(guest_addr)
             .map(|_| ())
             .map_err(|_| libc::EINVAL);
-        self.retired.reap(&self.host_mapper, &mut self.allocator);
+        self.retired.reap(&self.mmap_manager, &mut self.allocator);
         res
     }
 
+    /// The session's eventfd is readable: collect what the backend has produced.
     fn process_events(&mut self, session: &mut Self::Session) -> Result<(), i32> {
-        let has_event = if let Some(event) = session.backend_session.next_event() {
-            match event {
-                VideoDecoderBackendEvent::InputBufferDone(id) => {
-                    let Some(buffer) = session.input_buffers.get_mut(id as usize) else {
-                        log::error!("no matching OUTPUT buffer with id {} to process event", id);
-                        return Ok(());
-                    };
-
-                    buffer.v4l2_buffer.clear_flags(BufferFlags::QUEUED);
-
-                    self.event_queue
-                        .send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
-                            session.id,
-                            buffer.v4l2_buffer.clone(),
-                        )));
-                }
-                VideoDecoderBackendEvent::StreamFormatChanged => {
-                    let stream_params = session.backend_session.stream_params();
-
-                    // The crop rectangle is now determined by the stream and cannot be changed.
-                    session.crop_rectangle = CropRectangle::FromStream(stream_params.visible_rect);
-
-                    if session.src_change_subscribed {
-                        self.event_queue
-                            .send_event(V4l2Event::Event(SessionEvent::new(
-                                session.id,
-                                bindings::v4l2_event {
-                                    type_: bindings::V4L2_EVENT_SOURCE_CHANGE,
-                                    u: bindings::v4l2_event__bindgen_ty_1 {
-                                        src_change: bindings::v4l2_event_src_change {
-                                            changes: SrcChanges::RESOLUTION.bits(),
-                                        },
-                                    },
-                                    // TODO: fill pending, sequence, and timestamp.
-                                    ..Default::default()
-                                },
-                            )))
-                    }
-                }
-                VideoDecoderBackendEvent::FrameCompleted {
-                    buffer_id,
-                    timestamp,
-                    bytes_used,
-                    is_last,
-                } => {
-                    let Some(buffer) = session.output_buffers.get_mut(buffer_id as usize) else {
-                        log::error!(
-                            "no matching CAPTURE buffer with id {} to process event",
-                            buffer_id
-                        );
-                        return Ok(());
-                    };
-
-                    buffer.v4l2_buffer.clear_flags(BufferFlags::QUEUED);
-                    buffer.v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
-                    if is_last {
-                        buffer.v4l2_buffer.set_flags(BufferFlags::LAST);
-                    }
-                    buffer.v4l2_buffer.set_sequence(session.sequence_cpt);
-                    session.sequence_cpt += 1;
-                    buffer.v4l2_buffer.set_timestamp(timestamp);
-                    let first_plane = buffer.v4l2_buffer.get_first_plane_mut();
-                    *first_plane.bytesused = bytes_used.first().copied().unwrap_or(0);
-                    self.event_queue
-                        .send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
-                            session.id,
-                            buffer.v4l2_buffer.clone(),
-                        )));
-
-                    if is_last && session.eos_subscribed {
-                        self.event_queue
-                            .send_event(V4l2Event::Event(SessionEvent::new(
-                                session.id,
-                                bindings::v4l2_event {
-                                    type_: bindings::V4L2_EVENT_EOS,
-                                    ..Default::default()
-                                },
-                            )))
-                    }
-                }
-            }
-            true
-        } else {
-            false
-        };
-
-        if !has_event {
-            log::warn!("process_events called but no event was pending");
+        session.signal.drain();
+        if session.dead {
+            return Ok(());
         }
-
+        let events = session.backend.take_events();
+        for event in events {
+            self.handle_event(session, event);
+            if session.dead {
+                break;
+            }
+        }
         Ok(())
     }
 }
 
-impl<B, Q, HM, A> VirtioMediaIoctlHandler for VideoDecoder<B, Q, HM, A>
+impl<B, Q, M, HM, A> VirtioMediaIoctlHandler for VideoDecoder<B, Q, M, HM, A>
 where
     B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
+    M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
     A: VirtioMediaBufferAllocator,
 {
-    type Session = VideoDecoderSession<B::Session>;
+    type Session = VideoDecoderSession<M::GuestMemoryMapping, B::Session>;
 
     fn enum_fmt(
         &mut self,
-        session: &Self::Session,
+        _session: &Self::Session,
         queue: QueueType,
         index: u32,
-    ) -> IoctlResult<bindings::v4l2_fmtdesc> {
-        match queue {
-            QueueType::VideoOutputMplane | QueueType::VideoCaptureMplane => {
-                self.backend.enum_formats(session, queue.direction(), index)
+    ) -> IoctlResult<v4l2_fmtdesc> {
+        let (fourcc, flags) = match queue {
+            QueueType::VideoOutputMplane => {
+                let f = self
+                    .backend
+                    .capabilities()
+                    .coded_formats
+                    .get(index as usize)
+                    .ok_or(libc::EINVAL)?;
+                let mut flags = bindings::V4L2_FMT_FLAG_COMPRESSED;
+                if f.dynamic_resolution {
+                    flags |= bindings::V4L2_FMT_FLAG_DYN_RESOLUTION;
+                }
+                (f.fourcc, flags)
             }
-            _ => None,
-        }
-        .ok_or(libc::EINVAL)
+            QueueType::VideoCaptureMplane => {
+                if index != 0 {
+                    return Err(libc::EINVAL);
+                }
+                (NV12, 0)
+            }
+            _ => return Err(libc::EINVAL),
+        };
+        let mut desc = v4l2_fmtdesc {
+            index,
+            type_: queue as u32,
+            flags,
+            pixelformat: fourcc.to_u32(),
+            ..Default::default()
+        };
+        let description = fourcc_description(fourcc);
+        desc.description[..description.len()].copy_from_slice(description);
+        Ok(desc)
     }
 
+    /// Stepwise frame sizes for a coded (OUTPUT) format or for NV12 (CAPTURE). A decoder has no
+    /// frame rate, so `ENUM_FRAMEINTERVALS` and `G/S_PARM` are left at their `ENOTTY` default,
+    /// which `v4l2-compliance` requires of an m2m decoder.
     fn enum_framesizes(
         &mut self,
         _session: &Self::Session,
         index: u32,
         pixel_format: u32,
-    ) -> IoctlResult<bindings::v4l2_frmsizeenum> {
-        // We only support step-wise frame sizes.
+    ) -> IoctlResult<v4l2_frmsizeenum> {
         if index != 0 {
             return Err(libc::EINVAL);
         }
-
-        Ok(bindings::v4l2_frmsizeenum {
+        let caps = self.backend.capabilities();
+        let asked = PixelFormat::from_u32(pixel_format);
+        // For NV12 (CAPTURE) the sizes follow the first coded format the decoder offers.
+        let coded = if asked == NV12 {
+            caps.coded_formats.first()
+        } else {
+            caps.coded_format(asked)
+        }
+        .ok_or(libc::EINVAL)?;
+        Ok(v4l2_frmsizeenum {
             index: 0,
             pixel_format,
             type_: bindings::v4l2_frmsizetypes_V4L2_FRMSIZE_TYPE_STEPWISE,
             __bindgen_anon_1: bindings::v4l2_frmsizeenum__bindgen_ty_1 {
-                stepwise: self.backend.frame_sizes(pixel_format).ok_or(libc::EINVAL)?,
+                stepwise: bindings::v4l2_frmsize_stepwise {
+                    min_width: coded.width.min,
+                    max_width: coded.width.max,
+                    step_width: coded.width.step.max(1),
+                    min_height: coded.height.min,
+                    max_height: coded.height.max,
+                    step_height: coded.height.step.max(1),
+                },
             },
             ..Default::default()
         })
     }
 
-    fn g_fmt(
-        &mut self,
-        session: &Self::Session,
-        queue: QueueType,
-    ) -> IoctlResult<bindings::v4l2_format> {
-        if !matches!(
-            queue,
-            QueueType::VideoOutputMplane | QueueType::VideoCaptureMplane,
-        ) {
-            return Err(libc::EINVAL);
-        }
-
-        let format = session.current_format(queue.direction());
-        let v4l2_format: &bindings::v4l2_format = format.as_ref();
-        Ok(*v4l2_format)
+    fn g_fmt(&mut self, session: &Self::Session, queue: QueueType) -> IoctlResult<v4l2_format> {
+        Ok(session.format(queue.direction_or_einval()?))
     }
 
     fn try_fmt(
         &mut self,
         session: &Self::Session,
         queue: QueueType,
-        format: bindings::v4l2_format,
-    ) -> IoctlResult<bindings::v4l2_format> {
-        let format = self.try_format(session, queue, format)?;
-
-        let v4l2_format: &bindings::v4l2_format = format.as_ref();
-        Ok(*v4l2_format)
+        format: v4l2_format,
+    ) -> IoctlResult<v4l2_format> {
+        let direction = queue.direction_or_einval()?;
+        // SAFETY: both accepted queue types are multi-planar, so `pix_mp` is the live member.
+        let pix_mp = unsafe { format.fmt.pix_mp };
+        match direction {
+            QueueDirection::Output => {
+                let coded = self.adjust_coded_format(pix_mp.pixelformat)?;
+                let width = coded.width.clamp(if pix_mp.width == 0 {
+                    session.coded_size.0
+                } else {
+                    pix_mp.width
+                });
+                let height = coded.height.clamp(if pix_mp.height == 0 {
+                    session.coded_size.1
+                } else {
+                    pix_mp.height
+                });
+                let sizeimage = pix_mp.plane_fmt[0]
+                    .sizeimage
+                    .max(nv12_sizeimage(width, height) / 2)
+                    .max(MIN_BITSTREAM_SIZE);
+                let colorspace = V4l2FormatColorspace::from_pix_mp(&pix_mp);
+                Ok(coded_output_format(coded.fourcc, width, height, sizeimage, colorspace))
+            }
+            // CAPTURE is always NV12 at the current coded size; only the size may be echoed.
+            QueueDirection::Capture => Ok(session.format(QueueDirection::Capture)),
+        }
     }
 
     fn s_fmt(
         &mut self,
         session: &mut Self::Session,
         queue: QueueType,
-        format: bindings::v4l2_format,
-    ) -> IoctlResult<bindings::v4l2_format> {
-        let format = self.try_format(session, queue, format)?;
-
-        self.backend
-            .apply_format(&mut session.backend_session, queue.direction(), &format);
-
-        //  Setting the colorspace information on the `OUTPUT` queue sets it for both queues.
-        if queue.direction() == QueueDirection::Output {
-            session.colorspace.colorspace = format.colorspace();
-            session.colorspace.xfer_func = format.xfer_func();
-            session.colorspace.ycbcr_enc = format.ycbcr_enc();
-            session.colorspace.quantization = format.quantization();
+        format: v4l2_format,
+    ) -> IoctlResult<v4l2_format> {
+        let direction = queue.direction_or_einval()?;
+        if session.dead {
+            return Err(libc::ENODEV);
         }
-
-        // If the crop rectangle is still settable, adjust it to the size of the new format.
-        if let CropRectangle::Settable(rect) = &mut session.crop_rectangle {
-            let (width, height) = format.size();
-            *rect = v4l2r::Rect::new(0, 0, width, height);
+        match direction {
+            QueueDirection::Output => {
+                // The OUTPUT format governs the decode; changing it while buffers are allocated
+                // is refused, and a running codec cannot be reconfigured (kernel decoder
+                // interface, "Commit Points").
+                if !session.input.buffers.is_empty()
+                    || !session.output.buffers.is_empty()
+                    || session.codec_started
+                {
+                    return Err(libc::EBUSY);
+                }
+                let adjusted = self.try_fmt(session, queue, format)?;
+                // SAFETY: multi-planar.
+                let pix_mp = unsafe { adjusted.fmt.pix_mp };
+                session.coded_format = PixelFormat::from_u32(pix_mp.pixelformat);
+                session.coded_size = (pix_mp.width, pix_mp.height);
+                session.output_sizeimage = pix_mp.plane_fmt[0].sizeimage;
+                session.colorspace = V4l2FormatColorspace::from_pix_mp(&pix_mp);
+                if let CropRectangle::Settable(rect) = &mut session.crop {
+                    *rect = v4l2r::Rect::new(0, 0, pix_mp.width, pix_mp.height);
+                }
+                Ok(adjusted)
+            }
+            QueueDirection::Capture => {
+                // The client may set the CAPTURE format but the decoder only offers NV12 at the
+                // established coded size; the pixel format is not negotiable.
+                Ok(session.format(QueueDirection::Capture))
+            }
         }
-
-        let v4l2_format: &bindings::v4l2_format = format.as_ref();
-        Ok(*v4l2_format)
     }
 
     fn reqbufs(
@@ -932,75 +1311,98 @@ where
         queue: QueueType,
         memory: MemoryType,
         count: u32,
-    ) -> IoctlResult<bindings::v4l2_requestbuffers> {
-        if memory != MemoryType::Mmap {
+    ) -> IoctlResult<v4l2_requestbuffers> {
+        let direction = queue.direction_or_einval()?;
+        if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
         }
-        // TODO: fail if streaming?
-
-        let (buffers, count) = match queue {
-            QueueType::VideoOutputMplane => (&mut session.input_buffers, count),
-            QueueType::VideoCaptureMplane => (
-                &mut session.output_buffers,
-                // TODO: no no, we need to reallocate all the buffers if the queue parameters have
-                // changed... especially if the new format won't fit into the old buffers!
-                // count.max(session.backend_session.stream_params().min_output_buffers),
-                count,
-            ),
-            _ => return Err(libc::EINVAL),
-        };
-
-        if (count as usize) < buffers.len() {
-            let freed: Vec<_> = buffers.drain(count as usize..).collect();
-            for buffer in freed {
-                self.free_buffer(buffer);
-            }
-        } else {
-            let sizeimage = session
-                .backend_session
-                .current_format(queue.direction())
-                .planes()
-                .first()
-                .ok_or(libc::EINVAL)?
-                .sizeimage;
-            let new_buffers = (buffers.len()..count as usize)
-                .map(|i| {
-                    let mmap_offset = self
-                        .host_mapper
-                        .register_buffer(None, sizeimage)
-                        .map_err(|_| libc::EINVAL)?;
-
-                    VideoDecoderBuffer::new(
-                        queue,
-                        i as u32,
-                        // TODO: only single-planar formats supported.
-                        &[sizeimage as usize],
-                        mmap_offset,
-                        &mut self.allocator,
-                    )
-                    .inspect_err(|_| {
-                        // TODO: no, we need to unregister all the buffers and restore the
-                        // previous state?
-                        self.host_mapper.unregister_buffer(mmap_offset);
-                    })
-                })
-                .collect::<IoctlResult<Vec<_>>>()?;
-            buffers.extend(new_buffers);
+        match self.active_session {
+            Some(id) if id != session.id => return Err(libc::EBUSY),
+            _ => (),
+        }
+        // `REQBUFS(0)` is an implicit `STREAMOFF`.
+        if count == 0 {
+            self.streamoff(session, queue)?;
+        }
+        // Old buffers go first, mappings and all, so the reply never races a stale view. The
+        // backend has stopped touching them (`streamoff` above, or there were none).
+        self.free_buffers(session.queue_mut(queue)?);
+        let count = (count as usize).min(MAX_BUFFERS);
+        if count > 0 {
+            let sizeimage = session.sizeimage(direction);
+            self.add_buffers(session.queue_mut(queue)?, queue, memory, count, sizeimage)?;
+            session.queue_mut(queue)?.memory = Some(memory);
+            self.active_session = Some(session.id);
+        } else if !session.has_buffers() {
+            self.active_session = None;
         }
 
-        session
-            .backend_session
-            .buffers_allocated(queue.direction(), count);
-
-        Ok(bindings::v4l2_requestbuffers {
-            count,
+        Ok(v4l2_requestbuffers {
+            count: count as u32,
             type_: queue as u32,
             memory: memory as u32,
             capabilities: (BufferCapabilities::SUPPORTS_MMAP
+                | BufferCapabilities::SUPPORTS_USERPTR
                 | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
                 .bits(),
-            flags: 0,
-            reserved: Default::default(),
+            ..Default::default()
+        })
+    }
+
+    fn create_bufs(
+        &mut self,
+        session: &mut Self::Session,
+        count: u32,
+        queue: QueueType,
+        memory: MemoryType,
+        format: v4l2_format,
+    ) -> IoctlResult<v4l2_create_buffers> {
+        let direction = queue.direction_or_einval()?;
+        if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
+            return Err(libc::EINVAL);
+        }
+        match self.active_session {
+            Some(id) if id != session.id => return Err(libc::EBUSY),
+            _ => (),
+        }
+        // `CREATE_BUFS` is the one call where the guest sizes the buffers itself, so the format
+        // it hands over is checked rather than adjusted (D6.2/D9, as the loopback and camera do):
+        // one plane, `sizeimage` at least what the queue's own format needs.
+        // SAFETY: both accepted queue types are multi-planar.
+        let pix_mp = unsafe { format.fmt.pix_mp };
+        if pix_mp.num_planes != 1 {
+            return Err(libc::EINVAL);
+        }
+        let asked = pix_mp.plane_fmt[0].sizeimage;
+        if asked < session.sizeimage(direction) {
+            return Err(libc::EINVAL);
+        }
+        {
+            let q = session.queue_mut(queue)?;
+            if let Some(existing) = q.memory {
+                if existing != memory {
+                    return Err(libc::EINVAL);
+                }
+            }
+        }
+        let first = session.queue(queue)?.buffers.len();
+        let count = (count as usize).min(MAX_BUFFERS - first);
+        if count > 0 {
+            self.add_buffers(session.queue_mut(queue)?, queue, memory, count, asked)?;
+            session.queue_mut(queue)?.memory = Some(memory);
+            self.active_session = Some(session.id);
+        }
+
+        Ok(v4l2_create_buffers {
+            index: first as u32,
+            count: count as u32,
+            memory: memory as u32,
+            format: session.format_sized(direction, asked),
+            capabilities: (BufferCapabilities::SUPPORTS_MMAP
+                | BufferCapabilities::SUPPORTS_USERPTR
+                | BufferCapabilities::SUPPORTS_ORPHANED_BUFS)
+                .bits(),
+            ..Default::default()
         })
     }
 
@@ -1010,21 +1412,311 @@ where
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<V4l2Buffer> {
-        let buffers = match queue {
-            QueueType::VideoOutputMplane => &session.input_buffers,
-            QueueType::VideoCaptureMplane => &session.output_buffers,
-            _ => return Err(libc::EINVAL),
-        };
-        let buffer = buffers.get(index as usize).ok_or(libc::EINVAL)?;
-
+        let buffer = session
+            .queue(queue)?
+            .buffers
+            .get(index as usize)
+            .ok_or(libc::EINVAL)?;
         Ok(buffer.v4l2_buffer.clone())
+    }
+
+    fn qbuf(
+        &mut self,
+        session: &mut Self::Session,
+        buffer: V4l2Buffer,
+        guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
+    ) -> IoctlResult<V4l2Buffer> {
+        let queue_type = buffer.queue();
+        let direction = queue_type.direction_or_einval()?;
+        if session.dead {
+            return Err(libc::ENODEV);
+        }
+        let index = buffer.index() as usize;
+        let sizeimage = session.sizeimage(direction);
+        let q = session.queue_mut(queue_type)?;
+        let entry = q.buffers.get_mut(index).ok_or(libc::EINVAL)?;
+        if entry.queued || Some(buffer.memory()) != q.memory {
+            return Err(libc::EINVAL);
+        }
+        // A prepared buffer keeps the payload description `PREPARE_BUF` accepted; V4L2 says this
+        // call's own `bytesused`/`data_offset` are ignored.
+        let prepared = entry.prepared;
+        if prepared.is_none() && !payload_valid {
+            return Err(libc::EINVAL);
+        }
+        // A guest-supplied MPLANE buffer may carry no plane at all; the first plane is asked for,
+        // never assumed (this VMM aborts on panic).
+        let guest_plane = buffer.planes_iter().next().ok_or(libc::EINVAL)?;
+        let guest_bytesused = *guest_plane.bytesused;
+        let guest_length = match prepared {
+            Some((_, length)) => length,
+            None => *guest_plane.length,
+        };
+
+        match &mut entry.backing {
+            Backing::Host { .. } => {
+                let plane = entry.v4l2_buffer.get_first_plane_mut();
+                *plane.bytesused = if direction == QueueDirection::Output {
+                    guest_bytesused
+                } else {
+                    0
+                };
+            }
+            Backing::Guest(slot) => {
+                // `length` sizes the mapping. An OUTPUT buffer holds `bytesused` of bitstream; a
+                // CAPTURE buffer must hold a whole frame. Both are held to what the buffer was
+                // allocated for.
+                if guest_length == 0 || guest_length > entry.size {
+                    return Err(libc::EINVAL);
+                }
+                if direction == QueueDirection::Capture && guest_length < sizeimage {
+                    return Err(libc::EINVAL);
+                }
+                let sgs = guest_regions.into_iter().next().ok_or(libc::EINVAL)?;
+                // OUTPUT is read by the backend; CAPTURE is written by it.
+                let writable = direction == QueueDirection::Capture;
+                let mapping = self.mem.new_mapping_for(sgs, writable).map_err(|e| {
+                    log::error!("failed to map USERPTR buffer: {:#}", e);
+                    guest_mapping_errno(&e)
+                })?;
+                *slot = Some(mapping);
+                if prepared.is_none() {
+                    // The guest's own view of its buffer -- userptr and length -- is echoed back.
+                    let mut v4l2_buffer = buffer.clone();
+                    v4l2_buffer.set_field(BufferField::None);
+                    v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
+                    if direction == QueueDirection::Output {
+                        v4l2_buffer.set_timestamp(buffer.timestamp());
+                        *v4l2_buffer.get_first_plane_mut().bytesused = guest_bytesused;
+                    } else {
+                        *v4l2_buffer.get_first_plane_mut().bytesused = 0;
+                    }
+                    entry.v4l2_buffer = v4l2_buffer;
+                }
+            }
+        }
+
+        if direction == QueueDirection::Output {
+            entry.v4l2_buffer.set_timestamp(buffer.timestamp());
+        }
+        entry.queued = true;
+        entry.prepared = None;
+        entry
+            .v4l2_buffer
+            .clear_flags(BufferFlags::PREPARED | BufferFlags::LAST | BufferFlags::DONE);
+        entry.v4l2_buffer.add_flags(BufferFlags::QUEUED);
+        let reply = entry.v4l2_buffer.clone();
+
+        match direction {
+            QueueDirection::Output => {
+                if session.codec_started && session.state.output_streaming {
+                    if let Err(e) = Self::lend_input(session, index) {
+                        self.end_session(session, &format!("the backend refused input: errno {e}"));
+                        return Err(libc::EIO);
+                    }
+                } else {
+                    session.input.pending.push_back(index);
+                }
+            }
+            QueueDirection::Capture => {
+                session.output.pending.push_back(index);
+                if let Err(e) = self.try_send_pending_capture(session) {
+                    self.end_session(session, &format!("the backend refused a frame: errno {e}"));
+                    return Err(libc::EIO);
+                }
+            }
+        }
+
+        Ok(reply)
+    }
+
+    /// `VIDIOC_PREPARE_BUF`: everything `QBUF` validates, minus the queueing (D6.1, as the
+    /// loopback and camera do). No guest memory is mapped: the driver sends the SG list again
+    /// with the `QBUF` that follows.
+    fn prepare_buf(
+        &mut self,
+        session: &mut Self::Session,
+        buffer: V4l2Buffer,
+        _guest_regions: Vec<Vec<SgEntry>>,
+        payload_valid: bool,
+    ) -> IoctlResult<V4l2Buffer> {
+        if !payload_valid {
+            return Err(libc::EINVAL);
+        }
+        let queue_type = buffer.queue();
+        let direction = queue_type.direction_or_einval()?;
+        let sizeimage = session.sizeimage(direction);
+        let q = session.queue_mut(queue_type)?;
+        let entry = q.buffers.get_mut(buffer.index() as usize).ok_or(libc::EINVAL)?;
+        if entry.queued || entry.prepared.is_some() || Some(buffer.memory()) != q.memory {
+            return Err(libc::EINVAL);
+        }
+
+        let guest_plane = buffer.planes_iter().next().ok_or(libc::EINVAL)?;
+        let guest_bytesused = *guest_plane.bytesused;
+        let guest_length = *guest_plane.length;
+
+        if let Backing::Guest(_) = &entry.backing {
+            if guest_length == 0 || guest_length > entry.size {
+                return Err(libc::EINVAL);
+            }
+            if direction == QueueDirection::Capture && guest_length < sizeimage {
+                return Err(libc::EINVAL);
+            }
+            let mut v4l2_buffer = buffer.clone();
+            v4l2_buffer.set_field(BufferField::None);
+            v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_COPY);
+            entry.v4l2_buffer = v4l2_buffer;
+        }
+
+        let bytesused = if direction == QueueDirection::Output {
+            guest_bytesused
+        } else {
+            0
+        };
+        entry.v4l2_buffer.set_timestamp(Default::default());
+        entry.v4l2_buffer.set_sequence(0);
+        entry
+            .v4l2_buffer
+            .clear_flags(BufferFlags::QUEUED | BufferFlags::DONE | BufferFlags::LAST);
+        *entry.v4l2_buffer.get_first_plane_mut().bytesused = bytesused;
+        entry.v4l2_buffer.add_flags(BufferFlags::PREPARED);
+        entry.prepared = Some((bytesused, guest_length));
+
+        Ok(entry.v4l2_buffer.clone())
+    }
+
+    fn streamon(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
+        let direction = queue.direction_or_einval()?;
+        if session.dead {
+            return Err(libc::ENODEV);
+        }
+        if session.queue(queue)?.buffers.is_empty() {
+            return Err(libc::EINVAL);
+        }
+        match direction {
+            QueueDirection::Output => {
+                if session.state.output_streaming {
+                    return Ok(());
+                }
+                // The codec is created at the first OUTPUT streamon; a later streamon after a
+                // seek (STREAMOFF(OUTPUT)) just resumes it.
+                if !session.codec_started {
+                    let (fmt, size) = (session.coded_format, session.coded_size);
+                    session.backend.start(fmt, size)?;
+                    session.codec_started = true;
+                }
+                session.state.output_streaming = true;
+                // Lend every OUTPUT buffer queued before streaming.
+                while let Some(index) = session.input.pending.pop_front() {
+                    if let Err(e) = Self::lend_input(session, index) {
+                        self.end_session(session, &format!("the backend refused input: errno {e}"));
+                        return Err(libc::EIO);
+                    }
+                }
+                self.try_send_pending_capture(session)?;
+            }
+            QueueDirection::Capture => {
+                if session.state.capture_streaming {
+                    return Ok(());
+                }
+                session.state.capture_streaming = true;
+                // A CAPTURE restart clears a finished drain (kernel decoder interface, drain).
+                if session.drain == Drain::Done {
+                    session.drain = Drain::None;
+                }
+                self.try_send_pending_capture(session)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn streamoff(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
+        let direction = queue.direction_or_einval()?;
+        match direction {
+            QueueDirection::Output => {
+                // Seek: the backend drops its pending input; the CAPTURE queue keeps streaming.
+                if session.codec_started && !session.dead {
+                    session.backend.flush()?;
+                }
+                session.state.output_streaming = false;
+                session.input.pending.clear();
+                session.drain = Drain::None;
+                for buffer in session.input.buffers.iter_mut() {
+                    buffer.unqueue();
+                }
+            }
+            QueueDirection::Capture => {
+                // The backend must stop writing CAPTURE buffers before we release them (§2.5).
+                if session.codec_started && !session.dead {
+                    session.backend.clear_capture_buffers()?;
+                }
+                session.state.capture_streaming = false;
+                session.output.pending.clear();
+                session.drain = Drain::None;
+                for buffer in session.output.buffers.iter_mut() {
+                    buffer.unqueue();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn g_selection(
+        &mut self,
+        session: &Self::Session,
+        sel_type: SelectionType,
+        sel_target: SelectionTarget,
+    ) -> IoctlResult<bindings::v4l2_rect> {
+        match (sel_type, sel_target) {
+            // Coded resolution of the stream.
+            (SelectionType::Capture, SelectionTarget::CropBounds) => {
+                Ok(v4l2r::Rect::new(0, 0, session.coded_size.0, session.coded_size.1).into())
+            }
+            // Visible area of CAPTURE buffers.
+            (
+                SelectionType::Capture,
+                SelectionTarget::Crop
+                | SelectionTarget::CropDefault
+                | SelectionTarget::ComposeDefault
+                | SelectionTarget::ComposeBounds
+                | SelectionTarget::Compose,
+            ) => Ok(session.crop.rect().into()),
+            _ => Err(libc::EINVAL),
+        }
+    }
+
+    fn s_selection(
+        &mut self,
+        session: &mut Self::Session,
+        sel_type: SelectionType,
+        sel_target: SelectionTarget,
+        mut sel_rect: bindings::v4l2_rect,
+        _sel_flags: SelectionFlags,
+    ) -> IoctlResult<bindings::v4l2_rect> {
+        if !matches!(
+            (sel_type, sel_target),
+            (SelectionType::Capture, SelectionTarget::Compose)
+        ) {
+            return Err(libc::EINVAL);
+        }
+        // Settable only until the stream fixes the crop.
+        if let CropRectangle::Settable(rect) = &mut session.crop {
+            sel_rect.left = sel_rect.left.max(0);
+            sel_rect.top = sel_rect.top.max(0);
+            sel_rect.width = sel_rect.width.min(session.coded_size.0);
+            sel_rect.height = sel_rect.height.min(session.coded_size.1);
+            *rect = sel_rect.into();
+        }
+        self.g_selection(session, sel_type, sel_target)
     }
 
     fn subscribe_event(
         &mut self,
         session: &mut Self::Session,
-        event: v4l2r::ioctl::EventType,
-        _flags: v4l2r::ioctl::SubscribeEventFlags,
+        event: EventType,
+        _flags: SubscribeEventFlags,
     ) -> IoctlResult<()> {
         match event {
             EventType::SourceChange(0) => {
@@ -1039,24 +1731,21 @@ where
         }
     }
 
-    // TODO: parse the event and use an enum value to signal ALL or single event?
     fn unsubscribe_event(
         &mut self,
         session: &mut Self::Session,
-        event: bindings::v4l2_event_subscription,
+        event: v4l2_event_subscription,
     ) -> IoctlResult<()> {
-        let mut valid = false;
-
-        if event.type_ == 0 || matches!(EventType::try_from(&event), Ok(EventType::SourceChange(0)))
-        {
+        let all = event.type_ == bindings::V4L2_EVENT_ALL;
+        let mut valid = all;
+        if all || matches!(EventType::try_from(&event), Ok(EventType::SourceChange(0))) {
             session.src_change_subscribed = false;
             valid = true;
         }
-        if event.type_ == 0 || matches!(EventType::try_from(&event), Ok(EventType::Eos)) {
+        if all || matches!(EventType::try_from(&event), Ok(EventType::Eos)) {
             session.eos_subscribed = false;
             valid = true;
         }
-
         if valid {
             Ok(())
         } else {
@@ -1064,278 +1753,125 @@ where
         }
     }
 
-    fn streamon(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
-        let buffers = match queue {
-            QueueType::VideoOutputMplane => &session.input_buffers,
-            QueueType::VideoCaptureMplane => &session.output_buffers,
-            _ => return Err(libc::EINVAL),
-        };
-
-        let already_running = matches!(session.state, VideoDecoderStreamingState::Running);
-
-        // Cannot stream if no buffers allocated.
-        if buffers.is_empty() {
-            return Err(libc::EINVAL);
-        }
-
-        match queue.direction() {
-            QueueDirection::Output => session.state.input_streamon(),
-            QueueDirection::Capture => session.state.output_streamon(),
-        }
-
-        session
-            .backend_session
-            .streaming_state(queue.direction(), true);
-
-        if !already_running && matches!(session.state, VideoDecoderStreamingState::Running) {
-            // TODO: start queueing pending buffers?
-        }
-
-        session.try_send_pending_output_buffers();
-
-        Ok(())
-    }
-
-    fn streamoff(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
-        let buffers = match queue.direction() {
-            QueueDirection::Output => {
-                // TODO: something to do on the backend?
-                session.state.input_streamoff();
-
-                &mut session.input_buffers
-            }
-            QueueDirection::Capture => {
-                session.backend_session.clear_output_buffers()?;
-                session.state.output_streamoff();
-                session.pending_output_buffers.clear();
-
-                &mut session.output_buffers
-            }
-        };
-
-        for buffer in buffers {
-            buffer.v4l2_buffer.clear_flags(BufferFlags::QUEUED);
-        }
-
-        session
-            .backend_session
-            .streaming_state(queue.direction(), false);
-
-        Ok(())
-    }
-
-    fn g_selection(
-        &mut self,
-        session: &Self::Session,
-        sel_type: SelectionType,
-        sel_target: SelectionTarget,
-    ) -> IoctlResult<bindings::v4l2_rect> {
-        match (sel_type, sel_target) {
-            // Coded resolution of the stream.
-            (SelectionType::Capture, SelectionTarget::CropBounds) => {
-                let coded_size = session.backend_session.stream_params().coded_size;
-                Ok(v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1).into())
-            }
-            // Visible area of CAPTURE buffers.
-            (
-                SelectionType::Capture,
-                SelectionTarget::Crop
-                | SelectionTarget::CropDefault
-                | SelectionTarget::ComposeDefault
-                | SelectionTarget::ComposeBounds
-                | SelectionTarget::Compose,
-            ) => {
-                //Ok(session.backend_session.stream_params().visible_rect.into())
-                Ok((*session.crop_rectangle).into())
-            }
-            _ => Err(libc::EINVAL),
-        }
-    }
-
-    fn s_selection(
-        &mut self,
-        session: &mut Self::Session,
-        sel_type: SelectionType,
-        sel_target: SelectionTarget,
-        mut sel_rect: bindings::v4l2_rect,
-        _sel_flags: v4l2r::ioctl::SelectionFlags,
-    ) -> IoctlResult<bindings::v4l2_rect> {
-        if !matches!(
-            (sel_type, sel_target),
-            (SelectionType::Capture, SelectionTarget::Compose)
-        ) {
-            return Err(libc::EINVAL);
-        }
-
-        // If the crop rectangle is still settable, allow its modification within the bounds of the
-        // coded resolution.
-        if let CropRectangle::Settable(rect) = &mut session.crop_rectangle {
-            let coded_size = session
-                .backend_session
-                .current_format(QueueDirection::Capture)
-                .size();
-            sel_rect.left = std::cmp::max(0, sel_rect.left);
-            sel_rect.top = std::cmp::max(0, sel_rect.top);
-            sel_rect.width = std::cmp::min(coded_size.0, sel_rect.width - sel_rect.left as u32);
-            sel_rect.height = std::cmp::min(coded_size.0, sel_rect.height - sel_rect.top as u32);
-
-            *rect = sel_rect.into();
-        }
-
-        self.g_selection(session, sel_type, sel_target)
-    }
-
-    fn qbuf(
-        &mut self,
-        session: &mut Self::Session,
-        buffer: V4l2Buffer,
-        _guest_regions: Vec<Vec<SgEntry>>,
-        payload_valid: bool,
-    ) -> IoctlResult<V4l2Buffer> {
-        // This device has no `PREPARE_BUF`, so a payload description that does not fit the
-        // buffer is always the guest's mistake.
-        if !payload_valid {
-            return Err(libc::EINVAL);
-        }
-        let buffers = match buffer.queue() {
-            QueueType::VideoOutputMplane => &mut session.input_buffers,
-            QueueType::VideoCaptureMplane => &mut session.output_buffers,
-            _ => return Err(libc::EINVAL),
-        };
-        let host_buffer = buffers
-            .get_mut(buffer.index() as usize)
-            .ok_or(libc::EINVAL)?;
-
-        // Check that the buffer's memory type corresponds to the one requested during allocation.
-        if buffer.memory() != host_buffer.v4l2_buffer.memory() {
-            return Err(libc::EINVAL);
-        }
-        // A guest-supplied MPLANE buffer may carry no plane at all (v4l2r only refuses
-        // `length >= VIDEO_MAX_PLANES`), so the guest's first plane is asked for rather than
-        // assumed: `get_first_plane()` would panic on it.
-        if buffer.planes_iter().next().is_none() {
-            return Err(libc::EINVAL);
-        }
-
-        match buffer.queue().direction() {
-            QueueDirection::Output => {
-                // Update buffer state
-                let v4l2_buffer = &mut host_buffer.v4l2_buffer;
-                v4l2_buffer.set_field(BufferField::None);
-                v4l2_buffer.set_timestamp(buffer.timestamp());
-                let first_plane = buffer.get_first_plane();
-                *v4l2_buffer.get_first_plane_mut().bytesused = *first_plane.bytesused;
-                let host_first_plane = v4l2_buffer.get_first_plane_mut();
-                *host_first_plane.length = *first_plane.length;
-                *host_first_plane.bytesused = *first_plane.bytesused;
-                if let Some(data_offset) = host_first_plane.data_offset {
-                    *data_offset = first_plane.data_offset.copied().unwrap_or(0);
-                }
-
-                let bytes_used = {
-                    let first_plane = host_buffer.v4l2_buffer.get_first_plane();
-                    // V4L2's spec mentions that if `bytes_used == 0` then the whole buffer is considered to be
-                    // used.
-                    if *first_plane.bytesused == 0 {
-                        *first_plane.length
-                    } else {
-                        *first_plane.bytesused
-                    }
-                };
-
-                session.backend_session.decode(
-                    &host_buffer.backing,
-                    host_buffer.index(),
-                    host_buffer.timestamp(),
-                    bytes_used,
-                )?;
-
-                host_buffer.v4l2_buffer.add_flags(BufferFlags::QUEUED);
-
-                Ok(host_buffer.v4l2_buffer.clone())
-            }
-            QueueDirection::Capture => {
-                // Update buffer state
-                let v4l2_buffer = &mut host_buffer.v4l2_buffer;
-                v4l2_buffer.add_flags(BufferFlags::QUEUED);
-                v4l2_buffer.clear_flags(BufferFlags::LAST);
-                let host_first_plane = v4l2_buffer.get_first_plane_mut();
-                let first_plane = buffer.get_first_plane();
-                *host_first_plane.length = *first_plane.length;
-                *host_first_plane.bytesused = *first_plane.bytesused;
-                if let Some(data_offset) = host_first_plane.data_offset {
-                    *data_offset = first_plane.data_offset.copied().unwrap_or(0);
-                }
-
-                let res = v4l2_buffer.clone();
-
-                session.pending_output_buffers.push(buffer.index());
-                session.try_send_pending_output_buffers();
-
-                Ok(res)
-            }
+    /// The only control the decoder answers: `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, which GStreamer
+    /// reads to size its CAPTURE pool. Full control enumeration (`QUERYCTRL` / the codec control
+    /// class) is M5; see the report.
+    fn g_ctrl(&mut self, session: &Self::Session, id: u32) -> IoctlResult<v4l2_control> {
+        if id == bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE {
+            Ok(v4l2_control {
+                id,
+                value: session.min_capture_buffers.max(1) as i32,
+            })
+        } else {
+            Err(libc::EINVAL)
         }
     }
 
     fn try_decoder_cmd(
         &mut self,
-        session: &Self::Session,
-        cmd: bindings::v4l2_decoder_cmd,
-    ) -> IoctlResult<bindings::v4l2_decoder_cmd> {
-        let cmd = DecoderCmd::try_from(cmd).map_err(|_| libc::EINVAL)?;
-        session.try_decoder_cmd(cmd).map(Into::into)
+        _session: &Self::Session,
+        cmd: v4l2_decoder_cmd,
+    ) -> IoctlResult<v4l2_decoder_cmd> {
+        normalize_decoder_cmd(cmd)
     }
 
     fn decoder_cmd(
         &mut self,
         session: &mut Self::Session,
-        cmd: bindings::v4l2_decoder_cmd,
-    ) -> IoctlResult<bindings::v4l2_decoder_cmd> {
-        let cmd = DecoderCmd::try_from(cmd).map_err(|_| libc::EINVAL)?;
-        let cmd = session.try_decoder_cmd(cmd)?;
-
-        // The command is valid, apply it.
-        match cmd {
-            DecoderCmd::Stop { .. } => {
-                // Switch to stopped state if we aren't already there.
-                if !matches!(session.state, VideoDecoderStreamingState::Stopped { .. }) {
-                    session.state = VideoDecoderStreamingState::Stopped {
-                        input_streaming: true,
-                        output_streaming: true,
-                    };
-
-                    // Start the `DRAIN` sequence.
-                    session.backend_session.drain()?;
-                }
-            }
-            DecoderCmd::Start { .. } => {
-                // Restart the decoder if we were in the stopped state with both queues streaming.
-                if let VideoDecoderStreamingState::Stopped {
-                    input_streaming,
-                    output_streaming,
-                } = &session.state
-                {
-                    if *input_streaming && *output_streaming {
-                        session.state = VideoDecoderStreamingState::Running;
-                        session
-                            .backend_session
-                            .streaming_state(QueueDirection::Capture, true);
-                    }
-                    session.try_send_pending_output_buffers();
-                }
-            }
-            DecoderCmd::Pause { .. } => {
-                if matches!(session.state, VideoDecoderStreamingState::Running) {
-                    session.state = VideoDecoderStreamingState::Paused;
-                }
-            }
-            DecoderCmd::Resume => {
-                if matches!(session.state, VideoDecoderStreamingState::Paused) {
-                    session.state = VideoDecoderStreamingState::Running;
-                }
-            }
+        cmd: v4l2_decoder_cmd,
+    ) -> IoctlResult<v4l2_decoder_cmd> {
+        let cmd = normalize_decoder_cmd(cmd)?;
+        if session.dead {
+            return Err(libc::ENODEV);
         }
-
-        Ok(cmd.into())
+        match cmd.cmd {
+            bindings::V4L2_DEC_CMD_STOP => {
+                // The drain only starts if both queues stream; otherwise it is a no-op success
+                // (kernel decoder interface, "Drain").
+                if session.state.running() && session.drain == Drain::None {
+                    session.drain = Drain::Pending;
+                    session.backend.drain()?;
+                }
+            }
+            bindings::V4L2_DEC_CMD_START => {
+                if session.drain != Drain::None {
+                    session.drain = Drain::None;
+                    self.try_send_pending_capture(session)?;
+                }
+            }
+            _ => return Err(libc::EINVAL),
+        }
+        Ok(cmd)
     }
 }
+
+/// A coded (OUTPUT) `v4l2_format`. Compressed formats carry `width`/`height` (the coded size) but
+/// `bytesperline = 0`, and a single plane sized `sizeimage`.
+fn coded_output_format(
+    fourcc: PixelFormat,
+    width: u32,
+    height: u32,
+    sizeimage: u32,
+    colorspace: V4l2FormatColorspace,
+) -> v4l2_format {
+    let mut pix_mp = bindings::v4l2_pix_format_mplane {
+        width,
+        height,
+        pixelformat: fourcc.to_u32(),
+        field: bindings::v4l2_field_V4L2_FIELD_NONE,
+        num_planes: 1,
+        ..Default::default()
+    };
+    colorspace.apply(&mut pix_mp);
+    pix_mp.plane_fmt[0] = bindings::v4l2_plane_pix_format {
+        sizeimage,
+        bytesperline: 0,
+        ..Default::default()
+    };
+    v4l2_format {
+        type_: QueueType::VideoOutputMplane as u32,
+        fmt: bindings::v4l2_format__bindgen_ty_1 { pix_mp },
+    }
+}
+
+/// `V4L2_DEC_CMD_STOP` / `START` reduced to what a decoder implements: `STOP` and `START` with
+/// their flags and `start` parameters cleared (a decoder honours none of them), `PAUSE` / `RESUME`
+/// `EINVAL`. `v4l2-compliance`'s `testDecoder` checks exactly this.
+fn normalize_decoder_cmd(cmd: v4l2_decoder_cmd) -> IoctlResult<v4l2_decoder_cmd> {
+    let anon = match cmd.cmd {
+        bindings::V4L2_DEC_CMD_STOP => bindings::v4l2_decoder_cmd__bindgen_ty_1 {
+            stop: bindings::v4l2_decoder_cmd__bindgen_ty_1__bindgen_ty_1 { pts: 0 },
+        },
+        bindings::V4L2_DEC_CMD_START => bindings::v4l2_decoder_cmd__bindgen_ty_1 {
+            start: bindings::v4l2_decoder_cmd__bindgen_ty_1__bindgen_ty_2 {
+                speed: 0,
+                format: 0,
+            },
+        },
+        _ => return Err(libc::EINVAL),
+    };
+    Ok(v4l2_decoder_cmd {
+        cmd: cmd.cmd,
+        flags: 0,
+        __bindgen_anon_1: anon,
+    })
+}
+
+/// Small helper: a queue type's direction, or `EINVAL` for a non-video-mplane queue.
+trait QueueDirectionExt {
+    fn direction_or_einval(self) -> IoctlResult<QueueDirection>;
+}
+
+impl QueueDirectionExt for QueueType {
+    fn direction_or_einval(self) -> IoctlResult<QueueDirection> {
+        match self {
+            QueueType::VideoOutputMplane => Ok(QueueDirection::Output),
+            QueueType::VideoCaptureMplane => Ok(QueueDirection::Capture),
+            _ => Err(libc::EINVAL),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "video_decoder_tests.rs"]
+mod tests;

@@ -26,6 +26,7 @@ rust_library {
         "default",
         "loopback-device",
         "simple-device",
+        "video-decoder-device",
     ],
     rustlibs: [
         "libanyhow",
@@ -63,6 +64,7 @@ rust_test {
         "default",
         "loopback-device",
         "simple-device",
+        "video-decoder-device",
     ],
     rustlibs: [
         "libanyhow",

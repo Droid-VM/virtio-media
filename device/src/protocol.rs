@@ -322,6 +322,11 @@ impl SessionEvent {
             v4l2_event,
         }
     }
+
+    /// The V4L2 event carried, so a consumer can tell a `SOURCE_CHANGE` from an `EOS`.
+    pub fn event(&self) -> &v4l2_event {
+        &self.v4l2_event
+    }
 }
 
 #[allow(clippy::large_enum_variant)]

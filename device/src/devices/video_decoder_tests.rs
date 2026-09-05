@@ -185,17 +185,32 @@ struct FakeLog {
     /// `use_as_capture` (device thread), removed when the frame is written or when the backend
     /// is joined. A guest mapping released while its pointer is in here is the R1 violation.
     holding: HashSet<usize>,
+    /// `resume` calls (`V4L2_DEC_CMD_START`).
+    resumes: usize,
+    /// The `len` of every OUTPUT buffer lent through `decode`, in order.
+    decoded_lens: Vec<usize>,
+    /// The next `flush` / `clear_capture_buffers` / `use_as_capture` / `drain` fails with this
+    /// errno (once): the wedged-codec case the device's bounds exist for.
+    fail_flush: Option<i32>,
+    fail_clear: Option<i32>,
+    fail_use_capture: Option<i32>,
+    fail_drain: Option<i32>,
 }
 
 type SharedLog = Arc<Mutex<FakeLog>>;
 
-/// The bitstream's first byte that makes the fake report a mid-stream resolution change the way
-/// the MediaCodec backend does today: the new size is announced and no `CAPTURE` buffer is marked
-/// (`M6-backend` §10 item 2).
+/// The bitstream's first byte that makes the fake report a mid-stream resolution change from a
+/// backend that marks nothing: the new size is announced and no `CAPTURE` buffer is marked. The
+/// device then owes the client the `LAST` buffer itself (review-m6 R6-2).
 const DRC_MAGIC: u8 = 0xff;
-/// The same change, marked as the kernel asks and as `F7.md`'s crosvm change makes the MediaCodec
-/// backend do: the frames of the old size, then an empty `LAST` buffer, then the announcement.
+/// The same change, marked as the kernel asks: the frames of the old size, then an empty `LAST`
+/// buffer, then the announcement.
 const DRC_LAST_MAGIC: u8 = 0xfe;
+/// The same change in the order the MediaCodec backend uses (`android.rs` `announce`): the frames
+/// of the old size, the announcement, then the empty `LAST` buffer right behind it -- the order
+/// the kernel's decoder interface documents, and the one GStreamer and ffmpeg both poll for
+/// (`POLLPRI` before `POLLIN`).
+const DRC_LAST_AFTER_MAGIC: u8 = 0xfd;
 /// The resolution the fake "parses" out of the stream, whatever coded size the client set as a
 /// placeholder on `S_FMT(OUTPUT)`. A real decoder reads this from the bitstream.
 const FAKE_STREAM_SIZE: (u32, u32) = (320, 240);
@@ -353,7 +368,10 @@ impl VideoDecoderBackend for FakeBackend {
                     } => {
                         // The input is consumed at once.
                         emit(DecoderEvent::InputBufferDone(index));
-                        if first_byte == DRC_MAGIC || first_byte == DRC_LAST_MAGIC {
+                        if first_byte == DRC_MAGIC
+                            || first_byte == DRC_LAST_MAGIC
+                            || first_byte == DRC_LAST_AFTER_MAGIC
+                        {
                             // Mid-stream resolution change: halve the size (kept even).
                             let new_size = (
                                 (coded_size.0 / 2).max(2) & !1,
@@ -364,6 +382,24 @@ impl VideoDecoderBackend for FakeBackend {
                                 // then the announcement.
                                 pending_format = Some(new_size);
                                 draining = true;
+                            } else if first_byte == DRC_LAST_AFTER_MAGIC {
+                                // The announcement, then the empty LAST buffer from a lent
+                                // CAPTURE buffer, if one is lent (the MediaCodec backend's order).
+                                coded_size = new_size;
+                                emit(DecoderEvent::FormatChanged {
+                                    coded_size,
+                                    visible_rect: v4l2r::Rect::new(0, 0, new_size.0, new_size.1),
+                                    min_capture_buffers: 4,
+                                });
+                                if let Some((index, ptr, _)) = captures.pop_front() {
+                                    unhold(ptr);
+                                    emit(DecoderEvent::FrameDecoded {
+                                        index,
+                                        bytesused: 0,
+                                        timestamp: Default::default(),
+                                        is_last: true,
+                                    });
+                                }
                             } else {
                                 coded_size = new_size;
                                 emit(DecoderEvent::FormatChanged {
@@ -497,6 +533,7 @@ impl VideoDecoderBackendSession for FakeSession {
     }
 
     fn decode(&mut self, buffer: InputBuffer) -> IoctlResult<()> {
+        self.log.lock().unwrap().decoded_lens.push(buffer.len);
         // SAFETY: the device lends a readable pointer valid until we report InputBufferDone.
         let first_byte = if buffer.len > 0 {
             unsafe { *buffer.ptr.as_ptr() }
@@ -515,6 +552,9 @@ impl VideoDecoderBackendSession for FakeSession {
     fn use_as_capture(&mut self, buffer: OutputBuffer) -> IoctlResult<()> {
         {
             let mut log = self.log.lock().unwrap();
+            if let Some(errno) = log.fail_use_capture.take() {
+                return Err(errno);
+            }
             log.capture_active = true;
             log.holding.insert(buffer.ptr.as_ptr() as usize);
         }
@@ -528,7 +568,17 @@ impl VideoDecoderBackendSession for FakeSession {
     }
 
     fn clear_capture_buffers(&mut self) -> IoctlResult<()> {
-        self.log.lock().unwrap().clears += 1;
+        {
+            let mut log = self.log.lock().unwrap();
+            log.clears += 1;
+            // A codec that does not give its buffers back: the real backend has ended its
+            // session (`fail`) by the time it answers, so nothing is lent any more either way.
+            if let Some(errno) = log.fail_clear.take() {
+                log.capture_active = false;
+                log.holding.clear();
+                return Err(errno);
+            }
+        }
         // The rendezvous joins the worker w.r.t. CAPTURE buffers; only then is it safe to free
         // them, which is what the `capture_active` flag records.
         self.rendezvous(Cmd::ClearCapture);
@@ -539,13 +589,29 @@ impl VideoDecoderBackendSession for FakeSession {
     }
 
     fn flush(&mut self) -> IoctlResult<()> {
-        self.log.lock().unwrap().flushes += 1;
+        {
+            let mut log = self.log.lock().unwrap();
+            log.flushes += 1;
+            if let Some(errno) = log.fail_flush.take() {
+                return Err(errno);
+            }
+        }
+        // Nothing is reported for what the flush drops: the inputs were reported the moment
+        // they were taken, as the MediaCodec backend does, and the device unqueues the rest
+        // itself (the trait's `flush` contract, review-m6 R6-14).
         self.rendezvous(Cmd::Flush);
         Ok(())
     }
 
     fn drain(&mut self) -> IoctlResult<()> {
+        if let Some(errno) = self.log.lock().unwrap().fail_drain.take() {
+            return Err(errno);
+        }
         self.commands.send(Cmd::Drain).map_err(|_| libc::EIO)
+    }
+
+    fn resume(&mut self) {
+        self.log.lock().unwrap().resumes += 1;
     }
 
     fn stop(&mut self) {
@@ -596,10 +662,12 @@ fn caps() -> DecoderCapabilities {
                 height: range,
                 dynamic_resolution: true,
             },
+            // A narrower range than the others, as VP9's is on 5566 (B5 §5.1), so a query that
+            // answers the wrong format's range is caught.
             CodedFormat {
                 fourcc: VP90,
-                width: range,
-                height: range,
+                width: SizeRange::new(16, 2048, 2),
+                height: SizeRange::new(16, 2048, 2),
                 dynamic_resolution: true,
             },
         ],
@@ -1277,6 +1345,9 @@ fn dynamic_resolution_change_reconfigures_capture() {
     }
     let frame = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
     assert_eq!(*frame.get_first_plane().bytesused, new_sizeimage);
+    // The sequence counter restarted with the CAPTURE queue (V4L2 counts frames since
+    // `STREAMON`, review-m6 R6-16): the frame before the change was number 0 of the old stream.
+    assert_eq!(frame.sequence(), 0);
 
     close(&mut r.device, s);
 }
@@ -1701,11 +1772,13 @@ fn a_resolution_change_marks_its_last_buffer_and_sends_no_eos() {
     close(&mut r.device, s);
 }
 
-/// The same sequence from a backend that marks nothing -- the MediaCodec backend as it stands
-/// (`M6-backend` §10 item 2), which the fork must keep accepting. There is no `LAST` buffer to
-/// show for it, but the `SOURCE_CHANGE` alone still stops the decoder (the kernel's implicit
-/// drain), so no CAPTURE buffer is handed to a codec that has stopped decoding at that size, and
-/// no `EOS` is invented.
+/// The same sequence from a backend that marks nothing, which the fork must keep accepting. The
+/// `SOURCE_CHANGE` alone still stops the decoder (the kernel's implicit drain), so no CAPTURE
+/// buffer is handed to a codec that has stopped decoding at that size, and no `EOS` is invented
+/// -- but the client is still owed the `LAST` buffer it waits for before it renegotiates
+/// (GStreamer, review-m6 R6-2), so the device supplies it from the next CAPTURE buffer the guest
+/// queues, empty, as `v4l2_m2m_qbuf` does for a stopped decoder. One only: the buffer after it
+/// waits for the resume.
 #[test]
 fn a_resolution_change_stops_the_decoder_even_when_nothing_is_marked() {
     let mut r = rig();
@@ -1744,11 +1817,17 @@ fn a_resolution_change_stops_the_decoder_even_when_nothing_is_marked() {
     );
     assert_eq!(eos_events(&r.events.borrow()), 0);
     assert_eq!(s.drain, Drain::Stopped);
+    assert!(
+        s.last_owed,
+        "the client is owed the LAST buffer of the old resolution"
+    );
 
     // The first announcement is not a change and must not stop anything: the frame above proves
-    // the initial SOURCE_CHANGE left the decoder running.
+    // the initial SOURCE_CHANGE left the decoder running. The CAPTURE buffer queued now comes
+    // straight back, empty and LAST, from the device itself.
     let index = 0usize;
     let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    let dequeued_before = dequeued_on(&r.events.borrow(), CAPTURE).len();
     r.device
         .qbuf(
             &mut s,
@@ -1757,8 +1836,139 @@ fn a_resolution_change_stops_the_decoder_even_when_nothing_is_marked() {
             PayloadValidity::ALL,
         )
         .unwrap();
-    assert!(!s.output.buffers[index].lent, "not lent while the decoder is stopped");
-    r.device.decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START)).unwrap();
+    let frames = dequeued_on(&r.events.borrow(), CAPTURE);
+    assert_eq!(frames.len(), dequeued_before + 1, "returned at once");
+    let last = frames.last().unwrap();
+    assert_eq!(last.index() as usize, index);
+    assert!(last.flags().contains(BufferFlags::LAST));
+    assert!(!last.flags().contains(BufferFlags::QUEUED));
+    assert_eq!(*last.get_first_plane().bytesused, 0);
+    assert!(!s.output.buffers[index].queued && !s.output.buffers[index].lent);
+    assert!(!s.last_owed);
+    assert_eq!(
+        eos_events(&r.events.borrow()),
+        0,
+        "still no EOS: nothing was drained"
+    );
+    assert_eq!(s.drain, Drain::Stopped, "and the decoder stays stopped");
+
+    // The next one waits, not lent, until the resume.
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, index as u32, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    assert!(s.output.buffers[index].queued);
+    assert!(
+        !s.output.buffers[index].lent,
+        "not lent while the decoder is stopped"
+    );
+    assert_eq!(
+        dequeued_on(&r.events.borrow(), CAPTURE).len(),
+        dequeued_before + 1
+    );
+    r.device
+        .decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START))
+        .unwrap();
+    assert!(s.output.buffers[index].lent);
+    assert_eq!(
+        r.log.lock().unwrap().resumes,
+        1,
+        "the backend hears of DEC_CMD_START"
+    );
+
+    close(&mut r.device, s);
+}
+
+/// The MediaCodec backend's order (`android.rs` `announce`): the frames of the old size, the
+/// announcement, then the empty `LAST` buffer right behind it, which is the order the kernel
+/// documents ("Dynamic Resolution Change" step 1 then 2) and the one both clients poll for. The
+/// device takes it as it takes the other order: `LAST` and no `EOS`, the decoder stopped, and
+/// nothing owed -- the next CAPTURE buffer queued waits for the resume instead of being
+/// answered a second time.
+#[test]
+fn a_resolution_change_may_mark_its_last_buffer_after_the_announcement() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming_320x240(&mut r, &mut s);
+    poke_mmap_output(&mut s, 0, 0x08);
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    let before = source_changes(&r.events.borrow());
+
+    poke_mmap_output(&mut s, 1, DRC_LAST_AFTER_MAGIC);
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 1, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    // Until both the announcement and the LAST buffer behind it are in.
+    loop {
+        let events = r.events.borrow();
+        let done = source_changes(&events) > before
+            && dequeued_on(&events, CAPTURE)
+                .last()
+                .is_some_and(|b| b.flags().contains(BufferFlags::LAST));
+        drop(events);
+        if done {
+            break;
+        }
+        assert!(wait_ready(&s), "no SOURCE_CHANGE + LAST within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert_eq!(source_changes(&r.events.borrow()), before + 1);
+    let frames = dequeued_on(&r.events.borrow(), CAPTURE);
+    let last = frames.last().unwrap().clone();
+    assert_eq!(*last.get_first_plane().bytesused, 0);
+    assert!(
+        frames[..frames.len() - 1]
+            .iter()
+            .all(|b| !b.flags().contains(BufferFlags::LAST)),
+        "only the last one"
+    );
+    assert_eq!(
+        eos_events(&r.events.borrow()),
+        0,
+        "no EOS for a resolution change"
+    );
+    assert_eq!(s.drain, Drain::Stopped);
+    assert!(!s.last_owed, "the backend's LAST buffer settled the debt");
+    // The event came first, so a query made on it already answers the new size.
+    assert_eq!(pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).width, 160);
+
+    let index = last.index() as usize;
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    let dequeued_before = frames.len();
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, index as u32, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    assert!(s.output.buffers[index].queued && !s.output.buffers[index].lent);
+    assert_eq!(
+        dequeued_on(&r.events.borrow(), CAPTURE).len(),
+        dequeued_before,
+        "no second LAST"
+    );
+    r.device
+        .decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START))
+        .unwrap();
     assert!(s.output.buffers[index].lent);
 
     close(&mut r.device, s);
@@ -2098,8 +2308,279 @@ fn a_codec_error_ends_the_session() {
         Some(libc::ENODEV)
     );
     assert_eq!(r.device.streamon(&mut s, OUTPUT).err(), Some(libc::ENODEV));
+    // A dead session takes no more pool space (review-m6 R6-11): the three allocating ioctls
+    // are refused, and `REQBUFS(0)` still frees.
+    assert_eq!(
+        r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).err(),
+        Some(libc::ENODEV)
+    );
+    assert_eq!(
+        r.device
+            .create_bufs(
+                &mut s,
+                1,
+                CAPTURE,
+                MemoryType::Mmap,
+                capture_format(320, 240)
+            )
+            .err(),
+        Some(libc::ENODEV)
+    );
+    assert_eq!(
+        r.device
+            .prepare_buf(
+                &mut s,
+                mmap_buffer(OUTPUT, 0, 1 << 20),
+                vec![],
+                PayloadValidity::ALL
+            )
+            .err(),
+        Some(libc::ENODEV)
+    );
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
+        .unwrap();
+    assert!(s.output.buffers.is_empty());
+    assert_eq!(
+        errors(&r.events.borrow()),
+        1,
+        "one error event, however many causes"
+    );
 
     close(&mut r.device, s);
+}
+
+/// `STREAMOFF` never fails (review-m6 R6-4): V4L2 has it remove every buffer from the queue,
+/// and a guest that cannot `STREAMOFF` cannot `REQBUFS(0)` either, so a flush or a clear the
+/// backend cannot complete -- a wedged codec past its bound -- ends the session instead, and the
+/// queue is reset, the buffers unqueued and the pool space freeable all the same.
+#[test]
+fn streamoff_never_fails_a_backend_that_will_not_flush() {
+    // A seek whose flush times out.
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let sizeimage = start_streaming_320x240(&mut r, &mut s);
+    poke_mmap_output(&mut s, 0, 0x05);
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    r.log.lock().unwrap().fail_flush = Some(libc::ETIMEDOUT);
+    assert_eq!(
+        r.device.streamoff(&mut s, OUTPUT),
+        Ok(()),
+        "STREAMOFF answers Ok"
+    );
+    assert!(s.dead, "and the session is over");
+    assert_eq!(errors(&r.events.borrow()), 1);
+    assert_eq!(r.log.lock().unwrap().stops, 1, "the backend was joined");
+    assert!(!s.state.output_streaming);
+    assert!(
+        s.input
+            .buffers
+            .iter()
+            .chain(s.output.buffers.iter())
+            .all(|b| !b.queued && !b.lent),
+        "every buffer of both queues is back"
+    );
+    // The guest can still free everything.
+    r.device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 0)
+        .unwrap();
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
+        .unwrap();
+    assert!(s.input.buffers.is_empty() && s.output.buffers.is_empty());
+    assert_eq!(r.device.active_session, None);
+    close(&mut r.device, s);
+
+    // A CAPTURE reset whose clear fails.
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming_320x240(&mut r, &mut s);
+    r.log.lock().unwrap().fail_clear = Some(libc::EIO);
+    assert_eq!(r.device.streamoff(&mut s, CAPTURE), Ok(()));
+    assert!(s.dead);
+    assert!(!s.state.capture_streaming);
+    assert!(s.output.buffers.iter().all(|b| !b.queued));
+    // `REQBUFS(0)` goes through the (now trivially successful) STREAMOFF and frees.
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
+        .unwrap();
+    assert!(s.output.buffers.is_empty());
+    let _ = sizeimage;
+    close(&mut r.device, s);
+}
+
+/// A CAPTURE buffer the backend refuses ends the session from every caller of the lend, not
+/// only from `QBUF` (review-m6 R6-6), and the buffer is unqueued with the rest rather than left
+/// neither lent nor pending. `DEC_CMD_START` is the caller exercised: the buffer waits while
+/// the decoder is stopped and is lent by the resume.
+#[test]
+fn a_refused_capture_buffer_ends_the_session_from_dec_cmd_start_too() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming_320x240(&mut r, &mut s);
+    poke_mmap_output(&mut s, 0, 0x08);
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 0, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    let before = source_changes(&r.events.borrow());
+    poke_mmap_output(&mut s, 1, DRC_LAST_MAGIC);
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(OUTPUT, 1, 1 << 20),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    while source_changes(&r.events.borrow()) == before {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert_eq!(s.drain, Drain::Stopped);
+    let index = 0usize;
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device
+        .qbuf(
+            &mut s,
+            mmap_buffer(CAPTURE, index as u32, sizeimage),
+            vec![],
+            PayloadValidity::ALL,
+        )
+        .unwrap();
+    assert_eq!(s.output.pending, [index]);
+
+    r.log.lock().unwrap().fail_use_capture = Some(libc::EIO);
+    assert_eq!(
+        r.device
+            .decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START))
+            .err(),
+        Some(libc::EIO)
+    );
+    assert!(s.dead);
+    assert_eq!(errors(&r.events.borrow()), 1);
+    assert!(s.output.pending.is_empty());
+    assert!(
+        !s.output.buffers[index].queued && !s.output.buffers[index].lent,
+        "the refused buffer went back with the rest"
+    );
+    close(&mut r.device, s);
+}
+
+/// The `MMAP` half of `prepare_buf_then_qbuf_keeps_the_prepared_payload` (review-m6 R6-7): a
+/// host-owned OUTPUT buffer prepared with `bytesused = 5000` and queued with `bytesused = 0`
+/// lends the backend 5000 bytes, not the whole buffer.
+#[test]
+fn prepare_buf_keeps_the_prepared_payload_for_an_mmap_buffer_too() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240))
+        .unwrap();
+    r.device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 1)
+        .unwrap();
+
+    let mut pb = mmap_buffer(OUTPUT, 0, 1 << 20);
+    *pb.get_first_plane_mut().bytesused = 5000;
+    let prepared = r
+        .device
+        .prepare_buf(&mut s, pb, vec![], PayloadValidity::ALL)
+        .unwrap();
+    assert_eq!(*prepared.get_first_plane().bytesused, 5000);
+    let mut qb = mmap_buffer(OUTPUT, 0, 1 << 20);
+    *qb.get_first_plane_mut().bytesused = 0;
+    let queued = r
+        .device
+        .qbuf(&mut s, qb, vec![], PayloadValidity::ALL)
+        .unwrap();
+    assert_eq!(
+        *queued.get_first_plane().bytesused,
+        5000,
+        "the prepared bytesused survived"
+    );
+
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    assert_eq!(
+        r.log.lock().unwrap().decoded_lens,
+        vec![5000],
+        "the backend was lent the prepared payload, not the buffer"
+    );
+    close(&mut r.device, s);
+}
+
+/// `ENUM_FRAMESIZES` for NV12 follows the coded format `S_FMT(OUTPUT)` selected, not always the
+/// first one offered (review-m6 R6-16).
+#[test]
+fn enum_framesizes_for_nv12_follows_the_selected_coded_format() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let max_width = |r: &mut Rig, s: &Session| {
+        let fs = r.device.enum_framesizes(s, 0, NV12.to_u32()).unwrap();
+        // SAFETY: stepwise.
+        unsafe { fs.__bindgen_anon_1.stepwise }.max_width
+    };
+    assert_eq!(max_width(&mut r, &s), 4096, "H264's range before any S_FMT");
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(VP90, 640, 480))
+        .unwrap();
+    assert_eq!(
+        max_width(&mut r, &s),
+        2048,
+        "VP9's range once VP9 is selected"
+    );
+    close(&mut r.device, s);
+}
+
+/// A drain the backend refuses leaves no drain pending (review-m6 R6-6 second half): the
+/// session is not left waiting for a `LAST` buffer no drain will produce.
+#[test]
+fn a_refused_drain_leaves_no_drain_pending() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    start_streaming_320x240(&mut r, &mut s);
+    r.log.lock().unwrap().fail_drain = Some(libc::EIO);
+    assert_eq!(
+        r.device
+            .decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_STOP))
+            .err(),
+        Some(libc::EIO)
+    );
+    assert_eq!(s.drain, Drain::None);
+    // The next STOP is a real one.
+    r.device
+        .decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_STOP))
+        .unwrap();
+    assert_eq!(s.drain, Drain::Pending);
+    collect_capture(&mut r, &mut s, 1);
+    let last = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
+    assert!(last.flags().contains(BufferFlags::LAST));
+    assert_eq!(eos_events(&r.events.borrow()), 1);
+    close(&mut r.device, s);
+}
+
+/// `nv12_sizeimage` saturates rather than aborting the helper on a dimension the codec store
+/// published (review-m6 R6-8): `u32::MAX` bytes is a buffer the allocator refuses.
+#[test]
+fn nv12_sizeimage_saturates_instead_of_aborting() {
+    assert_eq!(nv12_sizeimage(320, 240), 320 * 240 * 3 / 2);
+    assert_eq!(nv12_sizeimage(3, 3), 9 + 2 * 2 * 2);
+    assert_eq!(nv12_sizeimage(65_536, 65_536), u32::MAX);
+    assert_eq!(nv12_sizeimage(u32::MAX, u32::MAX), u32::MAX);
+    assert_eq!(nv12_sizeimage(u32::MAX, 1), u32::MAX);
 }
 
 // helpers used by several tests ---------------------------------------------------------------

@@ -378,15 +378,26 @@ pub trait VideoDecoderBackendSession {
     /// this returns the backend touches no `CAPTURE` buffer any more, so the device may free them.
     fn clear_capture_buffers(&mut self) -> IoctlResult<()>;
 
-    /// `STREAMOFF(OUTPUT)` = seek: drop every pending `OUTPUT` buffer (reporting each as
-    /// [`DecoderEvent::InputBufferDone`]) and be ready to decode from a new resume point. The
-    /// `CAPTURE` queue keeps streaming. On an async codec this is flush-then-start.
+    /// `STREAMOFF(OUTPUT)` = seek: drop every pending `OUTPUT` buffer and be ready to decode from
+    /// a new resume point. When this returns the backend holds no `OUTPUT` buffer and reports
+    /// nothing more about the ones it held: the device unqueues them itself, and a late
+    /// [`DecoderEvent::InputBufferDone`] would land on a buffer the guest may have queued again
+    /// (review-m6 R6-14). The `CAPTURE` queue keeps streaming. On an async codec this is
+    /// flush-then-start. An error here ends the session (the device never fails `STREAMOFF`).
     fn flush(&mut self) -> IoctlResult<()>;
 
     /// `V4L2_DEC_CMD_STOP`: decode everything queued so far, then report the last `CAPTURE`
     /// buffer with [`DecoderEvent::FrameDecoded`] `is_last = true` (empty if there is no frame
     /// left).
     fn drain(&mut self) -> IoctlResult<()>;
+
+    /// `V4L2_DEC_CMD_START` after the decoder stopped -- a finished drain, or a resolution change
+    /// the client answers without reallocating: decode on into the `CAPTURE` buffers still lent
+    /// and the ones lent from now on. A backend that stops writing after it announces a
+    /// mid-stream change (so no frame of the new size lands in a buffer the client is about to
+    /// take back) picks up here; the other way out of the stop, `STREAMOFF`/`STREAMON(CAPTURE)`,
+    /// goes through [`Self::clear_capture_buffers`]. The default does nothing.
+    fn resume(&mut self) {}
 
     /// Tear the codec down and join its thread. When this returns the backend touches nothing.
     ///
@@ -512,15 +523,23 @@ enum Drain {
     /// `SOURCE_CHANGE` triggered the kernel's implicit drain ("A source change triggers an
     /// implicit decoder drain, similar to the explicit Drain sequence. The decoder is stopped
     /// after it completes", `dev-decoder.rst`, "Dynamic Resolution Change"). No `CAPTURE` buffer
-    /// is lent to the backend, and `DQBUF(CAPTURE)` answers `EPIPE`, until `STREAMON(CAPTURE)`
-    /// or `V4L2_DEC_CMD_START`.
+    /// is lent to the backend until `STREAMON(CAPTURE)` or `V4L2_DEC_CMD_START`. (The device has
+    /// no dequeue of its own: whether the guest sees `EPIPE` after the `LAST` buffer is the
+    /// driver's side.)
     Stopped,
 }
 
 /// Bytes of one tightly packed NV12 frame of `width` x `height`. Odd dimensions round the chroma
-/// plane up.
+/// plane up. Saturates: the sizes come from the backend's published ranges, and a store that
+/// reports a dimension past ~53 000 must not turn a plain `S_FMT` into an overflow abort of the
+/// helper (review-m6 R6-8); `u32::MAX` bytes is a buffer the allocator refuses.
 fn nv12_sizeimage(width: u32, height: u32) -> u32 {
-    width * height + 2 * width.div_ceil(2) * height.div_ceil(2)
+    let luma = width.saturating_mul(height);
+    let chroma = width
+        .div_ceil(2)
+        .saturating_mul(2)
+        .saturating_mul(height.div_ceil(2));
+    luma.saturating_add(chroma)
 }
 
 /// Where a buffer's bytes live. Same two ownerships as `camera.rs` / `loopback_device.rs`.
@@ -642,9 +661,17 @@ pub struct VideoDecoderSession<GM, S> {
     format_announced: bool,
     /// One `warn!` per session about a `CAPTURE` buffer too small for the announced canvas.
     warned_small_capture: bool,
+    /// A mid-stream `SOURCE_CHANGE` stopped the decoder while `CAPTURE` streamed and no `LAST`
+    /// buffer has gone out for it yet: the client is owed one (a GStreamer client waits for
+    /// exactly that buffer before it renegotiates, review-m6 R6-2). The backend supplies it from
+    /// a buffer it holds when it can; otherwise the next `CAPTURE` buffer the guest queues is
+    /// returned empty with `V4L2_BUF_FLAG_LAST`, as `v4l2_m2m_qbuf` does for a stopped decoder.
+    /// Cleared by the `LAST` buffer, by `STREAMOFF(CAPTURE)` (the client is reallocating and
+    /// needs no answer), and by the two resumes.
+    last_owed: bool,
     /// The codec died; every ioctl that would touch it answers `ENODEV` until the guest closes.
     dead: bool,
-    /// Sequence number of the next CAPTURE frame.
+    /// Sequence number of the next CAPTURE frame; restarts at 0 with `STREAMON(CAPTURE)`.
     sequence: u32,
 }
 
@@ -947,7 +974,9 @@ where
     }
 
     /// Send every CAPTURE buffer queued so far to the backend, if both queues stream and the
-    /// drain has not ended the queue.
+    /// drain has not ended the queue. A buffer the backend refuses ends the session -- from
+    /// every caller, the way `qbuf` always did -- and the buffer is popped only once it is lent,
+    /// so a refused one is never left neither lent nor pending (review-m6 R6-6).
     fn try_send_pending_capture(
         &mut self,
         session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
@@ -955,18 +984,53 @@ where
         if !session.state.running() || session.drain == Drain::Stopped {
             return Ok(());
         }
-        while let Some(index) = session.output.pending.pop_front() {
-            Self::lend_output(session, index)?;
+        while let Some(&index) = session.output.pending.front() {
+            if let Err(e) = Self::lend_output(session, index) {
+                self.end_session(session, &format!("the backend refused a frame: errno {e}"));
+                return Err(libc::EIO);
+            }
+            session.output.pending.pop_front();
         }
         Ok(())
     }
 
-    /// The codec died: unqueue every buffer, mark the session dead, tell the guest.
+    /// Return the CAPTURE buffer `index` -- queued, not lent -- to the guest as the empty `LAST`
+    /// buffer a stopped decoder owes it (`last_owed`).
+    fn return_empty_last(
+        &mut self,
+        session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
+        index: usize,
+    ) {
+        let seq = session.sequence;
+        let Some(entry) = session.output.buffers.get_mut(index) else {
+            return;
+        };
+        session.last_owed = false;
+        session.sequence = session.sequence.wrapping_add(1);
+        entry.unqueue();
+        *entry.v4l2_buffer.get_first_plane_mut().bytesused = 0;
+        entry.v4l2_buffer.set_timestamp(Default::default());
+        entry.v4l2_buffer.set_sequence(seq);
+        entry
+            .v4l2_buffer
+            .set_flags(BufferFlags::TIMESTAMP_COPY | BufferFlags::LAST);
+        let event = entry.v4l2_buffer.clone();
+        self.evt_queue
+            .send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
+                session.id, event,
+            )));
+    }
+
+    /// The codec died: unqueue every buffer, mark the session dead, tell the guest. Once per
+    /// session: a second cause after the first changes nothing.
     fn end_session(
         &mut self,
         session: &mut VideoDecoderSession<M::GuestMemoryMapping, B::Session>,
         why: &str,
     ) {
+        if session.dead {
+            return;
+        }
         log::error!("decoder: session {} ends: {}", session.id, why);
         session.backend.stop();
         session.input.pending.clear();
@@ -979,6 +1043,7 @@ where
         {
             buffer.unqueue();
         }
+        session.last_owed = false;
         session.dead = true;
         self.evt_queue.send_error(session.id, libc::ENODEV);
     }
@@ -1048,6 +1113,7 @@ where
                     // decoder is now stopped (`Drain::Stopped`).
                     let drained = session.drain == Drain::Pending;
                     session.drain = Drain::Stopped;
+                    session.last_owed = false;
                     if drained && session.eos_subscribed {
                         self.evt_queue
                             .send_event(V4l2Event::Event(SessionEvent::new(
@@ -1071,9 +1137,13 @@ where
                 // backend reports every frame of the old resolution before it announces the new
                 // one -- and it is also what makes a backend that cannot mark its last old-size
                 // buffer (`is_last`) behave: no further CAPTURE buffer is handed to it at a size
-                // it has stopped decoding into.
-                if session.format_announced {
+                // it has stopped decoding into. If the stop is this event's doing (no `LAST`
+                // buffer has stopped the decoder already), the client is owed that `LAST`
+                // buffer: the backend may still send it -- the MediaCodec backend does, right
+                // behind this event, the kernel's order -- else `qbuf` supplies it.
+                if session.format_announced && session.drain != Drain::Stopped {
                     session.drain = Drain::Stopped;
+                    session.last_owed = session.state.capture_streaming;
                 }
                 session.format_announced = true;
                 session.coded_size = coded_size;
@@ -1152,6 +1222,7 @@ where
             eos_subscribed: false,
             format_announced: false,
             warned_small_capture: false,
+            last_owed: false,
             dead: false,
             sequence: 0,
         })
@@ -1285,7 +1356,7 @@ where
     /// which `v4l2-compliance` requires of an m2m decoder.
     fn enum_framesizes(
         &mut self,
-        _session: &Self::Session,
+        session: &Self::Session,
         index: u32,
         pixel_format: u32,
     ) -> IoctlResult<v4l2_frmsizeenum> {
@@ -1294,9 +1365,12 @@ where
         }
         let caps = self.backend.capabilities();
         let asked = PixelFormat::from_u32(pixel_format);
-        // For NV12 (CAPTURE) the sizes follow the first coded format the decoder offers.
+        // For NV12 (CAPTURE) the sizes follow the coded format `S_FMT(OUTPUT)` selected (the
+        // first offered one until then), not always the first: on 5566 that is H264's
+        // `96..8192` against VP9's `96..4096` (review-m6 R6-16).
         let coded = if asked == NV12 {
-            caps.coded_formats.first()
+            caps.coded_format(session.coded_format)
+                .or_else(|| caps.coded_formats.first())
         } else {
             caps.coded_format(asked)
         }
@@ -1417,9 +1491,12 @@ where
         // refused, as vb2 does (`vb2_core_reqbufs`, Linux 6.18.21
         // `drivers/media/common/videobuf2/videobuf2-core.c:883-886`), because the buffers it
         // would free may be lent to the backend and freeing them without a join is exactly the
-        // §2.5 violation (`M7-crate` §9 item 3).
+        // §2.5 violation (`M7-crate` §9 item 3). A dead session may free, never allocate: pool
+        // space a decode can never use (review-m6 R6-11).
         if count == 0 {
             self.streamoff(session, queue)?;
+        } else if session.dead {
+            return Err(libc::ENODEV);
         } else if session.streaming(direction) {
             return Err(libc::EBUSY);
         }
@@ -1459,6 +1536,9 @@ where
         let direction = queue.direction_or_einval()?;
         if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
+        }
+        if session.dead {
+            return Err(libc::ENODEV);
         }
         match self.active_session {
             Some(id) if id != session.id => return Err(libc::EBUSY),
@@ -1564,9 +1644,13 @@ where
 
         match &mut entry.backing {
             Backing::Host { .. } => {
+                // The prepared payload wins here too (review-m6 R6-7): with this call's own
+                // `bytesused` of 0 `lend_input` would hand the backend the whole buffer.
                 let plane = entry.v4l2_buffer.get_first_plane_mut();
                 *plane.bytesused = if direction == QueueDirection::Output {
-                    guest_bytesused
+                    prepared
+                        .map(|(bytesused, _)| bytesused)
+                        .unwrap_or(guest_bytesused)
                 } else {
                     0
                 };
@@ -1640,11 +1724,15 @@ where
                 }
             }
             QueueDirection::Capture => {
-                session.output.pending.push_back(index);
-                if let Err(e) = self.try_send_pending_capture(session) {
-                    self.end_session(session, &format!("the backend refused a frame: errno {e}"));
-                    return Err(libc::EIO);
+                // A decoder stopped by a resolution change that still owes its `LAST` buffer
+                // answers with this one, empty: the kernel's `v4l2_m2m_qbuf` rule for a stopped
+                // decoder, and what a client waiting for the flag needs (review-m6 R6-2).
+                if session.drain == Drain::Stopped && session.last_owed {
+                    self.return_empty_last(session, index);
+                    return Ok(reply);
                 }
+                session.output.pending.push_back(index);
+                self.try_send_pending_capture(session)?;
             }
         }
 
@@ -1663,6 +1751,9 @@ where
     ) -> IoctlResult<V4l2Buffer> {
         let queue_type = buffer.queue();
         let direction = queue_type.direction_or_einval()?;
+        if session.dead {
+            return Err(libc::ENODEV);
+        }
         // The same rule `qbuf` applies, with no prepared description to fall back on.
         if !payload.is_accepted_by(direction, buffer.memory(), NUM_PLANES) {
             return Err(libc::EINVAL);
@@ -1743,11 +1834,15 @@ where
                     return Ok(());
                 }
                 session.state.capture_streaming = true;
+                // The sequence counter counts frames since this queue started streaming
+                // (`v4l2_buffer.sequence`; review-m6 R6-16).
+                session.sequence = 0;
                 // A CAPTURE restart clears a stopped decoder, whether a drain or a resolution
                 // change stopped it (kernel decoder interface, "Drain" and "Dynamic Resolution
                 // Change": the sequence resumes with `STREAMOFF`/`STREAMON(CAPTURE)`).
                 if session.drain == Drain::Stopped {
                     session.drain = Drain::None;
+                    session.last_owed = false;
                 }
                 self.try_send_pending_capture(session)?;
             }
@@ -1755,17 +1850,28 @@ where
         Ok(())
     }
 
+    /// `STREAMOFF` never fails: V4L2 has it remove every buffer from the queue whatever the
+    /// state of the hardware, and a guest that cannot `STREAMOFF` cannot `REQBUFS(0)` either
+    /// (review-m6 R6-4). A backend that cannot flush or clear -- a wedged codec past its bound
+    /// -- ends the session instead; the queue is reset and the buffers unqueued either way, so
+    /// the `media_host` lease can be freed.
     fn streamoff(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<()> {
         let direction = queue.direction_or_einval()?;
         match direction {
             QueueDirection::Output => {
                 // Seek: the backend drops its pending input; the CAPTURE queue keeps streaming.
                 if session.codec_started && !session.dead {
-                    session.backend.flush()?;
+                    if let Err(e) = session.backend.flush() {
+                        self.end_session(
+                            session,
+                            &format!("the backend could not flush: errno {e}"),
+                        );
+                    }
                 }
                 session.state.output_streaming = false;
                 session.input.pending.clear();
                 session.drain = Drain::None;
+                session.last_owed = false;
                 for buffer in session.input.buffers.iter_mut() {
                     buffer.unqueue();
                 }
@@ -1773,11 +1879,19 @@ where
             QueueDirection::Capture => {
                 // The backend must stop writing CAPTURE buffers before we release them (§2.5).
                 if session.codec_started && !session.dead {
-                    session.backend.clear_capture_buffers()?;
+                    if let Err(e) = session.backend.clear_capture_buffers() {
+                        self.end_session(
+                            session,
+                            &format!(
+                                "the backend could not release the CAPTURE buffers: errno {e}"
+                            ),
+                        );
+                    }
                 }
                 session.state.capture_streaming = false;
                 session.output.pending.clear();
                 session.drain = Drain::None;
+                session.last_owed = false;
                 for buffer in session.output.buffers.iter_mut() {
                     buffer.unqueue();
                 }
@@ -1910,17 +2024,22 @@ where
         match cmd.cmd {
             bindings::V4L2_DEC_CMD_STOP => {
                 // The drain only starts if both queues stream; otherwise it is a no-op success
-                // (kernel decoder interface, "Drain").
+                // (kernel decoder interface, "Drain"). `Pending` only once the backend has
+                // taken the drain: a session waiting for a `LAST` buffer no drain will produce
+                // is the review-m6 R6-6 shape.
                 if session.state.running() && session.drain == Drain::None {
-                    session.drain = Drain::Pending;
                     session.backend.drain()?;
+                    session.drain = Drain::Pending;
                 }
             }
             bindings::V4L2_DEC_CMD_START => {
                 // The other way out of a stopped decoder, and the one the kernel names for a
-                // resolution change the client answers without reallocating.
+                // resolution change the client answers without reallocating. The backend hears
+                // of it (`resume`): it may have stopped writing when it announced the change.
                 if session.drain != Drain::None {
                     session.drain = Drain::None;
+                    session.last_owed = false;
+                    session.backend.resume();
                     self.try_send_pending_capture(session)?;
                 }
             }

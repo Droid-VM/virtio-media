@@ -928,7 +928,35 @@ fn ext_ctrls_response(
 > {
     match result {
         Ok(()) => Ok((ctrls, ctrl_array)),
-        Err(e) => Err((e, Some((ctrls, ctrl_array)))),
+        Err(e) => {
+            // The D37 instrument (B9-acceptance §8, follow-up 5). Every error reply of these
+            // three ioctls passes here, so this line is the byte count the driver's guard is
+            // about to be compared against, next to the `error_idx` the guest is supposed to
+            // read out of it. `wr_ioctl_with_err_payload` writes a `RespHeader` and then this
+            // pair, and `ToDescriptorChain` writes the header and one `v4l2_ext_control` per
+            // entry, so the reply is exactly the sum below -- the arithmetic
+            // `a_failed_ext_ctrls_writes_the_header_back_with_error_idx` pins end to end
+            // (M5b §4.2). A guest that reads `error_idx` back as the value it sent, against a
+            // line that says the reply carried the device's value in >= threshold bytes, has
+            // lost it after the response, not in it.
+            log::debug!(
+                "ext-controls error reply: errno {}, count {}, error_idx {}, {} control(s), \
+                 {} + {} + {}x{} = {} bytes (the driver keeps the header only from {} bytes up)",
+                e,
+                ctrls.count,
+                ctrls.error_idx,
+                ctrl_array.len(),
+                std::mem::size_of::<RespHeader>(),
+                std::mem::size_of::<v4l2_ext_controls>(),
+                ctrl_array.len(),
+                std::mem::size_of::<v4l2_ext_control>(),
+                std::mem::size_of::<RespHeader>()
+                    + std::mem::size_of::<v4l2_ext_controls>()
+                    + ctrl_array.len() * std::mem::size_of::<v4l2_ext_control>(),
+                std::mem::size_of::<RespHeader>() + std::mem::size_of::<v4l2_ext_controls>(),
+            );
+            Err((e, Some((ctrls, ctrl_array))))
+        }
     }
 }
 

@@ -191,12 +191,21 @@ impl CameraInfo {
 
     /// The fps range to run at for a guest that asked for `fps` frames per second: the widest
     /// range whose maximum is `fps`; failing an exact match, the widest among those whose
-    /// maximum is nearest (the faster one on a tie). A camera that lists no ranges gets
+    /// maximum is nearest (the faster one on a tie). A camera that lists no usable range gets
     /// `(fps, fps)`.
-    fn range_for(&self, fps: u32) -> (u32, u32) {
+    ///
+    /// `cap` is the ceiling the chosen range must also respect -- the size's own, when a size
+    /// is in question. A range whose maximum is above it must not be chosen: the camera would
+    /// be opened at a rate `ENUM_FRAMEINTERVALS` never offered, and `G_PARM` would report a
+    /// rate the size cannot deliver. [`Self::frame_rates`] filters exactly the same way, so the
+    /// two ioctls answer from one list (review-m4 R5); when nothing fits under the ceiling,
+    /// both answer the ceiling itself.
+    fn range_for(&self, fps: u32, cap: Option<u32>) -> (u32, u32) {
+        let fits = |&&(_, max): &&(u32, u32)| max > 0 && cap.is_none_or(|cap| max <= cap);
         let nearest = self
             .fps_ranges
             .iter()
+            .filter(fits)
             .map(|&(_, max)| max)
             .min_by_key(|&max| (max.abs_diff(fps), std::cmp::Reverse(max)));
         match nearest {
@@ -212,13 +221,14 @@ impl CameraInfo {
     }
 
     /// The range to open `size` at when the guest asked for `fps`: the rate is first held to
-    /// what the size sustains.
+    /// what the size sustains, and so is the range chosen for it.
     fn range_at(&self, size: &FrameSize, fps: u32) -> (u32, u32) {
-        let fps = match size.max_fps() {
+        let cap = size.max_fps();
+        let fps = match cap {
             Some(cap) => fps.min(cap),
             None => fps,
         };
-        self.range_for(fps)
+        self.range_for(fps, cap)
     }
 
     /// The size nearest to `width`x`height` (least squared distance in both dimensions), or
@@ -1065,6 +1075,10 @@ where
         queue: QueueType,
         format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
+        // The camera is gone; see `reqbufs` (review-m4 R12).
+        if session.dead {
+            return Err(libc::ENODEV);
+        }
         let size = self.adjust_size(session, queue, &format)?;
         // Buffers were sized for the old format, and a stream is running at it.
         if !session.buffers.is_empty() || session.stream.is_some() {
@@ -1086,6 +1100,13 @@ where
         }
         if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
+        }
+        // Nothing that takes or holds resources for a session the camera has already left:
+        // `end_session` has told the guest the session is over, and the fork driver answers
+        // `ENODEV` itself from then on. Without this a guest that ignores the error event could
+        // still REQBUFS(32) and sit on a queue's worth of `media_host` (review-m4 R12).
+        if session.dead {
+            return Err(libc::ENODEV);
         }
         match self.active_session {
             Some(id) if id != session.id => return Err(libc::EBUSY),
@@ -1138,6 +1159,10 @@ where
         }
         if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
+        }
+        // The camera is gone; see `reqbufs` (review-m4 R12).
+        if session.dead {
+            return Err(libc::ENODEV);
         }
         match self.active_session {
             Some(id) if id != session.id => return Err(libc::EBUSY),
@@ -1320,6 +1345,10 @@ where
         if buffer.queue() != QUEUE {
             return Err(libc::EINVAL);
         }
+        // The camera is gone; see `reqbufs` (review-m4 R12).
+        if session.dead {
+            return Err(libc::ENODEV);
+        }
         let sizeimage = session.sizeimage();
         let entry = session
             .buffers
@@ -1394,7 +1423,12 @@ where
         })?;
         session.stream = Some(stream);
 
-        while let Some(index) = session.queued.pop_front() {
+        // Over a copy, so that `session.queued` is left exactly as the guest built it if one of
+        // the loans is refused: rebuilding it from the buffer list would hand a guest that
+        // queued 1, 0, 2 a retry in index order, and a different DQBUF order with it
+        // (review-m4 R13).
+        let order: Vec<usize> = session.queued.iter().copied().collect();
+        for index in order {
             if let Err(e) = Self::lend(session, index) {
                 // Undo: the stream is closed and every buffer stays queued but not lent, as
                 // before the call; the guest may try again.
@@ -1405,16 +1439,13 @@ where
                     e
                 );
                 self.stop_stream(session);
-                session.queued.clear();
-                for (index, buffer) in session.buffers.iter_mut().enumerate() {
+                for buffer in session.buffers.iter_mut() {
                     buffer.lent = false;
-                    if buffer.queued {
-                        session.queued.push_back(index);
-                    }
                 }
                 return Err(libc::EIO);
             }
         }
+        session.queued.clear();
         Ok(())
     }
 
@@ -1456,6 +1487,10 @@ where
     ) -> IoctlResult<v4l2_streamparm> {
         if parm.type_ != QUEUE as u32 {
             return Err(libc::EINVAL);
+        }
+        // The camera is gone; see `reqbufs` (review-m4 R12).
+        if session.dead {
+            return Err(libc::ENODEV);
         }
         // SAFETY: the type says capture, so `capture` is the live member.
         let asked = unsafe { parm.parm.capture.timeperframe };
@@ -2291,18 +2326,18 @@ mod tests {
         );
 
         // 30 fps: (7, 30) is the widest of the three ranges ending at 30.
-        assert_eq!(info().range_for(30), (7, 30));
-        assert_eq!(info().range_for(24), (24, 24));
-        assert_eq!(info().range_for(15), (15, 15));
+        assert_eq!(info().range_for(30, None), (7, 30));
+        assert_eq!(info().range_for(24, None), (24, 24));
+        assert_eq!(info().range_for(15, None), (15, 15));
         // No range ends at 20: 24 and 15 are equally far, the faster one wins.
-        assert_eq!(info().range_for(20), (24, 24));
-        assert_eq!(info().range_for(1000), (60, 60));
+        assert_eq!(info().range_for(20, None), (24, 24));
+        assert_eq!(info().range_for(1000, None), (60, 60));
         // A camera that lists none pins both ends.
         let mute = CameraInfo {
             fps_ranges: vec![],
             ..info()
         };
-        assert_eq!(mute.range_for(25), (25, 25));
+        assert_eq!(mute.range_for(25, None), (25, 25));
 
         let reply = r.device.s_parm(&mut s, parm_for((1, 24))).unwrap();
         assert_eq!(timeperframe(&reply), (1, 24));
@@ -2333,6 +2368,59 @@ mod tests {
             r.device.s_parm(&mut s, wrong_queue).err(),
             Some(libc::EINVAL)
         );
+
+        // A size whose own duration ceiling is under every range the camera lists: both ioctls
+        // answer with the ceiling. ENUM_FRAMEINTERVALS offered 1/15 and S_PARM used to snap
+        // back to the nearest listed maximum, 30 -- a rate the size cannot sustain
+        // (review-m4 R5).
+        let slow = CameraInfo {
+            sizes: vec![FrameSize {
+                width: 3840,
+                height: 2160,
+                min_frame_duration_ns: Some(66_666_666),
+            }],
+            fps_ranges: vec![(30, 30)],
+            ..info()
+        };
+        let uhd = slow.sizes[0];
+        assert_eq!(slow.frame_rates(&uhd), vec![15]);
+        assert_eq!(slow.range_at(&uhd, 15), (15, 15));
+        assert_eq!(slow.range_at(&uhd, 30), (15, 15));
+        // The same camera at a size with no ceiling still gets its listed range.
+        assert_eq!(slow.range_for(30, None), (30, 30));
+        let mut slow_rig = rig_with(FakeCamera {
+            info: slow,
+            ..camera()
+        });
+        let mut slow_s = session(&mut slow_rig.device);
+        let intervals: Vec<(u32, u32)> = (0..)
+            .map_while(|i| {
+                slow_rig
+                    .device
+                    .enum_frameintervals(&slow_s, i, NV12.to_u32(), 3840, 2160)
+                    .ok()
+            })
+            .map(|f| {
+                // SAFETY: discrete.
+                let d = unsafe { f.__bindgen_anon_1.discrete };
+                (d.numerator, d.denominator)
+            })
+            .collect();
+        assert_eq!(intervals, vec![(1, 15)]);
+        assert_eq!(
+            timeperframe(
+                &slow_rig
+                    .device
+                    .s_parm(&mut slow_s, parm_for((1, 15)))
+                    .unwrap()
+            ),
+            (1, 15)
+        );
+        assert_eq!(
+            timeperframe(&slow_rig.device.g_parm(&slow_s, QUEUE).unwrap()),
+            (1, 15)
+        );
+        close(&mut slow_rig.device, slow_s);
 
         // While streaming, S_PARM reaches the running stream as a control.
         r.device
@@ -2671,7 +2759,11 @@ mod tests {
         assert!(!s.dead);
         assert_eq!(r.log.lock().unwrap().closed, 1);
         assert!(s.buffers.iter().all(|b| b.queued && !b.lent));
-        assert_eq!(s.queued.len(), 2, "both still waiting for a retry");
+        assert_eq!(
+            s.queued,
+            VecDeque::from([1, 0]),
+            "the retry keeps the guest's queueing order"
+        );
 
         // Queued honestly, both stream.
         r.device.streamoff(&mut s, QUEUE).unwrap();
@@ -2912,6 +3004,179 @@ mod tests {
         close(&mut r.device, s);
         assert_eq!(*r.released.borrow(), 3);
         assert_eq!(r.log.lock().unwrap().released_while_streaming, 0);
+    }
+
+    /// §2.5 for the path `end_session` takes, on guest-owned buffers. The camera goes away
+    /// while it holds a buffer it never filled: the stream must be joined before that buffer's
+    /// mapping is released, or the guest's pages are handed back under a thread that still has
+    /// a pointer into them. `FakeMapping::drop` is what checks it -- with host buffers the same
+    /// test proves nothing, because `end_session` releases none (review-m4 R7).
+    #[test]
+    fn a_dying_camera_releases_the_guest_mappings_after_the_join() {
+        let mut r = rig_with(FakeCamera {
+            disconnect_after: Some(1),
+            ..camera()
+        });
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::UserPtr, 2)
+            .unwrap();
+        let gpa = 4 * 0x1000u64;
+        for index in 0..2u32 {
+            let (buf, sgs) = userptr_buffer(index, gpa + index as u64 * 0x1_0000, size);
+            r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        }
+        assert_eq!(*r.guest.live_mappings.borrow(), 2);
+        r.device.streamon(&mut s, QUEUE).unwrap();
+
+        // One frame, then the camera disconnects while it holds buffer 1.
+        while errors(&r.events.borrow()) == 0 {
+            assert!(wait_ready(&s), "no event within 2s");
+            process(&mut r.device, &mut s);
+        }
+        assert_eq!(dequeued(&r.events.borrow()).len(), 1);
+        assert!(s.dead);
+        assert_eq!(r.log.lock().unwrap().closed, 1, "joined");
+        assert!(s.buffers.iter().all(|b| !b.queued && !b.lent));
+        assert_eq!(*r.guest.live_mappings.borrow(), 0, "and only then released");
+
+        close(&mut r.device, s);
+    }
+
+    /// A session the camera has left holds nothing more: everything that would take or keep
+    /// `media_host` space, or set the session up to, answers `ENODEV` the way `QBUF` and
+    /// `STREAMON` already did -- a guest that ignores the error event could otherwise
+    /// `REQBUFS(32)` on a session it can never stream (review-m4 R12). Closing it still works.
+    #[test]
+    fn a_dead_session_is_enodev_for_everything_that_takes_buffers() {
+        let mut r = rig_with(FakeCamera {
+            disconnect_after: Some(0),
+            ..camera()
+        });
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 1)
+            .unwrap();
+        r.device
+            .qbuf(&mut s, mmap_buffer(0, size), vec![], true)
+            .unwrap();
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        while errors(&r.events.borrow()) == 0 {
+            assert!(wait_ready(&s), "no event within 2s");
+            process(&mut r.device, &mut s);
+        }
+        assert!(s.dead);
+
+        assert_eq!(
+            r.device.reqbufs(&mut s, QUEUE, MemoryType::Mmap, 4).err(),
+            Some(libc::ENODEV)
+        );
+        assert_eq!(
+            r.device.reqbufs(&mut s, QUEUE, MemoryType::Mmap, 0).err(),
+            Some(libc::ENODEV)
+        );
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 2, QUEUE, MemoryType::Mmap, format(64, 48))
+                .err(),
+            Some(libc::ENODEV)
+        );
+        assert_eq!(
+            r.device
+                .prepare_buf(&mut s, mmap_buffer(0, size), vec![], true)
+                .err(),
+            Some(libc::ENODEV)
+        );
+        assert_eq!(
+            r.device.s_fmt(&mut s, QUEUE, format(1280, 720)).err(),
+            Some(libc::ENODEV)
+        );
+        assert_eq!(
+            r.device.s_parm(&mut s, parm_for((1, 15))).err(),
+            Some(libc::ENODEV)
+        );
+        // The buffers it already had are still exactly the one it allocated.
+        assert_eq!(s.buffers.len(), 1);
+        assert_eq!(*r.released.borrow(), 0);
+
+        close(&mut r.device, s);
+        assert_eq!(*r.released.borrow(), 1);
+    }
+
+    /// `CREATE_BUFS` on a guest-owned queue: the set is appended to the `REQBUFS` one, it may
+    /// be sized larger than a frame, the memory type may not change, and a buffer created that
+    /// way streams -- the loan is sized from the session's format, never from the buffer's own
+    /// size (review-m4 R7).
+    #[test]
+    fn create_bufs_appends_userptr_buffers() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::UserPtr, 1)
+            .unwrap();
+
+        // A set smaller than the queue's own format is refused; a bigger one is not.
+        assert_eq!(
+            r.device
+                .create_bufs(
+                    &mut s,
+                    1,
+                    QUEUE,
+                    MemoryType::UserPtr,
+                    to_v4l2_sized(FrameSize::new(64, 48), size - 1),
+                )
+                .err(),
+            Some(libc::EINVAL)
+        );
+        // One memory type per queue.
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 1, QUEUE, MemoryType::Mmap, format(64, 48))
+                .err(),
+            Some(libc::EINVAL)
+        );
+
+        let big = size + 0x1000;
+        let reply = r
+            .device
+            .create_bufs(
+                &mut s,
+                1,
+                QUEUE,
+                MemoryType::UserPtr,
+                to_v4l2_sized(FrameSize::new(64, 48), big),
+            )
+            .unwrap();
+        assert_eq!((reply.index, reply.count), (1, 1));
+        assert_eq!(pix_mp(&reply.format).sizeimage, big);
+        assert_eq!(s.buffers.len(), 2);
+        assert_eq!(s.buffers[1].size, big);
+        assert_eq!(s.memory, Some(MemoryType::UserPtr));
+
+        // The created buffer takes a plane between a frame and its own size, and no more.
+        let gpa = 4 * 0x1000u64;
+        for len in [size - 1, big + 1] {
+            let (buf, sgs) = userptr_buffer(1, gpa, len);
+            assert_eq!(
+                r.device.qbuf(&mut s, buf, sgs, true).err(),
+                Some(libc::EINVAL)
+            );
+        }
+        let (buf, sgs) = userptr_buffer(1, gpa, big);
+        r.device.qbuf(&mut s, buf, sgs, true).unwrap();
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        let frames = collect_frames(&mut r, &mut s, 1);
+        assert_eq!(frames[0].index(), 1);
+        // Filled with a frame's worth, not the buffer's worth.
+        assert_eq!(*frames[0].get_first_plane().bytesused, size);
+
+        close(&mut r.device, s);
     }
 
     /// A camera that will not open (in use, no permission) fails `STREAMON` with that errno and

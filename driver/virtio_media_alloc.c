@@ -373,6 +373,8 @@ static void vmedia_dbuf_release(struct vmedia_dbuf *dbuf)
 	}
 	kvfree(dbuf->sg);
 	kfree(dbuf);
+	/* May free @vv itself: nothing above this touches it afterwards. */
+	v4l2_device_put(&vv->v4l2_dev);
 }
 
 struct vmedia_dbuf *vmedia_dbuf_alloc(struct virtio_media *vv,
@@ -399,6 +401,14 @@ struct vmedia_dbuf *vmedia_dbuf_alloc(struct virtio_media *vv,
 	dbuf->len = len;
 	INIT_LIST_HEAD(&dbuf->blocks);
 	refcount_set(&dbuf->maps, 1);
+	/*
+	 * A dbuf can outlive its session's file handle (a VMA holds a map
+	 * reference) and even the driver binding (sysfs unbind, D66): pin
+	 * the device so @vv, the guest pool allocator and @dma_dev are
+	 * still there when the last reference drops. Released at the end of
+	 * vmedia_dbuf_release(), which every path out of here goes through.
+	 */
+	v4l2_device_get(&vv->v4l2_dev);
 
 	if (vv->guest_pool_ready)
 		ret = vmedia_dbuf_alloc_pool(vv, dbuf, size);

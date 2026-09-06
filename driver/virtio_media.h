@@ -54,8 +54,10 @@ struct virtio_media {
 	/*
 	 * media_guest pool: guest-physical range the host SHARE'd for buffers
 	 * the guest fills (OUTPUT queues by default), carved with drm_buddy.
-	 * guest_pool_ready is cleared under guest_pool_lock at remove so a
-	 * late munmap sees the closed gate instead of a dead allocator.
+	 * guest_pool_ready is cleared under guest_pool_lock at the final
+	 * teardown (the v4l2_dev release, once the last file handle and
+	 * mapping are gone -- not at remove, D66) so a late free sees the
+	 * closed gate instead of a dead allocator.
 	 */
 	bool guest_pool_ready;
 	phys_addr_t guest_pool_base;
@@ -92,6 +94,18 @@ struct virtio_media {
 
 	/* Waitqueue for host responses on the command queue */
 	wait_queue_head_t wq;
+
+	/*
+	 * Set under vlock by virtio_media_remove() when the virtio device is
+	 * unbound (sysfs unbind or hot unplug). Every command sender checks
+	 * it before touching the virtqueues, so nothing reaches a reset or
+	 * deleted queue; the struct itself, the sessions and the pool
+	 * allocator stay allocated until the v4l2_dev refcount drops to zero
+	 * -- the last file handle or mapping -- so a late ioctl dereferences
+	 * live memory and fails with -ENODEV instead of oopsing (D66,
+	 * B12-acceptance section 15).
+	 */
+	bool disconnected;
 };
 
 static inline struct virtio_media *

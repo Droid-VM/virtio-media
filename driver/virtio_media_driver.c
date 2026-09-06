@@ -143,6 +143,13 @@ virtio_media_session_alloc(struct virtio_media *vv, u32 id,
 
 	mutex_lock(&vv->sessions_lock);
 	list_add_tail(&session->list, &vv->sessions);
+	/*
+	 * A remove() that ran between CMD_OPEN and this list_add marked every
+	 * listed session dead but could not see this one: inherit the verdict
+	 * so no session on a disconnected device ever looks alive (D66).
+	 */
+	if (READ_ONCE(vv->disconnected))
+		WRITE_ONCE(session->dead, true);
 	mutex_unlock(&vv->sessions_lock);
 
 	return session;
@@ -174,8 +181,8 @@ static void virtio_media_session_close(struct virtio_media *vv,
 	 * as the REQBUFS race). A run that starts after the flush cannot
 	 * find the session any more and drops its events. No lock is held
 	 * here, and the work only takes sessions_lock and dqbufs_lock, so
-	 * this cannot deadlock; in virtio_media_remove() the work was
-	 * already cancelled and this is a no-op.
+	 * this cannot deadlock; after a device removal the work was already
+	 * cancelled and this is a no-op.
 	 */
 	flush_work(&vv->eventq_work);
 
@@ -189,7 +196,8 @@ static void virtio_media_session_close(struct virtio_media *vv,
 	sg_free_table(&session->command_sgs);
 
 	/*
-	 * The host has processed CMD_CLOSE by now (the command completed),
+	 * The host has let go of the buffers by now -- it processed
+	 * CMD_CLOSE, or the whole device was reset at the unbind (D66) --
 	 * so its mappings of driver-owned buffers are gone and the memory
 	 * can go back to the pool (VPU_DESIGN.md 2.5).
 	 */
@@ -270,6 +278,16 @@ static int virtio_media_kick_command(struct virtio_media *vv,
 	};
 	struct virtio_media_resp_header *resp_header;
 	int ret;
+
+	/*
+	 * Every sender holds vv->vlock and virtio_media_remove() sets the
+	 * flag under it, so a disconnect never catches a command half-added:
+	 * either the command completed before remove() could take the lock,
+	 * or the sender sees the flag here, before touching a virtqueue that
+	 * is about to be reset and deleted (D66).
+	 */
+	if (vv->disconnected)
+		return -ENODEV;
 
 	ret = virtqueue_add_sgs(vv->commandq, sgs, out_sgs, in_sgs, &cb_param,
 				GFP_ATOMIC);
@@ -516,6 +534,16 @@ void virtio_media_process_events(struct virtio_media *vv)
 
 	mutex_lock(&vv->events_process_lock);
 
+	/*
+	 * A work run scheduled by a last interrupt can land here after
+	 * remove() reset the device and deleted the virtqueues; the flag is
+	 * set before the reset, so leave without touching them (D66).
+	 */
+	if (READ_ONCE(vv->disconnected)) {
+		mutex_unlock(&vv->events_process_lock);
+		return;
+	}
+
 	while ((evt = virtqueue_get_buf(vv->eventq, &len))) {
 		/* Make sure we received enough data */
 		if (len < sizeof(*evt)) {
@@ -679,18 +707,29 @@ static int virtio_media_device_close(struct file *file)
 	cmd_close = &session->cmd.close;
 
 	mutex_lock(&vv->vlock);
+	if (!vv->disconnected) {
+		cmd_close->hdr.cmd = VIRTIO_MEDIA_CMD_CLOSE;
+		cmd_close->session_id = session->id;
 
-	cmd_close->hdr.cmd = VIRTIO_MEDIA_CMD_CLOSE;
-	cmd_close->session_id = session->id;
+		sg_set_buf(&cmd_sg, cmd_close, sizeof(*cmd_close));
+		sg_mark_end(&cmd_sg);
 
-	sg_set_buf(&cmd_sg, cmd_close, sizeof(*cmd_close));
-	sg_mark_end(&cmd_sg);
-
-	ret = virtio_media_send_command(vv, sgs, 1, 0, 0, NULL);
+		ret = virtio_media_send_command(vv, sgs, 1, 0, 0, NULL);
+		if (ret < 0)
+			v4l2_err(&vv->v4l2_dev,
+				 "failed to close session %u: %d; freeing it anyway\n",
+				 session->id, ret);
+	}
 	mutex_unlock(&vv->vlock);
-	if (ret < 0)
-		return ret;
 
+	/*
+	 * Freed unconditionally: the file handle is gone whatever CMD_CLOSE
+	 * said, and on a disconnected device (D66) there is nobody to tell --
+	 * the VMM already reclaimed the session when the device reset
+	 * (B12-acceptance section 5 measured exactly that). Returning early
+	 * on a send error used to leak the session and leave it on
+	 * vv->sessions.
+	 */
 	virtio_media_session_close(vv, session);
 
 	return 0;
@@ -825,7 +864,9 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
  * resulting VMA -- and the tail of a split computed a wrong offset because
  * the split shifts vm_pgoff. Keeping the host offset here and counting the
  * VMAs through .open/.close sends exactly one MUNMAP, once the last VMA is
- * gone (VPU_DESIGN.md 2.5, 5.4).
+ * gone (VPU_DESIGN.md 2.5, 5.4). The map also holds a v4l2_dev reference:
+ * a VMA can outlive both the file handle and the driver binding (D66), and
+ * @vv must still be there for the vlock and the disconnected gate.
  */
 struct virtio_media_hostmap {
 	struct virtio_media *vv;
@@ -880,9 +921,15 @@ static void virtio_media_vma_close(struct vm_area_struct *vma)
 		return;
 
 	mutex_lock(&vv->vlock);
-	virtio_media_host_munmap_locked(vv, map->driver_addr);
+	/*
+	 * After a disconnect there is nobody to tell: the host's mappings
+	 * died with the device (D66).
+	 */
+	if (!vv->disconnected)
+		virtio_media_host_munmap_locked(vv, map->driver_addr);
 	mutex_unlock(&vv->vlock);
 	kfree(map);
+	v4l2_device_put(&vv->v4l2_dev);
 }
 
 static const struct vm_operations_struct virtio_media_vm_ops = {
@@ -1013,6 +1060,7 @@ static int virtio_media_device_mmap(struct file *file,
 	 */
 	vma->vm_private_data = map;
 	vma->vm_ops = &virtio_media_vm_ops;
+	v4l2_device_get(&vv->v4l2_dev);
 	goto end;
 
 unmap:
@@ -1156,10 +1204,35 @@ static void virtio_media_guest_pool_fini(struct virtio_media *vv)
 	mutex_lock(&vv->guest_pool_lock);
 	vv->guest_pool_ready = false;
 	if (vv->guest_pool_mm.avail != vv->guest_pool_mm.size)
-		pr_warn("virtio-media: media_guest pool still has %llu bytes allocated at remove\n",
+		pr_warn("virtio-media: media_guest pool still has %llu bytes allocated at teardown\n",
 			vv->guest_pool_mm.size - vv->guest_pool_mm.avail);
 	drm_buddy_fini(&vv->guest_pool_mm);
 	mutex_unlock(&vv->guest_pool_lock);
+}
+
+/**
+ * Final teardown: runs when the last reference on the v4l2_device drops.
+ *
+ * That is the driver binding's reference (dropped at the end of
+ * virtio_media_remove()), the video device's (dropped by the core once the
+ * device is unregistered and the last file handle is closed -- each open fd
+ * pins the video device, v4l2-dev.c v4l2_open/v4l2_release), and one per
+ * live driver-owned buffer and host mapping (a VMA can outlive its fd).
+ * Only here is it safe to tear the pool allocator down and free the device:
+ * freeing any of it at remove() time is what oopsed a client that still had
+ * a session open across a sysfs unbind (D66, B12-acceptance section 15) --
+ * the same reason mainline hotpluggable V4L2 drivers free their state from
+ * a release callback, not from disconnect.
+ */
+static void virtio_media_v4l2_release(struct v4l2_device *v4l2_dev)
+{
+	struct virtio_media *vv =
+		container_of(v4l2_dev, struct virtio_media, v4l2_dev);
+
+	virtio_media_guest_pool_fini(vv);
+	put_device(vv->dma_dev);
+	kfree(vv->event_buffer);
+	kfree(vv);
 }
 
 static const struct v4l2_file_operations virtio_media_fops = {
@@ -1198,14 +1271,22 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	int i;
 	int ret;
 
-	vv = devm_kzalloc(dev, sizeof(*vv), GFP_KERNEL);
+	/*
+	 * Not devm: a devm allocation dies when the driver unbinds, while
+	 * open file handles and mappings legitimately outlive a sysfs unbind
+	 * and keep dereferencing this memory (D66). vv -- and the video_dev
+	 * and v4l2_dev embedded in it -- is freed by
+	 * virtio_media_v4l2_release() once the last reference is gone.
+	 */
+	vv = kzalloc(sizeof(*vv), GFP_KERNEL);
 	if (!vv)
 		return -ENOMEM;
 
-	vv->event_buffer = devm_kzalloc(
-		dev, VIRTIO_MEDIA_EVENT_MAX_SIZE * VIRTIO_MEDIA_NUM_EVENT_BUFS,
+	vv->event_buffer = kzalloc(
+		VIRTIO_MEDIA_EVENT_MAX_SIZE * VIRTIO_MEDIA_NUM_EVENT_BUFS,
 		GFP_KERNEL);
 	if (!vv->event_buffer) {
+		kfree(vv);
 		return -ENOMEM;
 	}
 
@@ -1220,12 +1301,27 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	virtio_dev->priv = vv;
 	vv->dma_dev = virtio_dev->dev.parent ? virtio_dev->dev.parent :
 					       &virtio_dev->dev;
+	/*
+	 * A driver-owned buffer in no-pool mode frees its DMA pages when its
+	 * last mapping goes away, which can be after the unbind: pin the DMA
+	 * device until the final teardown.
+	 */
+	get_device(vv->dma_dev);
 
 	init_waitqueue_head(&vv->wq);
 
 	ret = v4l2_device_register(dev, &vv->v4l2_dev);
 	if (ret)
-		return ret;
+		goto err_v4l2_register;
+	/*
+	 * From here on everything is freed through the v4l2_dev refcount:
+	 * the core takes a reference per registered video device and per
+	 * open file, so the release only runs once the node is unregistered
+	 * AND the last fd is closed -- the disconnected-device lifetime D66
+	 * requires. Must be set before video_register_device(), whose
+	 * matching put in v4l2_device_release() is conditional on it.
+	 */
+	vv->v4l2_dev.release = virtio_media_v4l2_release;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 	ret = virtio_find_vqs(virtio_dev, 2, vqs, vq_info, NULL);
@@ -1282,36 +1378,97 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	return 0;
 
 send_event_buffer:
+	/*
+	 * The node existed for an instant: mirror remove() so a file handle
+	 * that slipped in cannot reach the dying virtqueues.
+	 */
+	mutex_lock(&vv->vlock);
+	vv->disconnected = true;
+	mutex_unlock(&vv->vlock);
 	video_unregister_device(&vv->video_dev);
 err_register:
-	virtio_media_guest_pool_fini(vv);
+	virtio_reset_device(virtio_dev);
+	cancel_work_sync(&vv->eventq_work);
 	virtio_dev->config->del_vqs(virtio_dev);
 err_find_vqs:
-	v4l2_device_unregister(&vv->v4l2_dev);
+	v4l2_device_disconnect(&vv->v4l2_dev);
+	/*
+	 * Drops the probe reference; virtio_media_v4l2_release() then frees
+	 * everything (now, or after a straggling fd from the
+	 * send_event_buffer path closes).
+	 */
+	v4l2_device_put(&vv->v4l2_dev);
+
+	return ret;
+
+err_v4l2_register:
+	put_device(vv->dma_dev);
+	kfree(vv->event_buffer);
+	kfree(vv);
 
 	return ret;
 }
 
+/*
+ * Driver unbind (sysfs unbind, module unload, hot unplug), following the
+ * video_unregister_device + disconnect pattern mainline hotpluggable V4L2
+ * drivers use: the device node disappears and every new entry point answers
+ * -ENODEV, open file handles keep working against allocated (dead) state,
+ * sleepers are woken, and nothing per-device is freed here -- sessions go
+ * away with their file's release(), and the device itself with the last
+ * v4l2_dev reference (virtio_media_v4l2_release()).
+ *
+ * The old order -- close every session and tear the pool down right here --
+ * is defect D66 (B12-acceptance sections 5 and 15): a client that held
+ * buffers across the unbind dereferenced its freed queue array on the next
+ * QBUF (level-3 translation fault in vmedia_dbuf_buffer_from_host) and was
+ * left as an unreapable zombie only a VM restart could clear.
+ */
 static void virtio_media_remove(struct virtio_device *virtio_dev)
 {
 	struct virtio_media *vv = virtio_dev->priv;
-	struct list_head *p, *n;
+	struct virtio_media_session *s;
 
-	cancel_work_sync(&vv->eventq_work);
-	virtio_reset_device(virtio_dev);
+	/*
+	 * Close the command gate first, under vlock: after this no thread
+	 * can add to a virtqueue (virtio_media_kick_command() checks the
+	 * flag under the same lock), and taking the lock waited out any
+	 * command in flight, so the reset below never yanks a live command.
+	 */
+	mutex_lock(&vv->vlock);
+	vv->disconnected = true;
+	mutex_unlock(&vv->vlock);
 
-	v4l2_device_unregister(&vv->v4l2_dev);
-	virtio_dev->config->del_vqs(virtio_dev);
+	/*
+	 * Give every open session the dead-session treatment the host-error
+	 * event path already gets right: ioctls answer -ENODEV, poll answers
+	 * EPOLLERR, and the wake-ups release anyone sleeping in DQBUF, in
+	 * poll, or in the DQEVENT pre-wait -- no thread is left in D state
+	 * over a vanished device (D66 requirement).
+	 */
+	mutex_lock(&vv->sessions_lock);
+	list_for_each_entry(s, &vv->sessions, list) {
+		WRITE_ONCE(s->dead, true);
+		wake_up(&s->dqbufs_wait);
+		wake_up_all(&s->fh.wait);
+	}
+	mutex_unlock(&vv->sessions_lock);
+
+	/*
+	 * Unregister before touching the transport: the core then fails
+	 * every new open/ioctl/poll/mmap with -ENODEV or EPOLLERR on its
+	 * own (v4l2-dev.c checks video_is_registered on each entry).
+	 */
 	video_unregister_device(&vv->video_dev);
 
-	list_for_each_safe(p, n, &vv->sessions) {
-		struct virtio_media_session *s =
-			list_entry(p, struct virtio_media_session, list);
+	/* No interrupts after the reset, so nothing re-schedules the work. */
+	virtio_reset_device(virtio_dev);
+	cancel_work_sync(&vv->eventq_work);
+	virtio_dev->config->del_vqs(virtio_dev);
 
-		virtio_media_session_close(vv, s);
-	}
-
-	virtio_media_guest_pool_fini(vv);
+	/* Sever the parent struct device; vv itself stays until the last put. */
+	v4l2_device_disconnect(&vv->v4l2_dev);
+	v4l2_device_put(&vv->v4l2_dev);
 }
 
 static struct virtio_device_id id_table[] = {

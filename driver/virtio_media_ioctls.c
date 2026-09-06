@@ -2001,9 +2001,31 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 	 * B7-controls §12.1). SUBSCRIBE/UNSUBSCRIBE_EVENT stay under vlock:
 	 * they only wait for the host's bounded command response, never for
 	 * guest-side activity.
+	 *
+	 * The core's own blocking wait only ever ends when an event arrives
+	 * (v4l2_event_dequeue()'s condition is fh->navailable alone), so a
+	 * waiter inside it would sleep through a device removal
+	 * indefinitely. Wait here instead, where the disconnect path's
+	 * wake-up can end the sleep -- virtio_media_remove() sets
+	 * session->dead before waking fh->wait (D66) -- and only then let
+	 * the core dequeue what is pending, which it does without blocking.
+	 * (If a second reader steals the pending event first the core blocks
+	 * again until the next one; a multi-reader race the plain dispatch
+	 * had as well.)
 	 */
-	if (cmd == VIDIOC_DQEVENT)
+	if (cmd == VIDIOC_DQEVENT) {
+		if (!(file->f_flags & O_NONBLOCK)) {
+			ret = wait_event_interruptible(
+				vfh->wait,
+				v4l2_event_pending(vfh) ||
+					READ_ONCE(fh_to_session(vfh)->dead));
+			if (ret)
+				return ret;
+			if (READ_ONCE(fh_to_session(vfh)->dead))
+				return -ENODEV;
+		}
 		return video_ioctl2(file, cmd, arg);
+	}
 
 	mutex_lock(&vv->vlock);
 

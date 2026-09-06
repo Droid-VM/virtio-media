@@ -131,7 +131,10 @@ struct virtio_media_session {
 	 * Set once the device sent VIRTIO_MEDIA_EVT_ERROR for this session. The
 	 * protocol says the session is then corrupted and closed on the host,
 	 * so every further ioctl fails with -ENODEV and poll reports EPOLLERR
-	 * until user-space closes the file (VPU_DESIGN.md 5.4).
+	 * until user-space closes the file (VPU_DESIGN.md 5.4). Also set for
+	 * every session when the device itself is unbound (D66): the same
+	 * dead-session paths give a disconnected device's clients their clean
+	 * -ENODEV.
 	 */
 	bool dead;
 

@@ -394,6 +394,22 @@ pub trait VideoDecoderBackendSession {
     /// flush-then-start. An error here ends the session (the device never fails `STREAMOFF`).
     fn flush(&mut self) -> IoctlResult<()>;
 
+    /// `STREAMOFF(OUTPUT)` issued to reconfigure `CAPTURE` across a *pending* format change, not
+    /// as a seek. The kernel's `dev-decoder.rst` says the client should **not** stop the `OUTPUT`
+    /// queue during a resolution change ("Dynamic resolution change"); a `STREAMOFF(OUTPUT)` that
+    /// arrives while a `SOURCE_CHANGE` has been announced but the `CAPTURE` queue has not yet been
+    /// (re)started for it is therefore a client reinitialising `CAPTURE`, not seeking. Unlike
+    /// [`Self::flush`], the staged bitstream the guest already believes consumed (returned at
+    /// `decode` time behind the D48 staging) and the frames/format the codec already holds are
+    /// **kept** -- they are fed and delivered once `CAPTURE` restarts and `STREAMON(OUTPUT)`
+    /// resumes -- and the codec's state is left intact. This is what keeps the head of the stream
+    /// from being dropped "after the first SOURCE_CHANGE" (D53). The default does nothing: a
+    /// backend that stages nothing across the call has nothing to keep. An error here ends the
+    /// session, as `flush` does (the device never fails `STREAMOFF`).
+    fn reinit(&mut self) -> IoctlResult<()> {
+        Ok(())
+    }
+
     /// `V4L2_DEC_CMD_STOP`: decode everything queued so far, then report the last `CAPTURE`
     /// buffer with [`DecoderEvent::FrameDecoded`] `is_last = true` (empty if there is no frame
     /// left).
@@ -667,6 +683,14 @@ pub struct VideoDecoderSession<GM, S> {
     /// Whether the backend has announced a format: the first [`DecoderEvent::FormatChanged`] is
     /// the initial announcement, every later one is a mid-stream resolution change.
     format_announced: bool,
+    /// A `SOURCE_CHANGE` has been announced (`FormatChanged` delivered) and the `CAPTURE` queue
+    /// has not been (re)started for it yet: the window in which a `STREAMOFF(OUTPUT)` is a client
+    /// reconfiguring `CAPTURE` (a reinit), not a seek (D53). Set when a `FormatChanged` is
+    /// handled; cleared by `STREAMON(CAPTURE)` and `V4L2_DEC_CMD_START`, the two ways the client
+    /// answers the change and resumes decoding. The kernel asks the client not to stop `OUTPUT`
+    /// during a resolution change (`dev-decoder.rst`, "Dynamic resolution change"); a
+    /// `STREAMOFF(OUTPUT)` here keeps the staged bitstream instead of dropping it as a seek would.
+    format_change_pending: bool,
     /// One `warn!` per session about a `CAPTURE` buffer too small for the announced canvas.
     warned_small_capture: bool,
     /// A mid-stream `SOURCE_CHANGE` stopped the decoder while `CAPTURE` streamed and no `LAST`
@@ -1069,6 +1093,20 @@ where
                     return;
                 };
                 if !entry.lent {
+                    // The backend reported an OUTPUT buffer done that the device no longer counts
+                    // as lent -- a seek/streamoff unqueued it, or it was already returned. Dropping
+                    // it is correct, but it must not be silent: a client's `DQBUF(OUTPUT)` that
+                    // never completes (D58) has to be visible in the log at info level (`debug!` is
+                    // unreachable on a phone until D60).
+                    log::warn!(
+                        "decoder: session {}: dropping InputBufferDone for OUTPUT buffer {} that \
+                         is not lent (queued {}, output_streaming {}); the guest will not see this \
+                         DQBUF",
+                        session.id,
+                        index,
+                        entry.queued,
+                        session.state.output_streaming,
+                    );
                     return;
                 }
                 // The backend is done reading the bitstream: drop the guest mapping (§2.5) and
@@ -1092,6 +1130,18 @@ where
                     return;
                 };
                 if !entry.lent {
+                    // As above for InputBufferDone: a decoded frame reported for a CAPTURE buffer
+                    // the device no longer counts as lent (a STREAMOFF(CAPTURE) took it back) is
+                    // dropped, but the drop is logged rather than silent (D58, D60).
+                    log::warn!(
+                        "decoder: session {}: dropping FrameDecoded for CAPTURE buffer {} that is \
+                         not lent (queued {}, capture_streaming {}, drain {:?})",
+                        session.id,
+                        index,
+                        entry.queued,
+                        session.state.capture_streaming,
+                        session.drain,
+                    );
                     return;
                 }
                 let capacity = entry.capacity();
@@ -1154,6 +1204,10 @@ where
                     session.last_owed = session.state.capture_streaming;
                 }
                 session.format_announced = true;
+                // A format change has been announced and the CAPTURE queue has not been (re)started
+                // for it yet: a `STREAMOFF(OUTPUT)` until then is a reinit, not a seek (D53). Set
+                // regardless of subscription; it is cleared by `STREAMON(CAPTURE)` / `DEC_CMD_START`.
+                session.format_change_pending = true;
                 session.coded_size = coded_size;
                 session.crop = CropRectangle::FromStream(visible_rect);
                 session.min_capture_buffers = min_capture_buffers;
@@ -1171,6 +1225,17 @@ where
                                 ..Default::default()
                             },
                         )));
+                } else {
+                    // The stream changed format but no client asked for the event: the change is
+                    // real (the coded size / crop above are updated) but no `SOURCE_CHANGE` goes
+                    // out, so a client waiting on `DQEVENT` would wait forever. Not silent (D58).
+                    log::warn!(
+                        "decoder: session {}: format change to {}x{} announced but SOURCE_CHANGE \
+                         is not subscribed; no event will be delivered",
+                        session.id,
+                        coded_size.0,
+                        coded_size.1,
+                    );
                 }
             }
             DecoderEvent::Error(reason) => {
@@ -1229,6 +1294,7 @@ where
             src_change_subscribed: false,
             eos_subscribed: false,
             format_announced: false,
+            format_change_pending: false,
             warned_small_capture: false,
             last_owed: false,
             dead: false,
@@ -1842,6 +1908,9 @@ where
                     return Ok(());
                 }
                 session.state.capture_streaming = true;
+                // The CAPTURE queue is (re)started for the announced format: the format change is
+                // no longer pending, so a later `STREAMOFF(OUTPUT)` is a seek again (D53).
+                session.format_change_pending = false;
                 // The sequence counter counts frames since this queue started streaming
                 // (`v4l2_buffer.sequence`; review-m6 R6-16).
                 session.sequence = 0;
@@ -1867,19 +1936,45 @@ where
         let direction = queue.direction_or_einval()?;
         match direction {
             QueueDirection::Output => {
-                // Seek: the backend drops its pending input; the CAPTURE queue keeps streaming.
+                // A `STREAMOFF(OUTPUT)` is normally a seek: the backend drops its staged bitstream
+                // and flushes the codec, and the CAPTURE queue keeps streaming. But one that
+                // arrives while a format change is *pending* -- a `SOURCE_CHANGE` announced and the
+                // CAPTURE queue not yet (re)started for it -- is a client reconfiguring CAPTURE
+                // across the change, not seeking: the kernel's `dev-decoder.rst` says the client
+                // should not stop OUTPUT during a resolution change, and treating that
+                // `STREAMOFF(OUTPUT)` as a seek drops the staged bitstream the guest already
+                // believes consumed (returned at `decode` time behind the D48 staging), which is
+                // the head-of-stream loss D53 measured "after the first SOURCE_CHANGE". A reinit
+                // keeps the staging and the codec's held frames/format, to be fed and delivered
+                // once CAPTURE restarts and `STREAMON(OUTPUT)` resumes; a `STREAMOFF(OUTPUT)` with
+                // no pending change still drops staging, so a genuine seek stays stale-free (B9's
+                // 0-stale seek measurements hold).
+                let reinit = session.format_change_pending;
                 if session.codec_started && !session.dead {
-                    if let Err(e) = session.backend.flush() {
+                    let result = if reinit {
+                        session.backend.reinit()
+                    } else {
+                        session.backend.flush()
+                    };
+                    if let Err(e) = result {
                         self.end_session(
                             session,
-                            &format!("the backend could not flush: errno {e}"),
+                            &format!(
+                                "the backend could not {} on STREAMOFF(OUTPUT): errno {e}",
+                                if reinit { "reinit" } else { "flush" }
+                            ),
                         );
                     }
                 }
                 session.state.output_streaming = false;
                 session.input.pending.clear();
-                session.drain = Drain::None;
-                session.last_owed = false;
+                if !reinit {
+                    // A genuine seek clears any drain / owed-`LAST` state. A reinit leaves the
+                    // pending format change to be resolved by the CAPTURE restart
+                    // (STREAMOFF/STREAMON(CAPTURE)), which clears `drain`/`last_owed` itself.
+                    session.drain = Drain::None;
+                    session.last_owed = false;
+                }
                 for buffer in session.input.buffers.iter_mut() {
                     buffer.unqueue();
                 }
@@ -2206,6 +2301,9 @@ where
                 if session.drain != Drain::None {
                     session.drain = Drain::None;
                     session.last_owed = false;
+                    // The client answered the change by resuming without reallocating CAPTURE: the
+                    // format change is no longer pending (D53).
+                    session.format_change_pending = false;
                     session.backend.resume();
                     self.try_send_pending_capture(session)?;
                 }

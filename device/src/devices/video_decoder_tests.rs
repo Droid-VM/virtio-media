@@ -177,6 +177,8 @@ struct FakeLog {
     capture_active: bool,
     /// `flush` (seek) calls.
     flushes: usize,
+    /// `reinit` (STREAMOFF(OUTPUT) across a pending format change) calls (D53).
+    reinits: usize,
     /// `clear_capture_buffers` calls.
     clears: usize,
     /// `stop` calls that completed.
@@ -610,8 +612,15 @@ impl VideoDecoderBackend for FakeBackend {
                         let _ = ack.send(());
                     }
                     Cmd::ClearCapture(ack) => {
+                        // STREAMOFF(CAPTURE): the lent buffers go back, but the frames already
+                        // decoded and waiting for a buffer are KEPT and delivered after the CAPTURE
+                        // restart -- the MediaCodec backend keeps its held outputs from the last
+                        // format change on (`android.rs` `clear_capture_buffers`), so the kernel
+                        // loses no frame at a resolution change (review-m6 R6-5). This is what a
+                        // reinit relies on: the staged frames survive both STREAMOFF(OUTPUT) (kept
+                        // by the reinit, not a seek, D53) and STREAMOFF(CAPTURE). A seek (`Flush`)
+                        // is what drops `ready`.
                         captures.clear();
-                        ready.clear();
                         draining = false;
                         pending_format = None;
                         let _ = ack.send(());
@@ -752,6 +761,15 @@ impl VideoDecoderBackendSession for FakeSession {
         // they were taken, as the MediaCodec backend does, and the device unqueues the rest
         // itself (the trait's `flush` contract, review-m6 R6-14).
         self.rendezvous(Cmd::Flush);
+        Ok(())
+    }
+
+    fn reinit(&mut self) -> IoctlResult<()> {
+        // A reinit STREAMOFF(OUTPUT) (D53): unlike `flush`, NOTHING is dropped -- no `Cmd::Flush`
+        // is sent, so the codec thread keeps its `ready` frames and its state, modelling the
+        // MediaCodec backend keeping `pending`/`held_outputs` across the call. The count lets the
+        // tests assert a reinit was taken rather than a seek.
+        self.log.lock().unwrap().reinits += 1;
         Ok(())
     }
 
@@ -1602,6 +1620,262 @@ fn dynamic_resolution_change_reconfigures_capture() {
     // The sequence counter restarted with the CAPTURE queue (V4L2 counts frames since
     // `STREAMON`, review-m6 R6-16): the frame before the change was number 0 of the old stream.
     assert_eq!(frame.sequence(), 0);
+
+    // D53, test (d): this is GStreamer's spec-conformant reinit -- it reconfigures CAPTURE
+    // (STREAMOFF(CAPTURE)/REQBUFS/STREAMON) and never stops the OUTPUT queue -- so neither the seek
+    // nor the reinit STREAMOFF(OUTPUT) path is ever taken. The rule leaves it entirely unchanged.
+    assert_eq!(r.log.lock().unwrap().flushes, 0, "gst reinit takes no seek");
+    assert_eq!(r.log.lock().unwrap().reinits, 0, "gst reinit never stops OUTPUT");
+
+    close(&mut r.device, s);
+}
+
+/// D53, test (a): a `STREAMOFF(OUTPUT)` issued to reconfigure CAPTURE across the *initial*
+/// `SOURCE_CHANGE` -- ffmpeg's `ff_v4l2_m2m_codec_reinit` path -- must keep the staged bitstream,
+/// not drop it as a seek. The device stages each queued bitstream buffer and returns the OUTPUT
+/// buffer at once (D48/D28), so the guest believes the packets consumed; a client that then
+/// reinits (STREAMOFF(OUTPUT), CAPTURE STREAMOFF/REQBUFS(0)/G_FMT/REQBUFS/STREAMON,
+/// STREAMON(OUTPUT)) must get every frame back. The kernel's `dev-decoder.rst` ("Dynamic
+/// resolution change") says the client should not stop OUTPUT during a resolution change, so a
+/// `STREAMOFF(OUTPUT)` while a format change is pending is a reinit, not a seek: no `flush` is
+/// taken, and no "seek #1 ... dropped" is logged by the real backend.
+#[test]
+fn reinit_across_the_initial_source_change_keeps_staged_input() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 4).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // Four bitstream buffers queued before any CAPTURE buffer exists: the backend stages them,
+    // announces the format from the first, returns all four (InputBufferDone) so the guest
+    // believes them consumed, and holds the four frames until CAPTURE is set up.
+    for i in 0..4u32 {
+        poke_mmap_output(&mut s, i as usize, 0x10 + i as u8);
+        let mut ob = mmap_buffer(OUTPUT, i, 1 << 20);
+        ob.set_timestamp(ts(i as i64 + 1));
+        r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    }
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+
+    // The SOURCE_CHANGE lands and all four OUTPUT buffers come back.
+    while output_dqbuf_at(&r.events.borrow(), 3).is_none() {
+        assert!(wait_ready(&s), "no OUTPUT DQBUF for buffer 3 within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert_eq!(source_changes(&r.events.borrow()), 1);
+    assert_eq!(
+        dequeued_on(&r.events.borrow(), OUTPUT).len(),
+        4,
+        "every staged input returned as consumed"
+    );
+
+    // The reinit: STREAMOFF(OUTPUT) while the format change is pending -- a reinit, NOT a seek.
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    assert_eq!(r.log.lock().unwrap().flushes, 0, "no seek: the staged bitstream is kept");
+    assert_eq!(r.log.lock().unwrap().reinits, 1, "the STREAMOFF(OUTPUT) was taken as a reinit");
+    assert!(r.log.lock().unwrap().open, "a reinit does not tear the codec down");
+
+    // CAPTURE STREAMOFF/REQBUFS(0)/G_FMT/REQBUFS/QBUF/STREAMON, then STREAMON(OUTPUT).
+    r.device.streamoff(&mut s, CAPTURE).unwrap();
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
+    for i in 0..4 {
+        r.device
+            .qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], PayloadValidity::ALL)
+            .unwrap();
+    }
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+
+    // Every one of the four staged frames is delivered -- none dropped -- in order (ts 1..4).
+    collect_capture(&mut r, &mut s, 4);
+    let frames = dequeued_on(&r.events.borrow(), CAPTURE);
+    assert_eq!(frames.len(), 4, "every frame delivered, none dropped across the reinit");
+    for (n, f) in frames.iter().enumerate() {
+        assert_eq!(f.timestamp().tv_sec, n as i64 + 1, "frame {n} in order");
+    }
+    assert_eq!(r.log.lock().unwrap().flushes, 0, "still no seek across the whole reinit");
+
+    close(&mut r.device, s);
+}
+
+/// D53, test (b): the same rule at a *dynamic resolution change*. A mid-stream `SOURCE_CHANGE`
+/// leaves a format change pending; a client that reconfigures CAPTURE by stopping OUTPUT first
+/// (STREAMOFF(OUTPUT) then the CAPTURE dance, as ffmpeg's reinit would if it stopped OUTPUT) must
+/// have that `STREAMOFF(OUTPUT)` taken as a reinit, not a seek -- the codec is kept and decoding
+/// resumes at the new size. (The preservation of already-staged frames across a reinit is proven
+/// by `reinit_across_the_initial_source_change_keeps_staged_input`; here the fake's non-parking
+/// DRC model makes staging across the change ambiguous, so this test pins the classification and
+/// the clean resume.)
+#[test]
+fn reinit_across_a_drc_is_not_a_seek() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let _sizeimage = start_streaming_320x240(&mut r, &mut s);
+
+    // A frame at the first resolution.
+    poke_mmap_output(&mut s, 0, 0x08);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    let before = source_changes(&r.events.borrow());
+
+    // A magic buffer triggers a mid-stream resolution change to 160x120: a format change is now
+    // pending (announced, CAPTURE not yet restarted for it).
+    poke_mmap_output(&mut s, 1, DRC_MAGIC);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 1, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    while source_changes(&r.events.borrow()) == before {
+        assert!(wait_ready(&s), "no second SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+    let new_sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    assert_eq!(new_sizeimage, 160 * 120 * 3 / 2);
+
+    // The reinit: STREAMOFF(OUTPUT) while the DRC is pending -- a reinit, not a seek.
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    assert_eq!(r.log.lock().unwrap().flushes, 0, "no seek taken at the DRC reinit");
+    assert_eq!(r.log.lock().unwrap().reinits, 1, "the DRC STREAMOFF(OUTPUT) was a reinit");
+    assert!(r.log.lock().unwrap().open, "the codec is kept across the DRC reinit");
+
+    // The CAPTURE reconfiguration at the new size, then STREAMON(OUTPUT).
+    r.device.streamoff(&mut s, CAPTURE).unwrap();
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
+    for i in 0..4 {
+        r.device
+            .qbuf(&mut s, mmap_buffer(CAPTURE, i, new_sizeimage), vec![], PayloadValidity::ALL)
+            .unwrap();
+    }
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+
+    // Decoding resumes at the new size on the same codec: a new-size frame comes out.
+    poke_mmap_output(&mut s, 2, 0x09);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 2, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    let already = dequeued_on(&r.events.borrow(), CAPTURE).len();
+    while dequeued_on(&r.events.borrow(), CAPTURE).len() <= already {
+        assert!(wait_ready(&s), "no post-DRC-reinit frame within 2s");
+        process(&mut r.device, &mut s);
+    }
+    let frame = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
+    assert_eq!(*frame.get_first_plane().bytesused, new_sizeimage, "decoding resumed at the new size");
+    assert_eq!(r.log.lock().unwrap().flushes, 0, "no seek anywhere in the DRC reinit");
+    assert_eq!(r.log.lock().unwrap().started.len(), 1, "the same codec, not a new one");
+
+    close(&mut r.device, s);
+}
+
+/// D53, test (c): a *genuine* seek -- `STREAMOFF(OUTPUT)` with CAPTURE streaming and no format
+/// change pending -- still flushes: the staged bitstream is dropped, and the next stream is
+/// stale-free. This is the behaviour B9 measured (0 stale frames per seek); the reinit rule must
+/// not weaken it.
+#[test]
+fn a_true_seek_still_drops_staging_and_stays_stale_free() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let sizeimage = start_streaming_320x240(&mut r, &mut s);
+
+    // Decode one frame so the codec is warm, and drain everything the initial setup produced.
+    poke_mmap_output(&mut s, 0, 0x05);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    drain_events(&mut r, &mut s);
+
+    // A genuine seek: CAPTURE is streaming and no format change is pending, so this is a flush,
+    // NOT a reinit -- the staged bitstream is dropped, exactly as B9's 0-stale seek measured.
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    assert_eq!(r.log.lock().unwrap().flushes, 1, "a genuine seek flushes the backend (drops staging)");
+    assert_eq!(r.log.lock().unwrap().reinits, 0, "not a reinit: nothing was pending");
+    assert!(r.log.lock().unwrap().open, "the codec survives a seek");
+
+    // Resume and decode fresh, uniquely-timestamped data: it decodes cleanly on the same codec.
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    r.device
+        .qbuf(&mut s, mmap_buffer(CAPTURE, 0, sizeimage), vec![], PayloadValidity::ALL)
+        .unwrap();
+    poke_mmap_output(&mut s, 1, 0x06);
+    let mut ob = mmap_buffer(OUTPUT, 1, 1 << 20);
+    ob.set_timestamp(ts(42));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !dequeued_on(&r.events.borrow(), CAPTURE)
+        .iter()
+        .any(|f| f.timestamp().tv_sec == 42)
+    {
+        assert!(std::time::Instant::now() < deadline, "no post-seek frame within 2s");
+        if wait_ready(&s) {
+            process(&mut r.device, &mut s);
+        }
+    }
+    assert_eq!(r.log.lock().unwrap().flushes, 1, "still exactly one seek");
+    assert_eq!(r.log.lock().unwrap().started.len(), 1, "the same codec, not a new one");
+
+    close(&mut r.device, s);
+}
+
+/// D58 instrument + reproduction: `v4l2-compliance -d /dev/videoN -s`'s streaming test on the
+/// decoder's OUTPUT (m2m) queue queues three zero-filled bitstream buffers and expects each to be
+/// returned (`DQBUF(OUTPUT)`) as the codec consumes them (v4l-utils 1.32.0
+/// `v4l2-test-buffers.cpp`'s `captureBufs`: for an OUTPUT queue it fills, queues, streams, and
+/// dequeues every buffer, printing "Frame #NNN" per dequeue). B11-acceptance §3.2 saw the third
+/// `DQBUF(OUTPUT)` never complete (D58). This test replays that sequence against a backend that
+/// announces after the second buffer and never produces a frame, and asserts the DEVICE returns
+/// all three OUTPUT buffers: if it does (it does), the device is not where the buffer is lost, and
+/// the wedge is downstream (the crosvm event queue, or the guest driver's DQBUF wake-up) -- the
+/// B13 dig, see the report.
+#[test]
+fn compliance_zero_buffer_streaming_returns_every_output_buffer() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 3).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // Three zero-filled OUTPUT buffers (compliance fills with zero), queued and streamed. Buffers 0
+    // and 2 are NO_ANNOUNCE (consumed, no frame, InputBufferDone held while awaiting the format);
+    // buffer 1 -- the second buffer -- announces the format, which releases the held ones. This is
+    // the device-side signature B11-acceptance §3.2 measured ("announces after buffer 2, 1 format
+    // change, 0 frames out"), and the third buffer (index 2) is the `DQBUF(OUTPUT)` that never
+    // completed there (D58). The one frame the announcer would stage stays undelivered (no CAPTURE
+    // buffer), so 0 frames go out, as measured.
+    for i in 0..3u32 {
+        let byte = if i == 1 { 0x11 } else { NO_ANNOUNCE_MAGIC };
+        poke_mmap_output(&mut s, i as usize, byte);
+        let mut ob = mmap_buffer(OUTPUT, i, 1 << 20);
+        ob.set_timestamp(ts(i as i64 + 1));
+        r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    }
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+
+    // All three OUTPUT buffers must come back (DQBUF(OUTPUT)), the third included: the two held
+    // NO_ANNOUNCE buffers are released when buffer 2 announces, and buffer 2 (a plain buffer after
+    // the announcement) is returned at once. Poll until buffer 2's DQBUF, or time out.
+    while output_dqbuf_at(&r.events.borrow(), 2).is_none() {
+        assert!(wait_ready(&s), "the third OUTPUT buffer's DQBUF never arrived (D58 on the device)");
+        process(&mut r.device, &mut s);
+    }
+    let returned: HashSet<u32> = dequeued_on(&r.events.borrow(), OUTPUT)
+        .iter()
+        .map(|b| b.index())
+        .collect();
+    assert_eq!(returned.len(), 3, "every OUTPUT buffer returned: 0, 1 and 2");
+    assert!(returned.contains(&0) && returned.contains(&1) && returned.contains(&2));
+    assert_eq!(source_changes(&r.events.borrow()), 1, "one format change, as the repro measured");
 
     close(&mut r.device, s);
 }

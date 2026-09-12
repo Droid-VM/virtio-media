@@ -241,6 +241,9 @@ fn luma_of(b: u8) -> u8 {
 struct FakeBackend {
     caps: DecoderCapabilities,
     log: SharedLog,
+    /// The `min_capture_buffers` the fake reports in its initial `FormatChanged`, standing in for
+    /// the codec's own output-slot count the MediaCodec backend now announces (D69). Default 4.
+    announce_min: u32,
     /// `start` fails with this errno.
     fail_start: Option<i32>,
     /// How long a held `InputBufferDone` (a buffer the fake cannot yet announce a format from) is
@@ -295,6 +298,7 @@ impl VideoDecoderBackend for FakeBackend {
         let log = Arc::clone(&self.log);
         let thread_log = Arc::clone(&self.log);
         let grace = self.grace;
+        let announce_min = self.announce_min;
         let thread = thread::spawn(move || {
             let emit = |e: DecoderEvent| {
                 let _ = events_tx.send(e);
@@ -562,7 +566,7 @@ impl VideoDecoderBackend for FakeBackend {
                             emit(DecoderEvent::FormatChanged {
                                 coded_size,
                                 visible_rect: v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1),
-                                min_capture_buffers: 4,
+                                min_capture_buffers: announce_min,
                             });
                             // Any buffers held before the announcement (an earlier NO_ANNOUNCE
                             // one) go back now, AFTER the SOURCE_CHANGE (D45/D55 ordering).
@@ -850,14 +854,20 @@ fn caps() -> DecoderCapabilities {
 const FAKE_GRACE: Duration = Duration::from_millis(250);
 
 fn rig_with(fail_start: Option<i32>) -> Rig {
-    rig_full(fail_start, FAKE_GRACE)
+    rig_full(fail_start, FAKE_GRACE, 4)
 }
 
 fn rig_grace(grace: Duration) -> Rig {
-    rig_full(None, grace)
+    rig_full(None, grace, 4)
 }
 
-fn rig_full(fail_start: Option<i32>, grace: Duration) -> Rig {
+/// A rig whose fake backend announces `announce_min` CAPTURE buffers, standing in for a codec
+/// whose output-slot count the MediaCodec backend reads and announces (D69).
+fn rig_announcing_min(announce_min: u32) -> Rig {
+    rig_full(None, FAKE_GRACE, announce_min)
+}
+
+fn rig_full(fail_start: Option<i32>, grace: Duration, announce_min: u32) -> Rig {
     let events = EventLog::default();
     let events_log = Rc::clone(&events.0);
     let log: SharedLog = Default::default();
@@ -869,6 +879,7 @@ fn rig_full(fail_start: Option<i32>, grace: Duration) -> Rig {
     let backend = FakeBackend {
         caps: caps(),
         log: Arc::clone(&log),
+        announce_min,
         fail_start,
         grace,
     };
@@ -981,6 +992,21 @@ fn errors(events: &[V4l2Event]) -> usize {
 fn collect_capture(r: &mut Rig, s: &mut Session, n: usize) {
     while dequeued_on(&r.events.borrow(), CAPTURE).len() < n {
         assert!(wait_ready(s), "no CAPTURE frame within 2s");
+        process(&mut r.device, s);
+    }
+}
+
+/// Drive `process_events` until a CAPTURE buffer carrying `V4L2_BUF_FLAG_LAST` is dequeued, or
+/// time out. A drain delivers ordinary frames before its empty `LAST` buffer, and the grace-model
+/// backend thread can split them across `process_events` batches, so a test that wants the `LAST`
+/// must collect until it appears rather than assert it is the first CAPTURE dequeue -- doing the
+/// latter is what made `a_refused_drain_leaves_no_drain_pending` flaky under load (D63).
+fn collect_until_last(r: &mut Rig, s: &mut Session) {
+    while !dequeued_on(&r.events.borrow(), CAPTURE)
+        .iter()
+        .any(|b| b.flags().contains(BufferFlags::LAST))
+    {
+        assert!(wait_ready(s), "no LAST CAPTURE buffer within 2s");
         process(&mut r.device, s);
     }
 }
@@ -3161,9 +3187,15 @@ fn a_refused_drain_leaves_no_drain_pending() {
         .decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_STOP))
         .unwrap();
     assert_eq!(s.drain, Drain::Pending);
-    collect_capture(&mut r, &mut s, 1);
-    let last = dequeued_on(&r.events.borrow(), CAPTURE).pop().unwrap();
-    assert!(last.flags().contains(BufferFlags::LAST));
+    // Collect until the drain's LAST buffer appears -- not just the first CAPTURE dequeue, which
+    // an ordinary frame or the grace thread can beat under load (D63).
+    collect_until_last(&mut r, &mut s);
+    assert!(
+        dequeued_on(&r.events.borrow(), CAPTURE)
+            .iter()
+            .any(|b| b.flags().contains(BufferFlags::LAST)),
+        "the drain returned a LAST buffer"
+    );
     assert_eq!(eos_events(&r.events.borrow()), 1);
     close(&mut r.device, s);
 }
@@ -3468,6 +3500,40 @@ fn min_buffers_for_capture_is_enumerated_and_readable() {
     // The FakeDecoderBackend announces min_capture_buffers = 4.
     assert_eq!(r.device.g_ctrl(&s, CID_MIN_CAP).unwrap().value, 4);
     assert_eq!(g_ctrl_ext(&mut r, &mut s, CID_MIN_CAP), Ok(4), "via G_EXT_CTRLS");
+    close(&mut r.device, s);
+}
+
+/// D69: the CAPTURE minimum the backend announces flows through to the control and the
+/// `SOURCE_CHANGE`, whatever its value. A client that honours the announcement -- GStreamer sizes
+/// its CAPTURE pool from `MIN_BUFFERS_FOR_CAPTURE`, and ffmpeg's `-num_capture_buffers` needs it
+/// -- was told `min 4` while the codec needed 21 output slots, and undershooting cost frames in
+/// silence (8 buffers -> 73/300, rc 0, B12-acceptance §2/§15). The MediaCodec backend now reads
+/// `num-output-slots` and announces `max(4, slots)`; here the fake stands in for the codec by
+/// announcing 21, and the device must carry it to both `G_CTRL(MIN_BUFFERS_FOR_CAPTURE)` (and its
+/// `G_EXT_CTRLS` form) and the `SOURCE_CHANGE`. Before any format change the floor (1) still
+/// stands, and the control is read-only and volatile.
+#[test]
+fn the_announced_capture_minimum_reaches_the_control() {
+    let mut r = rig_announcing_min(21);
+    let mut s = session(&mut r.device);
+    const CID_MIN_CAP: u32 = bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
+
+    // Before the codec has parsed the stream the value is the floor, not the codec's number.
+    assert_eq!(r.device.g_ctrl(&s, CID_MIN_CAP).unwrap().value, 1);
+
+    // The SOURCE_CHANGE the fake raises carries min 21, and the control now answers 21 both ways.
+    start_streaming_320x240(&mut r, &mut s);
+    assert_eq!(source_changes(&r.events.borrow()), 1, "one SOURCE_CHANGE");
+    assert_eq!(
+        r.device.g_ctrl(&s, CID_MIN_CAP).unwrap().value,
+        21,
+        "the codec's output-slot count reached MIN_BUFFERS_FOR_CAPTURE"
+    );
+    assert_eq!(g_ctrl_ext(&mut r, &mut s, CID_MIN_CAP), Ok(21), "via G_EXT_CTRLS");
+
+    // Still read-only: a client cannot force it down and then under-provision without a refusal.
+    assert_eq!(r.device.s_ctrl(&mut s, CID_MIN_CAP, 4).map(|_| ()), Err(libc::EACCES));
+    assert_eq!(r.device.g_ctrl(&s, CID_MIN_CAP).unwrap().value, 21);
     close(&mut r.device, s);
 }
 

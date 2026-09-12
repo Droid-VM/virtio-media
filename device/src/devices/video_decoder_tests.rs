@@ -321,13 +321,20 @@ impl VideoDecoderBackend for FakeBackend {
             let mut deferred: std::collections::VecDeque<u32> = Default::default();
             let mut deferred_since: Option<Instant> = None;
             let mut awaiting_drc = false;
-            // Return the guest OUTPUT buffer, or hold it if a `SOURCE_CHANGE` is still owed.
+            // The grace has fired once in this pending-format window without an announcement, so no
+            // further buffer of it is held (D64, `android.rs`'s `grace_expired`): only the first
+            // buffer needs holding for gst's ordering, and a client that keeps feeding must not be
+            // re-throttled to one buffer per grace.
+            let mut grace_expired = false;
+            // Return the guest OUTPUT buffer, or hold it if a `SOURCE_CHANGE` is still owed and the
+            // window's grace has not already fired (`grace_expired`, D64).
             let hold = |index: u32,
                         format_announced: bool,
                         awaiting_drc: bool,
+                        grace_expired: bool,
                         deferred: &mut std::collections::VecDeque<u32>,
                         deferred_since: &mut Option<Instant>| {
-                if !format_announced || awaiting_drc {
+                if (!format_announced || awaiting_drc) && !grace_expired {
                     if deferred_since.is_none() {
                         *deferred_since = Some(Instant::now());
                     }
@@ -433,6 +440,8 @@ impl VideoDecoderBackend for FakeBackend {
                                 &mut deferred_since,
                                 &mut awaiting_drc,
                             );
+                            // One-shot: the rest of this window is not held (D64).
+                            grace_expired = true;
                             continue;
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -460,6 +469,7 @@ impl VideoDecoderBackend for FakeBackend {
                                 index,
                                 format_announced,
                                 awaiting_drc,
+                                grace_expired,
                                 &mut deferred,
                                 &mut deferred_since,
                             );
@@ -473,10 +483,13 @@ impl VideoDecoderBackend for FakeBackend {
                             // emptied. Model it: begin the DRC hold, announce, then release the
                             // held buffer AFTER the event.
                             awaiting_drc = true;
+                            // A fresh pending-format window: hold its first buffer again (D64).
+                            grace_expired = false;
                             hold(
                                 index,
                                 format_announced,
                                 awaiting_drc,
+                                grace_expired,
                                 &mut deferred,
                                 &mut deferred_since,
                             );
@@ -577,6 +590,7 @@ impl VideoDecoderBackend for FakeBackend {
                             index,
                             format_announced,
                             awaiting_drc,
+                            grace_expired,
                             &mut deferred,
                             &mut deferred_since,
                         );
@@ -1848,6 +1862,127 @@ fn a_true_seek_still_drops_staging_and_stays_stale_free() {
     assert_eq!(r.log.lock().unwrap().flushes, 1, "still exactly one seek");
     assert_eq!(r.log.lock().unwrap().started.len(), 1, "the same codec, not a new one");
 
+    close(&mut r.device, s);
+}
+
+/// D71, order STREAMON-then-announce: ffmpeg brings CAPTURE up from the `S_FMT(OUTPUT)`
+/// placeholder *before* the `SOURCE_CHANGE` arrives. The announce then finds CAPTURE already
+/// streaming at a size it does not change, so nothing has to be reconfigured and no later
+/// `STREAMON(CAPTURE)` will come to clear `format_change_pending`. The flag must therefore not be
+/// left set: a `STREAMOFF(OUTPUT)` after that (ffmpeg's EOF close, or a genuine seek) must be a
+/// seek -- a flush that drops staging -- not a reinit, or B9's 0-stale-seek property is silently
+/// disarmed for the life of the session.
+#[test]
+fn an_announce_after_streamon_capture_leaves_a_later_streamoff_a_seek() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 4).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // CAPTURE up at the placeholder size, streaming, before any SOURCE_CHANGE -- the fake will
+    // announce FAKE_STREAM_SIZE (320x240), the same size, so the announce changes nothing.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
+    for i in 0..4 {
+        r.device
+            .qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], PayloadValidity::ALL)
+            .unwrap();
+    }
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+
+    // Now feed OUTPUT and stream it on: the backend parses and raises SOURCE_CHANGE, which the
+    // device handles with CAPTURE already streaming.
+    poke_mmap_output(&mut s, 0, 0x01);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while source_changes(&r.events.borrow()) == 0 {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert_eq!(source_changes(&r.events.borrow()), 1);
+
+    // The STREAMOFF(OUTPUT): a genuine seek (flush), NOT a reinit -- the change was never left
+    // pending, because CAPTURE was already streaming for this format (D71).
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    assert_eq!(
+        r.log.lock().unwrap().flushes,
+        1,
+        "STREAMOFF(OUTPUT) after an announce that found CAPTURE streaming is a seek"
+    );
+    assert_eq!(
+        r.log.lock().unwrap().reinits,
+        0,
+        "not a reinit: the format change was not left pending (D71)"
+    );
+
+    close(&mut r.device, s);
+}
+
+/// D71, order announce-then-STREAMON: the ordinary GStreamer/ffmpeg flow where CAPTURE is started
+/// *after* the `SOURCE_CHANGE`. `start_streaming_320x240` does exactly that (announce, then
+/// `REQBUFS`/`STREAMON(CAPTURE)`), and `STREAMON(CAPTURE)` must clear the pending flag so that a
+/// later `STREAMOFF(OUTPUT)` is a seek again -- B9's 0-stale seek. (The pending window itself, and
+/// the reinit taken inside it, are pinned by `reinit_across_the_initial_source_change_keeps_staged_input`.)
+#[test]
+fn streamon_capture_after_the_announce_clears_the_pending_change() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    let sizeimage = start_streaming_320x240(&mut r, &mut s);
+
+    // Decode a frame so the codec is warm, then drain.
+    poke_mmap_output(&mut s, 0, 0x07);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    collect_capture(&mut r, &mut s, 1);
+    drain_events(&mut r, &mut s);
+
+    // STREAMON(CAPTURE) has already cleared the pending change (it ran inside
+    // start_streaming_320x240), so this STREAMOFF(OUTPUT) is a seek, not a reinit.
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    assert_eq!(r.log.lock().unwrap().flushes, 1, "a seek after STREAMON(CAPTURE) cleared the change");
+    assert_eq!(r.log.lock().unwrap().reinits, 0, "not a reinit: STREAMON(CAPTURE) cleared it");
+    let _ = sizeimage;
+
+    close(&mut r.device, s);
+}
+
+/// D72: a `REQBUFS(CAPTURE, n)` with `n` below the codec's announced minimum is raised to the
+/// minimum, the way `vb2_core_reqbufs` bumps a count up to the driver's floor. ffmpeg asks for a
+/// fixed 20 and never reads `MIN_BUFFERS_FOR_CAPTURE`; the codec here needs 21, so the count must
+/// come back 21, not 20. A count already at or above the minimum, and one on the OUTPUT queue, are
+/// left as asked (capped at `MAX_BUFFERS`).
+#[test]
+fn reqbufs_capture_is_raised_to_the_announced_minimum() {
+    let mut r = rig_announcing_min(21);
+    let mut s = session(&mut r.device);
+    start_streaming_320x240(&mut r, &mut s);
+
+    // The codec announced 21; a client asking for 20 (ffmpeg's default) is granted 21.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.streamoff(&mut s, CAPTURE).unwrap();
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
+    let reply = r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 20).unwrap();
+    assert_eq!(reply.count, 21, "REQBUFS(CAPTURE, 20) is raised to the announced minimum 21 (D72)");
+
+    // A count already above the minimum is left as asked.
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
+    let reply = r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 25).unwrap();
+    assert_eq!(reply.count, 25, "a count above the minimum is not lowered");
+
+    // The OUTPUT queue is never raised: only CAPTURE has the codec's minimum.
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 0).unwrap();
+    let reply = r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2).unwrap();
+    assert_eq!(reply.count, 2, "OUTPUT REQBUFS is granted as asked");
+
+    let _ = sizeimage;
     close(&mut r.device, s);
 }
 
@@ -3320,6 +3455,69 @@ fn a_held_input_buffer_returns_after_the_grace_when_the_codec_never_announces() 
         "the buffer must be held for the grace, not returned on the recycle"
     );
     assert_eq!(dequeued_on(&r.events.borrow(), OUTPUT).len(), 1, "buffer 0 returned after the grace");
+    assert_eq!(source_changes(&r.events.borrow()), 0, "the codec never announced");
+    close(&mut r.device, s);
+}
+
+/// D64: the grace is one-shot per pending-format window. A client that keeps feeding after the
+/// first held buffer comes back (ffmpeg, one `OUTPUT` buffer in flight, re-queuing it) must not be
+/// re-throttled to one buffer per grace: only the *first* buffer needs holding for gst's ordering
+/// (gst queues one and stops), and throttling ffmpeg for a whole 7.5 s announce delay under encode
+/// contention starved the codec into dropping a mid-stream band of ~30 pictures (30 grace lines ==
+/// 30 lost frames). So the first buffer is held for the grace, and every buffer after the grace
+/// fires (with no announcement) comes back at full rate.
+#[test]
+fn a_never_announcing_codec_feeds_a_one_buffer_client_at_full_rate_after_the_first_grace() {
+    let grace = Duration::from_millis(100);
+    let mut r = rig_grace(grace);
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 4).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // One OUTPUT buffer in flight (ffmpeg-shaped), re-queued each time it comes back. The first
+    // one carries bytes the codec cannot announce from: it is held for the grace.
+    poke_mmap_output(&mut s, 0, NO_ANNOUNCE_MAGIC);
+    r.device
+        .qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], PayloadValidity::ALL)
+        .unwrap();
+    let start = Instant::now();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while dequeued_on(&r.events.borrow(), OUTPUT).is_empty() {
+        assert!(wait_ready(&s), "no first OUTPUT DQBUF within 2s");
+        process(&mut r.device, &mut s);
+    }
+    assert!(start.elapsed() >= grace, "the first buffer is held for the grace");
+
+    // Now keep feeding the same one buffer. After the first grace has fired without an
+    // announcement, each re-queue must come back at full rate. Six re-queues that were each
+    // throttled would take at least 6*grace; assert all six come back inside a single grace.
+    let feeds = 6usize;
+    let resume = Instant::now();
+    for _ in 0..feeds {
+        let have = dequeued_on(&r.events.borrow(), OUTPUT).len();
+        poke_mmap_output(&mut s, 0, NO_ANNOUNCE_MAGIC);
+        r.device
+            .qbuf(&mut s, mmap_buffer(OUTPUT, 0, 1 << 20), vec![], PayloadValidity::ALL)
+            .unwrap();
+        while dequeued_on(&r.events.borrow(), OUTPUT).len() <= have {
+            assert!(wait_ready(&s), "no prompt InputBufferDone after the first grace");
+            process(&mut r.device, &mut s);
+        }
+    }
+    let elapsed = resume.elapsed();
+    assert_eq!(
+        dequeued_on(&r.events.borrow(), OUTPUT).len(),
+        1 + feeds,
+        "every fed buffer returned"
+    );
+    assert!(
+        elapsed < grace,
+        "after the first grace the client runs at full rate ({elapsed:?} for {feeds} feeds, grace {grace:?}); \
+         re-throttling would take at least {feeds}*grace"
+    );
     assert_eq!(source_changes(&r.events.borrow()), 0, "the codec never announced");
     close(&mut r.device, s);
 }

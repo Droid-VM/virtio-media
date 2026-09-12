@@ -1207,7 +1207,19 @@ where
                 // A format change has been announced and the CAPTURE queue has not been (re)started
                 // for it yet: a `STREAMOFF(OUTPUT)` until then is a reinit, not a seek (D53). Set
                 // regardless of subscription; it is cleared by `STREAMON(CAPTURE)` / `DEC_CMD_START`.
-                session.format_change_pending = true;
+                //
+                // But when the announce lands while CAPTURE is *already* streaming for this very
+                // format, there is nothing left to (re)start: ffmpeg brings CAPTURE up from the
+                // `S_FMT(OUTPUT)` placeholder before the `SOURCE_CHANGE`, so the announce finds
+                // CAPTURE streaming at a size it does not change, and no later `STREAMON(CAPTURE)`
+                // will come to clear the flag. Leaving it set would classify every subsequent
+                // `STREAMOFF(OUTPUT)` -- ffmpeg's EOF close, and any genuine seek -- as a reinit for
+                // the life of the session, silently disarming B9's 0-stale-seek property (D71). So
+                // the change is pending only when the client still has to (re)start CAPTURE:
+                // CAPTURE not streaming, or streaming at a size this announce actually changes (a
+                // real resolution change, where the client reallocates and restarts CAPTURE).
+                session.format_change_pending =
+                    !(session.state.capture_streaming && session.coded_size == coded_size);
                 session.coded_size = coded_size;
                 session.crop = CropRectangle::FromStream(visible_rect);
                 session.min_capture_buffers = min_capture_buffers;
@@ -1577,7 +1589,18 @@ where
         // Old buffers go first, mappings and all, so the reply never races a stale view. The
         // backend has stopped touching them (`streamoff` above, or the queue was not streaming).
         self.free_buffers(session.queue_mut(queue)?);
-        let count = (count as usize).min(MAX_BUFFERS);
+        let mut count = (count as usize).min(MAX_BUFFERS);
+        // A `REQBUFS(CAPTURE, n)` below the codec's announced minimum is raised to it, as vb2 does
+        // (`vb2_core_reqbufs` bumps a non-zero count up to the driver's minimum,
+        // `videobuf2-core.c`): V4L2 lets `REQBUFS` grant more buffers than the client asked for
+        // exactly so a driver can meet its own floor, and a client that provisions fewer than the
+        // codec's output-slot count -- ffmpeg's fixed `-num_capture_buffers` default of 20, one
+        // below the announced 21 -- gets a silently short decode (D72). Capped at `MAX_BUFFERS`.
+        if count > 0 && direction == QueueDirection::Capture {
+            count = count
+                .max(session.min_capture_buffers as usize)
+                .min(MAX_BUFFERS);
+        }
         if count > 0 {
             let sizeimage = session.sizeimage(direction);
             self.add_buffers(session.queue_mut(queue)?, queue, memory, count, sizeimage)?;

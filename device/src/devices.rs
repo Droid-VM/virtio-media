@@ -64,3 +64,69 @@ pub use video_decoder::VideoDecoder;
 pub mod video_encoder;
 #[cfg(feature = "video-encoder-device")]
 pub use video_encoder::VideoEncoder;
+
+/// A byte budget the device tests' allocators consult, standing in for the VMM's fixed-size
+/// `media_host` pool.
+///
+/// [`crate::MemFdAllocator`] never runs out, so before D73 no test could tell "the pool granted
+/// what it could" from "the pool granted everything": the partial `REQBUFS`/`CREATE_BUFS` rule
+/// needs an allocator that refuses the seventh buffer and keeps counting bytes. Each device's
+/// test allocator wraps the memfd one and asks this first; the default is unlimited, so every
+/// test that predates the rule allocates exactly as it always did.
+#[cfg(test)]
+pub(crate) mod test_pool {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// `capacity` bytes, `used` of them handed out. Shared (`Rc`) between the test and the
+    /// allocator the device holds, because the test sizes it and reads it back.
+    pub(crate) struct PoolBudget {
+        capacity: Cell<u64>,
+        used: Cell<u64>,
+    }
+
+    impl PoolBudget {
+        /// A pool nothing can exhaust: what every test that does not size one gets.
+        pub(crate) fn unlimited() -> Rc<Self> {
+            Rc::new(PoolBudget {
+                capacity: Cell::new(u64::MAX),
+                used: Cell::new(0),
+            })
+        }
+
+        /// Size the pool to hold exactly `n` buffers of `sizeimage` bytes and not one more.
+        pub(crate) fn holds(&self, n: u64, sizeimage: u64) {
+            self.capacity.set(n * sizeimage);
+        }
+
+        /// Leave room for exactly `n` more buffers of `sizeimage` bytes on top of what is
+        /// already out -- for a queue allocated against a pool another queue is already using.
+        pub(crate) fn holds_more(&self, n: u64, sizeimage: u64) {
+            self.capacity.set(self.used.get() + n * sizeimage);
+        }
+
+        /// Bytes handed out and not yet given back -- the `pool used` of the VMM's accounting
+        /// line, which a partial answer must match buffer for buffer.
+        pub(crate) fn used(&self) -> u64 {
+            self.used.get()
+        }
+
+        /// Take `len` bytes, or `ENOMEM` if they do not fit -- the errno the VMM's own pool
+        /// answers an exhausted `media_host` with.
+        pub(crate) fn take(&self, len: u64) -> Result<(), i32> {
+            let used = self.used.get();
+            match used.checked_add(len) {
+                Some(after) if after <= self.capacity.get() => {
+                    self.used.set(after);
+                    Ok(())
+                }
+                _ => Err(libc::ENOMEM),
+            }
+        }
+
+        /// Give `len` bytes back.
+        pub(crate) fn give_back(&self, len: u64) {
+            self.used.set(self.used.get().saturating_sub(len));
+        }
+    }
+}

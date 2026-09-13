@@ -766,16 +766,43 @@ where
         }
     }
 
-    /// Append `count` buffers of `sizeimage` bytes. All or nothing.
+    /// Append up to `count` buffers of `sizeimage` bytes and return how many were actually
+    /// appended -- fewer than `count` when the pool ran out on the way (D73).
+    ///
+    /// This was all-or-nothing, and that cost a 4K capture the whole request: `libavdevice`'s
+    /// v4l2 input asks `REQBUFS(count = 256)` and exposes no option to lower it, the device
+    /// clamps that to `MAX_BUFFERS` (32), and 32 x 12 443 648 B = 379.75 MiB does not fit the
+    /// 320 MiB `media_host` pool -- so `ffmpeg -f v4l2 -video_size 3840x2160` failed `ENOMEM` on
+    /// buffer 27 while the 26 the pool could hold would have streamed, and `REQBUFS(3)` at the
+    /// same size worked (`logs/vpu_wp/B14-accept-B.md` section 2). V4L2 has always allowed the
+    /// shorter answer: "the driver may allocate fewer buffers than requested" and the count
+    /// field comes back with what it got (`vidioc-reqbufs.rst`). vb2 is built that way --
+    /// `__vb2_queue_alloc` allocates what it can, and `vb2_core_reqbufs` turns that into
+    /// `-ENOMEM` only when it lands below the queue's own floor (`allocated_buffers <
+    /// q->min_reqbufs_allocation`, `videobuf2-core.c:977`), `vb2_core_create_bufs` only when it
+    /// is zero (`:1102`).
+    ///
+    /// So a refusal from the allocator ends the loop, not the request: what was allocated stays,
+    /// as long as it is at least `min`. Below `min` nothing is kept -- `undo_added` gives back
+    /// every buffer this call made, and the errno the allocator refused with (the `ENOMEM` whose
+    /// cause the VMM's own pool-exhaustion line names) goes back to the guest exactly as before.
+    /// A partial answer is made of ordinary buffers: indices `first..first + granted`, each
+    /// `sizeimage` bytes, each carrying the plane `length` that bounds its mapping (review-m4
+    /// R2), and the pool holds exactly `granted` of them -- nothing allocated is dropped on the
+    /// floor and nothing counted is missing.
     fn add_buffers(
         &mut self,
         session: &mut CameraSession<M::GuestMemoryMapping, B::Stream>,
         memory: MemoryType,
         count: usize,
+        min: usize,
         sizeimage: u32,
-    ) -> IoctlResult<()> {
+        what: &str,
+    ) -> IoctlResult<usize> {
         let first = session.buffers.len();
         let mut added: Vec<Buffer<M::GuestMemoryMapping>> = Vec::with_capacity(count);
+        // The errno that stopped the loop, if one did; kept for the below-`min` case.
+        let mut stopped: Option<i32> = None;
 
         for index in first..first + count {
             let mut v4l2_buffer = V4l2Buffer::new(QUEUE, index as u32, memory);
@@ -787,8 +814,8 @@ where
                     let host_buffer = match self.allocator.allocate(sizeimage as u64) {
                         Ok(b) => b,
                         Err(e) => {
-                            self.undo_added(added);
-                            return Err(e);
+                            stopped = Some(e);
+                            break;
                         }
                     };
                     let offset = match self.mmap_manager.register_buffer(None, sizeimage) {
@@ -796,8 +823,8 @@ where
                         Err(e) => {
                             log::error!("failed to register MMAP buffer: {:#}", e);
                             self.allocator.release(host_buffer);
-                            self.undo_added(added);
-                            return Err(libc::EINVAL);
+                            stopped = Some(libc::EINVAL);
+                            break;
                         }
                     };
                     if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
@@ -833,11 +860,27 @@ where
             });
         }
 
+        let granted = added.len();
+        if granted < min {
+            self.undo_added(added);
+            return Err(stopped.unwrap_or(libc::ENOMEM));
+        }
+        if stopped.is_some() {
+            // One line for the short answer, at `info!`: the VMM's pool logs the refusal that
+            // stopped the loop as an error and says nothing about the request that survived it.
+            log::info!(
+                "camera: {}: asked {}, pool holds {}, granted {}",
+                what,
+                count,
+                granted,
+                granted
+            );
+        }
         session.buffers.extend(added);
-        Ok(())
+        Ok(granted)
     }
 
-    /// Give back what `add_buffers` allocated before it failed.
+    /// Give back what `add_buffers` allocated before it failed, or beyond what it may keep.
     fn undo_added(&mut self, added: Vec<Buffer<M::GuestMemoryMapping>>) {
         for buffer in added {
             if let Backing::Host { buffer, offset } = buffer.backing {
@@ -1597,12 +1640,19 @@ where
         // stream is closed by now (`streamoff` above, or there was none), so nothing writes into
         // them.
         self.free_buffers(session);
-        let count = (count as usize).min(MAX_BUFFERS);
+        let want = (count as usize).min(MAX_BUFFERS);
         session.memory = None;
         self.active_session = None;
-        if count > 0 {
+        // What the guest is told it got: `want`, unless the pool could only serve some of it
+        // (D73). The camera's own floor is **one** buffer -- `streamon`'s only buffer gate is
+        // `session.buffers.is_empty()`, the backend is handed `session.buffers.len()` and
+        // streams whatever that is, and the device promises no double buffering (it exposes no
+        // `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`), so a one-buffer queue captures, slowly. Below it
+        // there is no queue at all and the answer stays `ENOMEM`.
+        let mut count = want;
+        if want > 0 {
             let sizeimage = session.sizeimage();
-            self.add_buffers(session, memory, count, sizeimage)?;
+            count = self.add_buffers(session, memory, want, 1, sizeimage, "REQBUFS")?;
             session.memory = Some(memory);
             self.active_session = Some(session.id);
         }
@@ -1692,9 +1742,13 @@ where
         }
 
         let first = session.buffers.len();
-        let count = (count as usize).min(MAX_BUFFERS.saturating_sub(first));
-        if count > 0 {
-            self.add_buffers(session, memory, count, asked)?;
+        let want = (count as usize).min(MAX_BUFFERS.saturating_sub(first));
+        // `index` + `count` are what the guest indexes the new buffers by, so `count` must be
+        // what was really created -- vb2 answers a short `CREATE_BUFS` the same way, failing
+        // only when it could make none (D73).
+        let mut count = want;
+        if want > 0 {
+            count = self.add_buffers(session, memory, want, 1, asked, "CREATE_BUFS")?;
             session.memory = Some(memory);
             self.active_session = Some(session.id);
         }
@@ -2260,6 +2314,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::devices::test_pool::PoolBudget;
     use crate::ioctl::ffmpeg_wire;
     use crate::poll::SessionPoller;
     use crate::protocol::VIRTIO_MEDIA_CMD_IOCTL;
@@ -2687,19 +2742,30 @@ mod tests {
         }
     }
 
-    /// Counts what the device gives back, and when.
+    /// Counts what the device gives back, and when, over a pool of a size the test chooses.
     struct OrderedAllocator {
         inner: MemFdAllocator,
         log: SharedLog,
         released: Rc<RefCell<usize>>,
+        /// The `media_host` pool this allocator carves from: unlimited unless a test sizes it
+        /// (D73).
+        pool: Rc<PoolBudget>,
     }
 
     impl VirtioMediaBufferAllocator for OrderedAllocator {
         fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
-            self.inner.allocate(len)
+            self.pool.take(len)?;
+            match self.inner.allocate(len) {
+                Ok(buffer) => Ok(buffer),
+                Err(e) => {
+                    self.pool.give_back(len);
+                    Err(e)
+                }
+            }
         }
 
         fn release(&mut self, buf: HostBuffer) {
+            self.pool.give_back(buf.len);
             {
                 let mut log = self.log.lock().unwrap();
                 if log.streaming {
@@ -2720,6 +2786,7 @@ mod tests {
         guest: FakeGuest,
         log: SharedLog,
         released: Rc<RefCell<usize>>,
+        pool: Rc<PoolBudget>,
     }
 
     const GUEST_MEMORY: usize = 1 << 20;
@@ -2825,6 +2892,7 @@ mod tests {
             log: Arc::clone(&log),
         };
         let released = Rc::new(RefCell::new(0));
+        let pool = PoolBudget::unlimited();
         let device = CameraDevice::new(
             camera,
             events,
@@ -2834,6 +2902,7 @@ mod tests {
                 inner: MemFdAllocator::new(),
                 log: Arc::clone(&log),
                 released: Rc::clone(&released),
+                pool: Rc::clone(&pool),
             },
         );
         Rig {
@@ -2842,6 +2911,7 @@ mod tests {
             guest,
             log,
             released,
+            pool,
         }
     }
 
@@ -6195,6 +6265,155 @@ mod tests {
             .unwrap();
         r.device.streamon(&mut s, QUEUE).unwrap();
         assert!(r.log.lock().unwrap().opened[0].controls.is_empty());
+        close(&mut r.device, s);
+    }
+
+    /// D73: a `REQBUFS` the pool cannot serve in full grants what it *can*, as vb2 does, instead
+    /// of failing the whole request.
+    ///
+    /// `libavdevice`'s v4l2 input asks `REQBUFS(256)` and offers no way to lower it; the device
+    /// clamps it to `MAX_BUFFERS` and used to allocate all 32 or nothing, which is why
+    /// `ffmpeg -f v4l2 -video_size 3840x2160` failed `ENOMEM` on a 320 MiB pool while
+    /// `REQBUFS(3)` at the same size worked (`logs/vpu_wp/B14-accept-B.md` section 2). Here the
+    /// pool holds five buffers: five come back, they are ordinary buffers with the queue's own
+    /// `sizeimage` on their plane, the books say five, and the sixth index does not exist.
+    #[test]
+    fn reqbufs_grants_what_the_pool_can_hold() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.pool.holds(5, size as u64);
+
+        let reply = r
+            .device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 256)
+            .unwrap();
+        assert_eq!(reply.count, 5, "the pool held five, so five were granted");
+        assert_eq!(s.buffers.len(), 5);
+        assert_eq!(
+            r.pool.used(),
+            5 * size as u64,
+            "the pool's books match the count the guest was told"
+        );
+        for index in 0..5 {
+            let buf = r.device.querybuf(&s, QUEUE, index).unwrap();
+            assert_eq!(buf.index(), index);
+            // The R2 length rule: every granted buffer carries the mapping bound the queue's
+            // format asks for, partial answer or not.
+            assert_eq!(*buf.get_first_plane().length, size);
+        }
+        assert_eq!(r.device.querybuf(&s, QUEUE, 5).err(), Some(libc::EINVAL));
+
+        // Five buffers are a queue that streams: the camera's floor is one.
+        for index in 0..5 {
+            r.device
+                .qbuf(
+                    &mut s,
+                    mmap_buffer(index, size),
+                    vec![],
+                    PayloadValidity::ALL,
+                )
+                .unwrap();
+        }
+        r.device.streamon(&mut s, QUEUE).unwrap();
+        assert_eq!(collect_frames(&mut r, &mut s, 5).len(), 5);
+        r.device.streamoff(&mut s, QUEUE).unwrap();
+
+        // And `REQBUFS(0)` gives every byte back.
+        assert_eq!(
+            r.device
+                .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 0)
+                .unwrap()
+                .count,
+            0
+        );
+        assert!(s.buffers.is_empty());
+        assert_eq!(r.pool.used(), 0);
+        assert_eq!(*r.released.borrow(), 5);
+        close(&mut r.device, s);
+    }
+
+    /// D73's other half: below the device's floor there is no queue to grant, so a pool that
+    /// cannot serve even one buffer is still `ENOMEM` with nothing held -- the exhaustion the
+    /// VMM's pool line names, and the behaviour every caller had before the partial rule.
+    #[test]
+    fn reqbufs_on_an_empty_pool_is_still_enomem_and_holds_nothing() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.pool.holds(0, size as u64);
+
+        assert_eq!(
+            r.device.reqbufs(&mut s, QUEUE, MemoryType::Mmap, 256).err(),
+            Some(libc::ENOMEM)
+        );
+        assert!(s.buffers.is_empty());
+        assert_eq!(s.memory, None);
+        assert_eq!(r.device.active_session, None);
+        assert_eq!(r.pool.used(), 0, "nothing was kept");
+        assert_eq!(*r.released.borrow(), 0, "and nothing was allocated to keep");
+
+        // The session is untouched, so a request the pool can serve still works.
+        r.pool.holds(2, size as u64);
+        assert_eq!(
+            r.device
+                .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 2)
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(r.pool.used(), 2 * size as u64);
+        close(&mut r.device, s);
+    }
+
+    /// D73 on `CREATE_BUFS`: the reply's `index` + `count` are what the guest indexes the new
+    /// buffers by, so a short answer must report what was really created and the buffers must be
+    /// there at those indices. A `CREATE_BUFS` that can create none is `ENOMEM`, and it leaves
+    /// the buffers the queue already had alone.
+    #[test]
+    fn create_bufs_grants_what_the_pool_can_hold() {
+        let mut r = rig();
+        let mut s = session(&mut r.device);
+        r.device.s_fmt(&mut s, QUEUE, format(64, 48)).unwrap();
+        let size = 64 * 48 * 3 / 2;
+        r.pool.holds(5, size as u64);
+
+        assert_eq!(
+            r.device
+                .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 2)
+                .unwrap()
+                .count,
+            2
+        );
+        // Three of the eight asked for still fit.
+        let reply = r
+            .device
+            .create_bufs(&mut s, 8, QUEUE, MemoryType::Mmap, format(64, 48))
+            .unwrap();
+        assert_eq!((reply.index, reply.count), (2, 3));
+        assert_eq!(s.buffers.len(), 5);
+        assert_eq!(r.pool.used(), 5 * size as u64);
+        assert!(r.device.querybuf(&s, QUEUE, 4).is_ok());
+        assert_eq!(r.device.querybuf(&s, QUEUE, 5).err(), Some(libc::EINVAL));
+
+        // The pool is full: a set that can create nothing is refused, and the five stay.
+        assert_eq!(
+            r.device
+                .create_bufs(&mut s, 4, QUEUE, MemoryType::Mmap, format(64, 48))
+                .err(),
+            Some(libc::ENOMEM)
+        );
+        assert_eq!(s.buffers.len(), 5);
+        assert_eq!(r.pool.used(), 5 * size as u64);
+
+        // `REQBUFS(0)` returns everything, `CREATE_BUFS` buffers included.
+        r.device
+            .reqbufs(&mut s, QUEUE, MemoryType::Mmap, 0)
+            .unwrap();
+        assert_eq!(r.pool.used(), 0);
+        assert_eq!(*r.released.borrow(), 5);
         close(&mut r.device, s);
     }
 }

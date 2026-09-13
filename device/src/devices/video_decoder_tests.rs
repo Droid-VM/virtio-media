@@ -21,6 +21,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use super::*;
+use crate::devices::test_pool::PoolBudget;
 use crate::ioctl::ffmpeg_wire;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::MemFdAllocator;
@@ -138,18 +139,29 @@ impl VirtioMediaHostMemoryMapper for FakeHostMapper {
     }
 }
 
-/// Counts what the device gives back, and whether it happened while the backend was still open.
+/// Counts what the device gives back, and whether it happened while the backend was still open,
+/// over a pool of a size the test chooses.
 struct OrderedAllocator {
     inner: MemFdAllocator,
     log: SharedLog,
+    /// The `media_host` pool this allocator carves from: unlimited unless a test sizes it (D73).
+    pool: Rc<PoolBudget>,
 }
 
 impl VirtioMediaBufferAllocator for OrderedAllocator {
     fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
-        self.inner.allocate(len)
+        self.pool.take(len)?;
+        match self.inner.allocate(len) {
+            Ok(buffer) => Ok(buffer),
+            Err(e) => {
+                self.pool.give_back(len);
+                Err(e)
+            }
+        }
     }
 
     fn release(&mut self, buf: HostBuffer) {
+        self.pool.give_back(buf.len);
         // §2.5: a buffer must not go back to the allocator while the backend might still be
         // writing the queue's buffers. `capture_active` is true only between a CAPTURE buffer
         // being lent and the backend being joined (clear/stop), so a non-zero count here is a
@@ -830,6 +842,7 @@ struct Rig {
     events: Rc<RefCell<Vec<V4l2Event>>>,
     guest: FakeGuest,
     log: SharedLog,
+    pool: Rc<PoolBudget>,
 }
 
 const GUEST_MEMORY: usize = 8 << 20;
@@ -897,6 +910,7 @@ fn rig_full(fail_start: Option<i32>, grace: Duration, announce_min: u32) -> Rig 
         fail_start,
         grace,
     };
+    let pool = PoolBudget::unlimited();
     let device = VideoDecoder::new(
         backend,
         events,
@@ -905,6 +919,7 @@ fn rig_full(fail_start: Option<i32>, grace: Duration, announce_min: u32) -> Rig 
         OrderedAllocator {
             inner: MemFdAllocator::new(),
             log: Arc::clone(&log),
+            pool: Rc::clone(&pool),
         },
     );
     Rig {
@@ -912,6 +927,7 @@ fn rig_full(fail_start: Option<i32>, grace: Duration, announce_min: u32) -> Rig 
         events: events_log,
         guest,
         log,
+        pool,
     }
 }
 
@@ -3885,4 +3901,186 @@ fn start_streaming_320x240(r: &mut Rig, s: &mut Session) -> u32 {
     r.device.streamon(s, CAPTURE).unwrap();
     let _ = drain_events; // silence dead-code in builds where it is unused
     sizeimage
+}
+
+/// D73: a `REQBUFS` the pool cannot serve in full grants what it *can*, as vb2 does
+/// (`__vb2_queue_alloc` keeps what it allocated; `vb2_core_reqbufs` only turns a short
+/// allocation into `-ENOMEM` below the queue's own floor), instead of failing the whole
+/// request -- the 4K `ffmpeg -f v4l2` failure of `logs/vpu_wp/B14-accept-B.md` section 2. The
+/// OUTPUT queue's floor is one bitstream buffer, so a pool that holds five answers five.
+#[test]
+fn reqbufs_output_grants_what_the_pool_can_hold() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240))
+        .unwrap();
+    let sizeimage = pix(&r.device.g_fmt(&s, OUTPUT).unwrap()).sizeimage;
+    r.pool.holds(5, sizeimage as u64);
+
+    let reply = r
+        .device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 256)
+        .unwrap();
+    assert_eq!(reply.count, 5, "the pool held five, so five were granted");
+    assert_eq!(s.input.buffers.len(), 5);
+    assert_eq!(r.pool.used(), 5 * sizeimage as u64);
+    for index in 0..5 {
+        let buf = r.device.querybuf(&s, OUTPUT, index).unwrap();
+        assert_eq!(buf.index(), index);
+        // The R2 length rule: a partial answer's buffers are bounded like any other's.
+        assert_eq!(*buf.get_first_plane().length, sizeimage);
+    }
+    assert_eq!(r.device.querybuf(&s, OUTPUT, 5).err(), Some(libc::EINVAL));
+
+    // `REQBUFS(0)` gives every byte back.
+    r.device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 0)
+        .unwrap();
+    assert!(s.input.buffers.is_empty());
+    assert_eq!(r.pool.used(), 0);
+    close(&mut r.device, s);
+}
+
+/// D73's other half on the decoder: a pool that cannot serve even one bitstream buffer is still
+/// `ENOMEM`, with nothing kept -- and the session is left able to allocate what does fit.
+#[test]
+fn reqbufs_output_on_an_empty_pool_is_still_enomem_and_holds_nothing() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240))
+        .unwrap();
+    let sizeimage = pix(&r.device.g_fmt(&s, OUTPUT).unwrap()).sizeimage;
+    r.pool.holds(0, sizeimage as u64);
+
+    assert_eq!(
+        r.device
+            .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 256)
+            .err(),
+        Some(libc::ENOMEM)
+    );
+    assert!(s.input.buffers.is_empty());
+    assert_eq!(s.input.memory, None);
+    assert_eq!(r.device.active_session, None);
+    assert_eq!(r.pool.used(), 0);
+
+    r.pool.holds(2, sizeimage as u64);
+    assert_eq!(
+        r.device
+            .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2)
+            .unwrap()
+            .count,
+        2
+    );
+    assert_eq!(r.pool.used(), 2 * sizeimage as u64);
+    close(&mut r.device, s);
+}
+
+/// D73 meets D72: the CAPTURE queue's floor is the count the codec announced, not one. A decode
+/// given fewer output slots than the codec needs does not run slowly, it stalls with every slot
+/// held (D69/D72), so a short CAPTURE answer below the announced minimum is no answer at all --
+/// `ENOMEM`, nothing kept. At or above it, the short answer stands.
+#[test]
+fn reqbufs_capture_below_the_announced_minimum_is_enomem() {
+    let mut r = rig_announcing_min(8);
+    let mut s = session(&mut r.device);
+    let sizeimage = start_streaming_320x240(&mut r, &mut s);
+
+    // Put the CAPTURE queue back and leave the pool room for five buffers only: below the eight
+    // the codec announced.
+    r.device.streamoff(&mut s, CAPTURE).unwrap();
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
+        .unwrap();
+    let output_held = r.pool.used();
+    r.pool.holds_more(5, sizeimage as u64);
+
+    assert_eq!(
+        r.device
+            .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 32)
+            .err(),
+        Some(libc::ENOMEM),
+        "five is below the announced eight, so nothing is granted"
+    );
+    assert!(s.output.buffers.is_empty());
+    assert_eq!(s.output.memory, None);
+    assert_eq!(
+        r.pool.used(),
+        output_held,
+        "the refused CAPTURE set left the OUTPUT queue's bytes and nothing else"
+    );
+
+    // Room for ten: the short answer is above the floor, so it stands.
+    r.pool.holds_more(10, sizeimage as u64);
+    let reply = r
+        .device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 32)
+        .unwrap();
+    assert_eq!(
+        reply.count, 10,
+        "ten fit, ten were granted (above the floor of eight)"
+    );
+    assert_eq!(s.output.buffers.len(), 10);
+    assert_eq!(r.pool.used(), output_held + 10 * sizeimage as u64);
+    for index in 0..10 {
+        assert_eq!(
+            r.device.querybuf(&s, CAPTURE, index).unwrap().index(),
+            index
+        );
+    }
+    assert_eq!(r.device.querybuf(&s, CAPTURE, 10).err(), Some(libc::EINVAL));
+
+    r.device
+        .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
+        .unwrap();
+    assert_eq!(r.pool.used(), output_held);
+    close(&mut r.device, s);
+}
+
+/// D73 on `CREATE_BUFS`: `index` + `count` are what the guest indexes the new buffers by, so a
+/// short answer reports what was really created. The announced CAPTURE minimum is a `REQBUFS`
+/// floor, not a `CREATE_BUFS` one (this call adds to a queue that already has buffers, and vb2's
+/// `vb2_core_create_bufs` fails only when it could create none) -- so one new buffer is enough,
+/// and a set the pool cannot start at all is `ENOMEM` with the existing buffers untouched.
+#[test]
+fn create_bufs_grants_what_the_pool_can_hold() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device
+        .s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240))
+        .unwrap();
+    let sizeimage = pix(&r.device.g_fmt(&s, OUTPUT).unwrap()).sizeimage;
+    r.pool.holds(5, sizeimage as u64);
+
+    r.device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2)
+        .unwrap();
+    let mut fmt = r.device.g_fmt(&s, OUTPUT).unwrap();
+    // SAFETY: the OUTPUT queue is multi-planar.
+    unsafe { fmt.fmt.pix_mp.num_planes = 1 };
+    let reply = r
+        .device
+        .create_bufs(&mut s, 8, OUTPUT, MemoryType::Mmap, fmt)
+        .unwrap();
+    assert_eq!((reply.index, reply.count), (2, 3));
+    assert_eq!(s.input.buffers.len(), 5);
+    assert_eq!(r.pool.used(), 5 * sizeimage as u64);
+    assert!(r.device.querybuf(&s, OUTPUT, 4).is_ok());
+    assert_eq!(r.device.querybuf(&s, OUTPUT, 5).err(), Some(libc::EINVAL));
+
+    assert_eq!(
+        r.device
+            .create_bufs(&mut s, 4, OUTPUT, MemoryType::Mmap, fmt)
+            .err(),
+        Some(libc::ENOMEM)
+    );
+    assert_eq!(s.input.buffers.len(), 5);
+    assert_eq!(r.pool.used(), 5 * sizeimage as u64);
+
+    r.device
+        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 0)
+        .unwrap();
+    assert_eq!(r.pool.used(), 0);
+    close(&mut r.device, s);
 }

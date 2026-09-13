@@ -1818,17 +1818,41 @@ where
         }
     }
 
-    /// Append `count` buffers of `sizeimage` bytes to `queue`. All or nothing.
+    /// Append up to `count` buffers of `sizeimage` bytes to `queue` and return how many were
+    /// actually appended -- fewer than `count` when the pool ran out on the way (D73).
+    ///
+    /// This was all-or-nothing, which cost a client the whole request for want of the last
+    /// buffer: `libavdevice` asks `REQBUFS(count = 256)` with no option to lower it, the device
+    /// clamps it to `MAX_BUFFERS`, and at 4K that set is 379.75 MiB against a 320 MiB
+    /// `media_host` pool -- `ENOMEM`, where the buffers the pool could hold would have run
+    /// (`logs/vpu_wp/B14-accept-B.md` section 2). V4L2 has always allowed the shorter answer:
+    /// "the driver may allocate fewer buffers than requested" and the count field comes back
+    /// with what it got (`vidioc-reqbufs.rst`). vb2 is built that way -- `__vb2_queue_alloc`
+    /// allocates what it can, and `vb2_core_reqbufs` turns that into `-ENOMEM` only when it
+    /// lands below the queue's own floor (`allocated_buffers < q->min_reqbufs_allocation`,
+    /// `videobuf2-core.c:977`), `vb2_core_create_bufs` only when it is zero (`:1102`).
+    ///
+    /// So a refusal from the allocator ends the loop, not the request: what was allocated stays,
+    /// as long as it is at least `min`, which is one buffer on both of this device's queues
+    /// (`streamon` takes any non-empty queue and the backend is handed what there is).
+    /// Below `min` nothing is kept -- `undo_added` gives back every buffer this call made, and
+    /// the allocator's errno goes to the guest as before. A partial answer is made of ordinary
+    /// buffers: indices `first..first + granted`, each `sizeimage` bytes with the plane `length`
+    /// that bounds its mapping (review-m4 R2), and the pool holds exactly `granted` of them.
     fn add_buffers(
         &mut self,
         queue: &mut Queue<M::GuestMemoryMapping>,
         queue_type: QueueType,
         memory: MemoryType,
         count: usize,
+        min: usize,
         sizeimage: u32,
-    ) -> IoctlResult<()> {
+        what: &str,
+    ) -> IoctlResult<usize> {
         let first = queue.buffers.len();
         let mut added: Vec<Buffer<M::GuestMemoryMapping>> = Vec::with_capacity(count);
+        // The errno that stopped the loop, if one did; kept for the below-`min` case.
+        let mut stopped: Option<i32> = None;
 
         for index in first..first + count {
             let mut v4l2_buffer = V4l2Buffer::new(queue_type, index as u32, memory);
@@ -1842,8 +1866,8 @@ where
                     let host_buffer = match self.allocator.allocate(sizeimage as u64) {
                         Ok(b) => b,
                         Err(e) => {
-                            self.undo_added(added);
-                            return Err(e);
+                            stopped = Some(e);
+                            break;
                         }
                     };
                     let offset = match self.mmap_manager.register_buffer(None, sizeimage) {
@@ -1851,8 +1875,8 @@ where
                         Err(e) => {
                             log::error!("failed to register MMAP buffer: {:#}", e);
                             self.allocator.release(host_buffer);
-                            self.undo_added(added);
-                            return Err(libc::EINVAL);
+                            stopped = Some(libc::EINVAL);
+                            break;
                         }
                     };
                     if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
@@ -1888,11 +1912,28 @@ where
             });
         }
 
+        let granted = added.len();
+        if granted < min {
+            self.undo_added(added);
+            return Err(stopped.unwrap_or(libc::ENOMEM));
+        }
+        if stopped.is_some() {
+            // One line for the short answer, at `info!`: the VMM's pool logs the refusal that
+            // stopped the loop as an error and says nothing about the request that survived it.
+            log::info!(
+                "encoder: {} on {:?}: asked {}, pool holds {}, granted {}",
+                what,
+                queue_type,
+                count,
+                granted,
+                granted
+            );
+        }
         queue.buffers.extend(added);
-        Ok(())
+        Ok(granted)
     }
 
-    /// Give back what `add_buffers` allocated before it failed.
+    /// Give back what `add_buffers` allocated before it failed, or beyond what it may keep.
     fn undo_added(&mut self, added: Vec<Buffer<M::GuestMemoryMapping>>) {
         for buffer in added {
             if let Backing::Host { buffer, offset } = buffer.backing {
@@ -2433,10 +2474,24 @@ where
         // Old buffers go first, mappings and all, so the reply never races a stale view. The
         // backend has stopped touching them (`streamoff` above, or the queue was not streaming).
         self.free_buffers(session.queue_mut(queue)?);
-        let count = (count as usize).min(MAX_BUFFERS);
-        if count > 0 {
+        let want = (count as usize).min(MAX_BUFFERS);
+        // What the guest is told it got: `want`, unless the pool could only serve some of it
+        // (D73). This device's floor is one buffer on either queue -- `streamon` takes any
+        // non-empty queue, one OUTPUT buffer feeds a frame in and one CAPTURE buffer takes a
+        // coded frame out -- so a short answer still encodes; below it there is no queue and the
+        // answer stays `ENOMEM`.
+        let mut count = want;
+        if want > 0 {
             let sizeimage = session.sizeimage(direction);
-            self.add_buffers(session.queue_mut(queue)?, queue, memory, count, sizeimage)?;
+            count = self.add_buffers(
+                session.queue_mut(queue)?,
+                queue,
+                memory,
+                want,
+                1,
+                sizeimage,
+                "REQBUFS",
+            )?;
             session.queue_mut(queue)?.memory = Some(memory);
             self.active_session = Some(session.id);
         } else if !session.has_buffers() {
@@ -2495,9 +2550,21 @@ where
             }
         }
         let first = session.queue(queue)?.buffers.len();
-        let count = (count as usize).min(MAX_BUFFERS - first);
-        if count > 0 {
-            self.add_buffers(session.queue_mut(queue)?, queue, memory, count, asked)?;
+        let want = (count as usize).min(MAX_BUFFERS - first);
+        // `index` + `count` are what the guest indexes the new buffers by, so `count` must be
+        // what was really created -- vb2 answers a short `CREATE_BUFS` the same way, failing
+        // only when it could make none (D73).
+        let mut count = want;
+        if want > 0 {
+            count = self.add_buffers(
+                session.queue_mut(queue)?,
+                queue,
+                memory,
+                want,
+                1,
+                asked,
+                "CREATE_BUFS",
+            )?;
             session.queue_mut(queue)?.memory = Some(memory);
             self.active_session = Some(session.id);
         }

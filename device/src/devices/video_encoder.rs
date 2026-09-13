@@ -30,7 +30,12 @@
 //! starts `OUTPUT` first, GStreamer `CAPTURE` first) from the formats, frame rate and control
 //! values current at that moment. Drain is `V4L2_ENC_CMD_STOP` (a `LAST` buffer, then
 //! `V4L2_EVENT_EOS`); `STREAMOFF(OUTPUT)` pauses the encoder and keeps it, `STREAMOFF(CAPTURE)`
-//! resets it so the next stream starts afresh, headers included.
+//! resets it so the next stream starts afresh, headers included. A `STREAMOFF(OUTPUT)` that
+//! arrives with frames the guest was already told `InputBufferDone` for first finishes those
+//! frames through the codec and delivers the coded frames to the `CAPTURE` buffers still lent,
+//! bounded ([`VideoEncoderBackendSession::drain_for_streamoff`]): an encoder has no seek from
+//! which a dropped picture could be re-derived, and `vidioc-streamoff.rst` permits the driver to
+//! complete buffers it had begun, so the accepted work is finished rather than discarded (D78).
 //!
 //! Buffers are guest-owned (`USERPTR`) or host-owned (`MMAP`, from the device's
 //! [`VirtioMediaBufferAllocator`] -- the `media_host` pool on DroidVM): a raw `OUTPUT` frame is
@@ -517,6 +522,25 @@ pub trait VideoEncoderBackendSession {
     /// (`request-sync` on MediaCodec).
     fn force_keyframe(&mut self) -> IoctlResult<()>;
 
+    /// `STREAMOFF(OUTPUT)` arriving with frames the guest was already told
+    /// [`EncoderEvent::InputBufferDone`] for: encode those staged frames through the codec and
+    /// write the coded frames into the `CAPTURE` buffers still lent, then return. Bounded by the
+    /// backend (`ENCODER_STREAMOFF_DRAIN`); coded frames it cannot place -- `CAPTURE` not
+    /// streaming, or the bound passed -- are dropped and the count logged. The device calls this
+    /// **before** [`Self::flush`] on an `OUTPUT` stream-off, and processes the
+    /// [`EncoderEvent::FrameEncoded`] events it produces so the guest can dequeue them before its
+    /// `CAPTURE` queue is torn down.
+    ///
+    /// This is the encoder's answer to a client (ffmpeg's `h264_v4l2m2m` at EOF) that issues
+    /// `V4L2_ENC_CMD_STOP` and then tears the stream down without waiting for the whole drain:
+    /// unlike a decoder, an encoder has no seek from which a dropped picture could be re-derived,
+    /// and the guest cannot be told a frame it was already acked went unencoded, so the driver
+    /// finishes the accepted work into the `CAPTURE` queue rather than discarding it. V4L2 allows
+    /// this: `VIDIOC_STREAMOFF` requires only that buffers be removed from the queue, and permits
+    /// the driver to complete buffers it had already begun (`vidioc-streamoff.rst`). A backend
+    /// that stages nothing loses nothing here, so the default is to do nothing.
+    fn drain_for_streamoff(&mut self) {}
+
     /// `STREAMOFF(OUTPUT)`, and `V4L2_ENC_CMD_START` after a finished drain: drop every pending
     /// `OUTPUT` frame and be ready to take new ones. When this returns the backend touches no
     /// `OUTPUT` buffer any more and reports nothing more about the ones it held -- the device
@@ -524,6 +548,7 @@ pub trait VideoEncoderBackendSession {
     /// [`EncoderEvent::InputBufferDone`] would land on a buffer the guest may have queued again
     /// (review-m7 R7-2, R7-11) -- and the codec is kept. On an async codec this is
     /// flush-then-start. An error here ends the session (the device never fails `STREAMOFF`).
+    /// On an `OUTPUT` stream-off [`Self::drain_for_streamoff`] runs first.
     fn flush(&mut self) -> IoctlResult<()>;
 
     /// `V4L2_ENC_CMD_STOP`: encode everything queued so far, then report the last `CAPTURE`
@@ -2814,7 +2839,22 @@ where
         let direction = queue.direction_or_einval()?;
         match direction {
             QueueDirection::Output => {
-                // The backend must let go of every raw frame before we release them (§2.5).
+                // The backend must let go of every raw frame before we release them (§2.5). But
+                // a frame the guest queued was acked (`InputBufferDone`) as soon as the backend
+                // staged it, so it cannot now be told the frame went unencoded: first finish the
+                // staged frames through the codec and deliver the coded frames to the `CAPTURE`
+                // buffers still lent (bounded), then let go. `drain_for_streamoff` produces
+                // `FrameEncoded` events; deliver them to the guest before the `CAPTURE` queue is
+                // torn down. A backend that stages nothing does nothing here.
+                if session.codec_started && !session.dead {
+                    session.backend.drain_for_streamoff();
+                    for event in session.backend.take_events() {
+                        if session.dead {
+                            break;
+                        }
+                        self.handle_event(session, event);
+                    }
+                }
                 if session.codec_started && !session.dead {
                     if let Err(e) = session.backend.flush() {
                         self.end_session(

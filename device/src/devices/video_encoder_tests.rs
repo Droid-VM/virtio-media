@@ -295,6 +295,9 @@ struct FakeLog {
     /// Raw frames a `flush` dropped without a word: the ones the codec had not written out, and
     /// the ones parked behind a drain's `EOS` (the MediaCodec backend's rule, review-m7 R7-11).
     dropped_by_flush: usize,
+    /// Coded frames a `STREAMOFF(OUTPUT)` drain could not place into a lent `CAPTURE` buffer, so
+    /// dropped -- the count the backend logs (D78).
+    dropped_by_streamoff: usize,
     /// The next `flush` / `drain` fails with this errno (once): the wedged-codec case the
     /// device's bounds exist for.
     fail_flush: Option<i32>,
@@ -308,6 +311,11 @@ struct FakeBackend {
     log: SharedLog,
     /// `start` fails with this errno.
     fail_start: Option<i32>,
+    /// How many just-encoded frames the fake codec keeps "in flight" (produced but not yet
+    /// available as coded output) -- a pipeline depth, so a `STREAMOFF(OUTPUT)` can arrive with
+    /// frames the codec has not emitted, the shape D78 is about. `0` is the historic behaviour
+    /// (every frame is available the moment it is queued), which every pre-D78 test relies on.
+    pipeline: usize,
 }
 
 enum Cmd {
@@ -326,6 +334,9 @@ enum Cmd {
     ForceKey,
     Flush(mpsc::Sender<()>),
     Drain,
+    /// `STREAMOFF(OUTPUT)`: emit every frame still in flight into the lent CAPTURE buffers,
+    /// without a `LAST` (the guest issued no drain), and count what does not fit.
+    DrainForStreamoff(mpsc::Sender<()>),
     Stop(mpsc::Sender<()>),
 }
 
@@ -333,6 +344,7 @@ struct FakeSession {
     sink: EncoderSink,
     log: SharedLog,
     fail_start: Option<i32>,
+    pipeline: usize,
     /// The codec thread's command channel, while a codec exists.
     commands: Option<mpsc::Sender<Cmd>>,
     events_tx: mpsc::Sender<EncoderEvent>,
@@ -355,6 +367,7 @@ fn run_codec(
     events_tx: mpsc::Sender<EncoderEvent>,
     sink: EncoderSink,
     thread_log: SharedLog,
+    pipeline: usize,
 ) {
     let emit = |e: EncoderEvent| {
         let _ = events_tx.send(e);
@@ -365,6 +378,10 @@ fn run_codec(
     let mut force_key = false;
     let mut headers_due = false;
     let mut ready: VecDeque<Packet> = VecDeque::new();
+    // Frames the codec has taken but not yet made available as coded output: a pipeline of depth
+    // `pipeline`. The newest `pipeline` frames sit here; older ones spill into `ready`. A drain
+    // (or STREAMOFF drain) flushes them all out.
+    let mut inflight: VecDeque<Packet> = VecDeque::new();
     let mut captures: VecDeque<(u32, SendPtr, usize)> = VecDeque::new();
     let mut draining = false;
     // From the drain's `EOS` on, a codec takes no input until it is flushed (the async rule):
@@ -435,6 +452,7 @@ fn run_codec(
                 draining = false;
                 stopped = false;
                 parked.clear();
+                inflight.clear();
             }
             Cmd::Encode {
                 index,
@@ -486,12 +504,27 @@ fn run_codec(
                 }
                 bytes.extend(frame_bytes(key, frame_no, digest));
                 frame_no = frame_no.wrapping_add(1);
-                ready.push_back(Packet {
+                // With a pipeline the fake stages like the real backend (D48): the guest's OUTPUT
+                // buffer is returned the moment the frame is copied, so a fast feeder is not
+                // throttled by the codec's slots and can queue past its own buffer count. Without
+                // one the buffer is returned when the coded frame is written (the historic
+                // behaviour every pre-D78 test relies on).
+                let input = if pipeline > 0 {
+                    emit(EncoderEvent::InputBufferDone(index));
+                    None
+                } else {
+                    Some(index)
+                };
+                // Hold the newest `pipeline` frames in flight; the rest become coded output.
+                inflight.push_back(Packet {
                     bytes,
                     kind,
                     timestamp,
-                    input: Some(index),
+                    input,
                 });
+                while inflight.len() > pipeline {
+                    ready.push_back(inflight.pop_front().unwrap());
+                }
                 pump(&mut ready, &mut captures, &mut draining, &mut stopped);
             }
             Cmd::UseCapture { index, ptr, len } => {
@@ -505,17 +538,36 @@ fn run_codec(
                 // (the trait's `flush` contract), and the MediaCodec backend does exactly this,
                 // because a report delivered after the device has unqueued a buffer could land
                 // on one the guest has queued again (review-m7 R7-11).
-                let dropped = ready.iter().filter(|p| p.input.is_some()).count() + parked.len();
+                let dropped = ready.iter().filter(|p| p.kind != FrameKind::Headers).count()
+                    + inflight.len()
+                    + parked.len();
                 thread_log.lock().unwrap().dropped_by_flush += dropped;
                 ready.clear();
+                inflight.clear();
                 parked.clear();
                 draining = false;
                 stopped = false;
                 let _ = ack.send(());
             }
             Cmd::Drain => {
+                // Everything the codec holds is drained out; the last packet carries LAST.
+                while let Some(p) = inflight.pop_front() {
+                    ready.push_back(p);
+                }
                 draining = true;
                 pump(&mut ready, &mut captures, &mut draining, &mut stopped);
+            }
+            Cmd::DrainForStreamoff(ack) => {
+                // The frames still in flight are emitted into the CAPTURE buffers still lent,
+                // without a LAST (no drain was asked for); what finds no buffer is counted
+                // dropped, and left for the following `flush` to clear.
+                while let Some(p) = inflight.pop_front() {
+                    ready.push_back(p);
+                }
+                pump(&mut ready, &mut captures, &mut draining, &mut stopped);
+                let dropped = ready.iter().filter(|p| p.kind != FrameKind::Headers).count();
+                thread_log.lock().unwrap().dropped_by_streamoff += dropped;
+                let _ = ack.send(());
             }
             Cmd::Stop(ack) => {
                 let _ = ack.send(());
@@ -539,6 +591,7 @@ impl VideoEncoderBackend for FakeBackend {
             sink,
             log: Arc::clone(&self.log),
             fail_start: self.fail_start,
+            pipeline: self.pipeline,
             commands: None,
             events_tx,
             events,
@@ -581,7 +634,9 @@ impl VideoEncoderBackendSession for FakeSession {
                 self.sink.clone(),
                 Arc::clone(&self.log),
             );
-            self.thread = Some(thread::spawn(move || run_codec(rx, events_tx, sink, log)));
+            let pipeline = self.pipeline;
+            self.thread =
+                Some(thread::spawn(move || run_codec(rx, events_tx, sink, log, pipeline)));
             self.commands = Some(commands);
             self.log.lock().unwrap().open = true;
         }
@@ -633,6 +688,10 @@ impl VideoEncoderBackendSession for FakeSession {
             return Err(errno);
         }
         self.send(Cmd::Drain)
+    }
+
+    fn drain_for_streamoff(&mut self) {
+        self.rendezvous(Cmd::DrainForStreamoff);
     }
 
     fn stop(&mut self) {
@@ -740,6 +799,16 @@ fn caps() -> EncoderCapabilities {
 }
 
 fn rig_with(fail_start: Option<i32>) -> Rig {
+    rig_full(fail_start, 0)
+}
+
+/// A rig whose fake codec keeps `pipeline` frames in flight, so a `STREAMOFF(OUTPUT)` can land
+/// with un-emitted frames (D78's shape).
+fn rig_with_pipeline(pipeline: usize) -> Rig {
+    rig_full(None, pipeline)
+}
+
+fn rig_full(fail_start: Option<i32>, pipeline: usize) -> Rig {
     let events = EventLog::default();
     let events_log = Rc::clone(&events.0);
     let guest = FakeGuest {
@@ -751,6 +820,7 @@ fn rig_with(fail_start: Option<i32>) -> Rig {
         caps: caps(),
         log: Arc::clone(&log),
         fail_start,
+        pipeline,
     };
     let pool = PoolBudget::unlimited();
     let device = VideoEncoder::new(
@@ -3873,5 +3943,215 @@ fn create_bufs_grants_what_the_pool_can_hold() {
         .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 0)
         .unwrap();
     assert_eq!(r.pool.used(), 0);
+    close(&mut r.device, s);
+}
+
+// ---------------------------------------------------------------------------------------------
+// D78: STREAMOFF(OUTPUT) finishes the frames the guest was already acked
+// ---------------------------------------------------------------------------------------------
+
+/// Stream both queues with `out_bufs` OUTPUT and `cap_bufs` CAPTURE buffers, every CAPTURE
+/// buffer queued. Like `start_streaming` but with the buffer counts the D78 tests choose.
+fn stream_bufs(r: &mut Rig, s: &mut Session, out_bufs: u32, cap_bufs: u32) -> u32 {
+    r.device.s_fmt(s, CAPTURE, capture_format(H264, 0)).unwrap();
+    r.device
+        .s_fmt(s, OUTPUT, output_format(NV12, SIZE.0, SIZE.1))
+        .unwrap();
+    r.device
+        .subscribe_event(s, EventType::Eos, SubscribeEventFlags::empty())
+        .unwrap();
+    r.device.reqbufs(s, OUTPUT, MemoryType::Mmap, out_bufs).unwrap();
+    let sizeimage = pix(&r.device.g_fmt(s, CAPTURE).unwrap()).sizeimage;
+    r.device
+        .reqbufs(s, CAPTURE, MemoryType::Mmap, cap_bufs)
+        .unwrap();
+    for i in 0..cap_bufs {
+        r.device
+            .qbuf(
+                s,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
+    }
+    r.device.streamon(s, OUTPUT).unwrap();
+    r.device.streamon(s, CAPTURE).unwrap();
+    assert_eq!(r.log.lock().unwrap().started.len(), 1);
+    sizeimage
+}
+
+/// D78, the headline: ffmpeg's `h264_v4l2m2m` at EOF issues `V4L2_ENC_CMD_STOP` and then, without
+/// waiting for the whole drain, tears the stream down (`ff_v4l2_m2m_codec_end`: `STREAMOFF
+/// (OUTPUT)`, `STREAMOFF(CAPTURE)`, close). A `STREAMOFF(OUTPUT)` used to drop every frame the
+/// codec had accepted but not yet emitted -- 300 in, 274 out on the phone -- because the guest
+/// was already told `InputBufferDone` for them, so it cannot be told they went unencoded. The
+/// device now finishes those staged frames through the codec and delivers the coded frames to the
+/// `CAPTURE` buffers still lent, before it lets go, and none carries `LAST` (the guest asked for
+/// no drain). Here the fake keeps all six frames in flight until the `STREAMOFF` drains them.
+#[test]
+fn streamoff_output_drains_staged_frames_into_capture() {
+    let mut r = rig_with_pipeline(6);
+    let mut s = session(&mut r.device);
+    let _ = stream_bufs(&mut r, &mut s, 8, 8);
+    for i in 0..6u32 {
+        queue_frame(&mut r, &mut s, i, 0x40 + i as u8, i as i64);
+    }
+    process(&mut r.device, &mut s);
+    assert_eq!(
+        dequeued_on(&r.events.borrow(), CAPTURE).len(),
+        0,
+        "all six frames are still in the codec, none coded yet"
+    );
+
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+
+    let coded = dequeued_on(&r.events.borrow(), CAPTURE);
+    assert_eq!(
+        coded.len(),
+        6,
+        "the STREAMOFF drain delivered every accepted frame"
+    );
+    assert_eq!(r.log.lock().unwrap().dropped_by_streamoff, 0);
+    assert!(
+        coded.iter().all(|b| !b.flags().contains(BufferFlags::LAST)),
+        "no LAST: the guest issued no drain, only a STREAMOFF"
+    );
+    for (n, b) in coded.iter().enumerate() {
+        assert_eq!(b.timestamp().tv_sec, n as i64, "frame {n} in order");
+    }
+    close(&mut r.device, s);
+}
+
+/// D78, the other half: a real `V4L2_ENC_CMD_STOP` drain is unchanged -- every frame in flight
+/// comes out, the last carrying `V4L2_BUF_FLAG_LAST`, then `V4L2_EVENT_EOS` -- even when the fake
+/// codec holds a pipeline of frames (the shape that made the STREAMOFF path lose them).
+#[test]
+fn enc_cmd_stop_still_drains_with_last_and_eos_under_a_pipeline() {
+    let mut r = rig_with_pipeline(4);
+    let mut s = session(&mut r.device);
+    let _ = stream_bufs(&mut r, &mut s, 8, 8);
+    for i in 0..5u32 {
+        queue_frame(&mut r, &mut s, i, 0x50 + i as u8, i as i64);
+    }
+    r.device
+        .encoder_cmd(&mut s, enc_cmd(bindings::V4L2_ENC_CMD_STOP))
+        .unwrap();
+    collect_capture(&mut r, &mut s, 5);
+    let coded = dequeued_on(&r.events.borrow(), CAPTURE);
+    assert_eq!(coded.len(), 5, "the whole pipeline drained out");
+    assert!(
+        coded.last().unwrap().flags().contains(BufferFlags::LAST),
+        "the last coded frame carries LAST"
+    );
+    assert_eq!(eos_events(&r.events.borrow()), 1, "one EOS");
+    assert_eq!(r.log.lock().unwrap().dropped_by_streamoff, 0);
+    close(&mut r.device, s);
+}
+
+/// D78: a feeder that queues frames faster than the codec encodes them loses none. Staging
+/// returns each OUTPUT frame the moment it is copied, so the guest recycles its buffers and feeds
+/// 300 frames past the codec, which keeps every one in flight; the `V4L2_ENC_CMD_STOP` drain then
+/// delivers all 300, recycling the CAPTURE buffers as they fill. On the phone this is the 720p
+/// `testsrc2` encode that was 300 in / 274 out.
+#[test]
+fn a_fast_feeder_past_the_codec_loses_no_frame() {
+    const N: u32 = 300;
+    let mut r = rig_with_pipeline(N as usize);
+    let mut s = session(&mut r.device);
+    let sizeimage = stream_bufs(&mut r, &mut s, 16, 16);
+
+    // Feed N frames into 16 OUTPUT buffers: staging returns each at once, so a free buffer is
+    // always along shortly.
+    let mut fed = 0u32;
+    while fed < N {
+        match (0..s.input.buffers.len()).find(|&b| !s.input.buffers[b].queued) {
+            Some(idx) => {
+                queue_frame(&mut r, &mut s, idx as u32, 0x40, fed as i64);
+                fed += 1;
+            }
+            None => {
+                assert!(wait_ready(&s), "no OUTPUT buffer freed within 2s");
+                process(&mut r.device, &mut s);
+            }
+        }
+    }
+
+    // Drain, recycling CAPTURE buffers until the LAST buffer appears.
+    r.device
+        .encoder_cmd(&mut s, enc_cmd(bindings::V4L2_ENC_CMD_STOP))
+        .unwrap();
+    let mut requeued = 0usize;
+    loop {
+        let (seen, last): (Vec<(u32, bool)>, bool) = {
+            let evs = r.events.borrow();
+            let caps = dequeued_on(&evs, CAPTURE);
+            let last = caps.iter().any(|b| b.flags().contains(BufferFlags::LAST));
+            (
+                caps.iter()
+                    .map(|b| (b.index(), b.flags().contains(BufferFlags::LAST)))
+                    .collect(),
+                last,
+            )
+        };
+        // Requeue every CAPTURE buffer we have dequeued and not yet handed back, unless it is the
+        // LAST one (the stream is over).
+        while requeued < seen.len() {
+            let (idx, is_last) = seen[requeued];
+            requeued += 1;
+            if !is_last {
+                r.device
+                    .qbuf(
+                        &mut s,
+                        mmap_buffer(CAPTURE, idx, sizeimage),
+                        vec![],
+                        PayloadValidity::ALL,
+                    )
+                    .unwrap();
+            }
+        }
+        if last {
+            break;
+        }
+        assert!(wait_ready(&s), "the drain stalled before the LAST buffer");
+        process(&mut r.device, &mut s);
+    }
+
+    let coded = dequeued_on(&r.events.borrow(), CAPTURE);
+    assert_eq!(coded.len(), N as usize, "all 300 frames were coded, none lost");
+    assert!(coded.last().unwrap().flags().contains(BufferFlags::LAST));
+    assert_eq!(eos_events(&r.events.borrow()), 1);
+    assert_eq!(r.log.lock().unwrap().dropped_by_streamoff, 0);
+    close(&mut r.device, s);
+}
+
+/// D78: when a `STREAMOFF(OUTPUT)` drain finds no `CAPTURE` buffer to place a coded frame into --
+/// the queue is exhausted (the same as CAPTURE never streaming: there is nowhere to deliver) --
+/// the frames are dropped and their count is logged rather than lost silently. Here two CAPTURE
+/// buffers take the first two coded frames and four more sit in the codec with no buffer left.
+#[test]
+fn streamoff_output_drain_with_no_capture_buffer_drops_and_counts() {
+    let mut r = rig_with_pipeline(4);
+    let mut s = session(&mut r.device);
+    let _ = stream_bufs(&mut r, &mut s, 8, 2);
+    for i in 0..6u32 {
+        queue_frame(&mut r, &mut s, i, 0x60 + i as u8, i as i64);
+    }
+    // The two CAPTURE buffers take frames 0 and 1; frames 2..6 stay in flight with none left.
+    collect_capture(&mut r, &mut s, 2);
+    assert_eq!(dequeued_on(&r.events.borrow(), CAPTURE).len(), 2);
+
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+
+    assert_eq!(
+        r.log.lock().unwrap().dropped_by_streamoff,
+        4,
+        "the four frames with no CAPTURE buffer are dropped, and counted"
+    );
+    assert_eq!(
+        dequeued_on(&r.events.borrow(), CAPTURE).len(),
+        2,
+        "the two that fit came out; no more"
+    );
     close(&mut r.device, s);
 }

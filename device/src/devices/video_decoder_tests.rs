@@ -4056,9 +4056,8 @@ fn create_bufs_grants_what_the_pool_can_hold() {
     r.device
         .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2)
         .unwrap();
-    let mut fmt = r.device.g_fmt(&s, OUTPUT).unwrap();
-    // SAFETY: the OUTPUT queue is multi-planar.
-    unsafe { fmt.fmt.pix_mp.num_planes = 1 };
+    // `g_fmt` already answers the one-plane OUTPUT format `create_bufs` requires.
+    let fmt = r.device.g_fmt(&s, OUTPUT).unwrap();
     let reply = r
         .device
         .create_bufs(&mut s, 8, OUTPUT, MemoryType::Mmap, fmt)

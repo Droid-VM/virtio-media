@@ -448,6 +448,18 @@ pub trait VideoDecoderBackend {
 
     /// Close and destroy `session`, joining its thread.
     fn close_session(&mut self, session: Self::Session);
+
+    /// The `CAPTURE` minimum an earlier session learned for `fourcc`, if any: the codec's
+    /// output-slot count, which a stateful decoder reports only at the `SOURCE_CHANGE`. A client
+    /// like ffmpeg sizes its `CAPTURE` pool with a fixed `REQBUFS(CAPTURE)` *before* the announce
+    /// and never re-asks, so it runs one buffer below the codec's need every session and the
+    /// device must hold decoded outputs at the announce (D77, B15 §2.6/§3). When a backend
+    /// remembers what it announced, the device raises a later session's pre-announce
+    /// `REQBUFS(CAPTURE)` to this floor so the shortfall never opens. The default knows nothing;
+    /// the device then keeps the bare floor of 1 until the codec announces.
+    fn min_capture_buffers(&self, _fourcc: PixelFormat) -> Option<u32> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -693,6 +705,12 @@ pub struct VideoDecoderSession<GM, S> {
     format_change_pending: bool,
     /// One `warn!` per session about a `CAPTURE` buffer too small for the announced canvas.
     warned_small_capture: bool,
+    /// One `warn!` per session when the announce raises the CAPTURE minimum above the buffer count
+    /// the client already streams with (D77): ffmpeg brings CAPTURE up before the SOURCE_CHANGE
+    /// with a fixed count and never re-asks, so it can end up one buffer short of what the codec
+    /// then announces. The session is not failed -- the backend holds the outputs until buffers
+    /// are queued -- but the shortfall is made visible so a short decode is not silent.
+    warned_capture_below_announced_min: bool,
     /// A mid-stream `SOURCE_CHANGE` stopped the decoder while `CAPTURE` streamed and no `LAST`
     /// buffer has gone out for it yet: the client is owed one (a GStreamer client waits for
     /// exactly that buffer before it renegotiates, review-m6 R6-2). The backend supplies it from
@@ -1263,6 +1281,27 @@ where
                     !(session.state.capture_streaming && session.coded_size == coded_size);
                 session.coded_size = coded_size;
                 session.crop = CropRectangle::FromStream(visible_rect);
+                // The announce may raise the CAPTURE minimum above the count the client is already
+                // streaming with -- ffmpeg brings CAPTURE up before the SOURCE_CHANGE with its
+                // fixed REQBUFS and, unless the D77 learned floor met the codec's need, answers the
+                // change with DEC_CMD_START rather than re-REQBUFS. The session is NOT failed: the
+                // backend holds the decoded outputs until buffers are queued (a client that keeps
+                // its queue supplied still runs). But the shortfall is made visible once, so a
+                // short decode is not silent (D77).
+                if session.state.capture_streaming
+                    && (session.output.buffers.len() as u32) < min_capture_buffers
+                    && !session.warned_capture_below_announced_min
+                {
+                    session.warned_capture_below_announced_min = true;
+                    log::warn!(
+                        "decoder: session {}: the codec announced min {} CAPTURE buffers but the \
+                         client already streams with {}; outputs are held until more are queued, \
+                         and a client that never queues more will get a short decode",
+                        session.id,
+                        min_capture_buffers,
+                        session.output.buffers.len(),
+                    );
+                }
                 session.min_capture_buffers = min_capture_buffers;
                 if session.src_change_subscribed {
                     self.evt_queue
@@ -1322,6 +1361,12 @@ where
             first.height.clamp(DEFAULT_CODED_SIZE.1),
         );
         let fourcc = first.fourcc;
+        // The CAPTURE floor a previous session learned for this coded format, if any: a client
+        // that sizes its CAPTURE pool before the SOURCE_CHANGE (ffmpeg's fixed REQBUFS) is then
+        // raised to the codec's real output-slot count from the start, instead of running one
+        // buffer short until an announce it never re-asks after (D77). Bare 1 until the codec
+        // announces, when it is set for real, when nothing was learned yet.
+        let min_capture_buffers = self.backend.min_capture_buffers(fourcc).unwrap_or(1).max(1);
         let signal = Arc::new(DecoderSignal::new()?);
         let backend = self
             .backend
@@ -1342,13 +1387,14 @@ where
             coded_size,
             output_sizeimage: MIN_BITSTREAM_SIZE,
             crop: CropRectangle::Settable(v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1)),
-            min_capture_buffers: 1,
+            min_capture_buffers,
             colorspace: Default::default(),
             src_change_subscribed: false,
             eos_subscribed: false,
             format_announced: false,
             format_change_pending: false,
             warned_small_capture: false,
+            warned_capture_below_announced_min: false,
             last_owed: false,
             dead: false,
             sequence: 0,
@@ -1583,6 +1629,15 @@ where
                 // SAFETY: multi-planar.
                 let pix_mp = unsafe { adjusted.fmt.pix_mp };
                 session.coded_format = PixelFormat::from_u32(pix_mp.pixelformat);
+                // The client picked the coded format; re-seed the pre-announce CAPTURE floor from
+                // what an earlier session learned for it (D77). This is always before the codec
+                // starts (a running codec makes S_FMT(OUTPUT) EBUSY above), so the announce has
+                // not set the minimum for real yet.
+                session.min_capture_buffers = self
+                    .backend
+                    .min_capture_buffers(session.coded_format)
+                    .unwrap_or(1)
+                    .max(1);
                 session.coded_size = (pix_mp.width, pix_mp.height);
                 session.output_sizeimage = pix_mp.plane_fmt[0].sizeimage;
                 session.colorspace = V4l2FormatColorspace::from_pix_mp(&pix_mp);

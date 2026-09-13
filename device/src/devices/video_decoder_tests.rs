@@ -262,6 +262,10 @@ struct FakeBackend {
     /// kept before it is returned anyway, modelling `android.rs`'s `ANNOUNCE_GRACE`. A test that
     /// exercises the grace injects a short one so it need not wait the production 250 ms.
     grace: Duration,
+    /// The `CAPTURE` minimum an earlier session "learned" for the coded format, standing in for
+    /// the MediaCodec backend's cross-session record (D77). `Some(n)` means the device should
+    /// raise a pre-announce `REQBUFS(CAPTURE)` to `n`.
+    learned_min: Option<u32>,
 }
 
 enum Cmd {
@@ -687,6 +691,10 @@ impl VideoDecoderBackend for FakeBackend {
     fn close_session(&mut self, mut session: FakeSession) {
         session.stop();
     }
+
+    fn min_capture_buffers(&self, _fourcc: v4l2r::PixelFormat) -> Option<u32> {
+        self.learned_min
+    }
 }
 
 impl Drop for FakeSession {
@@ -894,7 +902,22 @@ fn rig_announcing_min(announce_min: u32) -> Rig {
     rig_full(None, FAKE_GRACE, announce_min)
 }
 
+/// A rig whose fake backend reports a CAPTURE minimum `learned_min` learned by an earlier session
+/// (D77): the device raises this session's pre-announce `REQBUFS(CAPTURE)` to it.
+fn rig_with_learned_min(learned_min: u32) -> Rig {
+    rig_full_learned(None, FAKE_GRACE, 4, Some(learned_min))
+}
+
 fn rig_full(fail_start: Option<i32>, grace: Duration, announce_min: u32) -> Rig {
+    rig_full_learned(fail_start, grace, announce_min, None)
+}
+
+fn rig_full_learned(
+    fail_start: Option<i32>,
+    grace: Duration,
+    announce_min: u32,
+    learned_min: Option<u32>,
+) -> Rig {
     let events = EventLog::default();
     let events_log = Rc::clone(&events.0);
     let log: SharedLog = Default::default();
@@ -909,6 +932,7 @@ fn rig_full(fail_start: Option<i32>, grace: Duration, announce_min: u32) -> Rig 
         announce_min,
         fail_start,
         grace,
+        learned_min,
     };
     let pool = PoolBudget::unlimited();
     let device = VideoDecoder::new(
@@ -1999,6 +2023,181 @@ fn reqbufs_capture_is_raised_to_the_announced_minimum() {
     assert_eq!(reply.count, 2, "OUTPUT REQBUFS is granted as asked");
 
     let _ = sizeimage;
+    close(&mut r.device, s);
+}
+
+// ---------------------------------------------------------------------------------------------
+// F19: D64 (the head-GOP loss is a codec-internal drop, not the device or DEC_CMD_START) and D77
+// (the learned CAPTURE floor). See logs/vpu_wp/F19-decoder.md.
+// ---------------------------------------------------------------------------------------------
+
+/// D64, the orchestrator's first hypothesis, falsified in code: `V4L2_DEC_CMD_START` answering the
+/// *initial* `SOURCE_CHANGE` (ffmpeg's response -- it never re-`REQBUFS`) must not flush, restart
+/// or discard anything. B15 §2 proved the head-GOP loss is a codec-internal input drop under the
+/// output-slot stall, not the device dropping frames (`300 in, 270 out, 0 held output(s) dropped`).
+/// This replays ffmpeg's shape -- feed OUTPUT so the codec announces and produces frames while no
+/// `CAPTURE` buffer is lent yet, answer with `DEC_CMD_START`, then provide `CAPTURE` -- and asserts
+/// **every produced frame reaches the client, in order**, and that the backend's `resume` /
+/// `flush` / `clear` were never called by the initial `DEC_CMD_START` (`drain == None`, so it is a
+/// no-op in the device: the frames wait in the backend and flow when buffers arrive).
+#[test]
+fn dec_cmd_start_on_the_initial_source_change_loses_no_produced_frame() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 8).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+
+    // Feed six OUTPUT buffers with distinct timestamps. The fake announces on the first and
+    // produces one frame per buffer; with no CAPTURE buffer lent yet the frames wait in the
+    // backend -- exactly the pre-QBUF window in which the head GOP is at risk on the phone.
+    for i in 0..6u32 {
+        poke_mmap_output(&mut s, i as usize, (0x01 + i) as u8);
+        let mut ob = mmap_buffer(OUTPUT, i, 1 << 20);
+        ob.set_timestamp(ts(i as i64));
+        r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    }
+    while source_changes(&r.events.borrow()) == 0 {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+
+    // ffmpeg's answer to the change: DEC_CMD_START, with no re-REQBUFS. On the initial announce
+    // the drain is None, so this is a device no-op -- it must not touch the held frames.
+    r.device.decoder_cmd(&mut s, dec_cmd(bindings::V4L2_DEC_CMD_START)).unwrap();
+    assert_eq!(
+        r.log.lock().unwrap().resumes,
+        0,
+        "the initial DEC_CMD_START does not resume the backend (drain was None): it is a no-op"
+    );
+    assert_eq!(r.log.lock().unwrap().flushes, 0, "DEC_CMD_START does not flush/seek");
+    assert_eq!(r.log.lock().unwrap().clears, 0, "DEC_CMD_START does not clear CAPTURE");
+
+    // Now provide CAPTURE buffers (the QBUF ffmpeg issues after the change). Every one of the six
+    // frames the codec produced comes out, in timestamp order -- nothing was lost to the announce
+    // or to DEC_CMD_START.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 8).unwrap();
+    for i in 0..8 {
+        r.device
+            .qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], PayloadValidity::ALL)
+            .unwrap();
+    }
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+    collect_capture(&mut r, &mut s, 6);
+
+    let stamps: Vec<i64> = dequeued_on(&r.events.borrow(), CAPTURE)
+        .iter()
+        .map(|b| b.timestamp().tv_sec as i64)
+        .collect();
+    assert_eq!(
+        stamps,
+        vec![0, 1, 2, 3, 4, 5],
+        "every produced frame reaches the client in order across DEC_CMD_START (D64: the device \
+         loses none; the phone's head-GOP loss is the codec dropping input under the slot stall)"
+    );
+    assert_eq!(errors(&r.events.borrow()), 0, "the session did not fail");
+
+    close(&mut r.device, s);
+}
+
+/// D77: a client that sizes its CAPTURE pool with a fixed `REQBUFS(CAPTURE)` *before* the
+/// `SOURCE_CHANGE` (ffmpeg's 20, which it never re-asks) gets it raised to the codec's output-slot
+/// count when an earlier session has learned it -- the backend remembers the last announced
+/// minimum per coded format, and the device seeds the session's floor from it. Without the learned
+/// floor the pre-announce count is granted verbatim (the D72 raise cannot fire: the session minimum
+/// is still the bare 1). This is the whole of D77 (B15 §3): the floor now applies at REQBUFS time,
+/// not only after an announce the client never re-`REQBUFS` after.
+#[test]
+fn a_learned_minimum_raises_a_pre_announce_capture_reqbufs() {
+    // The backend learned 21 for this coded format in an earlier session.
+    let mut r = rig_with_learned_min(21);
+    let mut s = session(&mut r.device);
+
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 8).unwrap();
+
+    // G_CTRL(MIN_BUFFERS_FOR_CAPTURE) already reports the learned floor, before any announce: a
+    // client that reads it (GStreamer) sizes its pool correctly from the start.
+    assert_eq!(
+        s.min_capture_buffers, 21,
+        "the session's CAPTURE floor is seeded from the learned minimum before the announce (D77)"
+    );
+
+    // The pre-announce REQBUFS(CAPTURE, 20) -- ffmpeg's fixed count -- is raised to 21.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    let reply = r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 20).unwrap();
+    assert_eq!(
+        reply.count, 21,
+        "a pre-announce REQBUFS(CAPTURE, 20) is raised to the learned floor 21 (D77); \
+         without it the count would be granted verbatim as 20"
+    );
+    let _ = sizeimage;
+
+    close(&mut r.device, s);
+}
+
+/// D77, the other half: when the announce raises the CAPTURE minimum above the count the client is
+/// already streaming with -- ffmpeg brought CAPTURE up before the change and answered with
+/// `DEC_CMD_START`, and no learned floor had met the codec's need -- the session must **not** be
+/// failed. The backend holds the decoded outputs until more buffers are queued; the shortfall is
+/// logged once (`warned_capture_below_announced_min`), and a client that keeps its queue supplied
+/// still decodes. Here CAPTURE streams with four buffers (each large enough for the announced
+/// size), the codec announces min 21, and frames still flow.
+#[test]
+fn an_announce_above_the_streaming_capture_count_holds_rather_than_fails() {
+    let mut r = rig_announcing_min(21);
+    let mut s = session(&mut r.device);
+
+    r.device.s_fmt(&mut s, OUTPUT, output_format(H264, 320, 240)).unwrap();
+    r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 8).unwrap();
+    r.device
+        .subscribe_event(&mut s, EventType::SourceChange(0), SubscribeEventFlags::empty())
+        .unwrap();
+
+    // CAPTURE up with four buffers, streaming, before the SOURCE_CHANGE -- fewer than the 21 the
+    // codec will announce. The buffers are the announced size (FAKE_STREAM_SIZE), so they can hold
+    // frames; the shortfall is in the count, not the size.
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
+    for i in 0..4 {
+        r.device
+            .qbuf(&mut s, mmap_buffer(CAPTURE, i, sizeimage), vec![], PayloadValidity::ALL)
+            .unwrap();
+    }
+    r.device.streamon(&mut s, CAPTURE).unwrap();
+
+    // Feed OUTPUT so the codec announces min 21 while CAPTURE already streams with four.
+    poke_mmap_output(&mut s, 0, 0x01);
+    let mut ob = mmap_buffer(OUTPUT, 0, 1 << 20);
+    ob.set_timestamp(ts(0));
+    r.device.qbuf(&mut s, ob, vec![], PayloadValidity::ALL).unwrap();
+    r.device.streamon(&mut s, OUTPUT).unwrap();
+    while source_changes(&r.events.borrow()) == 0 {
+        assert!(wait_ready(&s), "no SOURCE_CHANGE within 2s");
+        process(&mut r.device, &mut s);
+    }
+
+    // The session was not failed, and the shortfall was noted once (D77).
+    assert_eq!(errors(&r.events.borrow()), 0, "the announce above the streaming count does not fail the session");
+    assert!(
+        s.warned_capture_below_announced_min,
+        "the count shortfall at the announce is made visible (D77)"
+    );
+    assert_eq!(s.min_capture_buffers, 21, "the announced minimum is recorded");
+
+    // A frame still reaches the client: the four buffers hold the announced size.
+    collect_capture(&mut r, &mut s, 1);
+    let stamps: Vec<i64> = dequeued_on(&r.events.borrow(), CAPTURE)
+        .iter()
+        .map(|b| b.timestamp().tv_sec as i64)
+        .collect();
+    assert_eq!(stamps.first(), Some(&0), "the first frame is delivered despite the count shortfall");
+
     close(&mut r.device, s);
 }
 

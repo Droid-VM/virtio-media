@@ -316,6 +316,11 @@ struct FakeBackend {
     /// frames the codec has not emitted, the shape D78 is about. `0` is the historic behaviour
     /// (every frame is available the moment it is queued), which every pre-D78 test relies on.
     pipeline: usize,
+    /// The `CAPTURE` floor the backend reports for every fourcc, standing in for the MediaCodec
+    /// backend's cross-session record of the codec's output-buffer need (the D78 residual,
+    /// B16 §5.3 -- the encoder's D77). `None` is a backend that has learned nothing yet, which
+    /// every pre-existing test relies on: nothing is raised.
+    min_capture: Option<u32>,
 }
 
 enum Cmd {
@@ -602,6 +607,10 @@ impl VideoEncoderBackend for FakeBackend {
     fn close_session(&mut self, mut session: FakeSession) {
         session.stop();
     }
+
+    fn min_capture_buffers(&self, _fourcc: PixelFormat) -> Option<u32> {
+        self.min_capture
+    }
 }
 
 impl FakeSession {
@@ -799,16 +808,23 @@ fn caps() -> EncoderCapabilities {
 }
 
 fn rig_with(fail_start: Option<i32>) -> Rig {
-    rig_full(fail_start, 0)
+    rig_full(fail_start, 0, None)
 }
 
 /// A rig whose fake codec keeps `pipeline` frames in flight, so a `STREAMOFF(OUTPUT)` can land
 /// with un-emitted frames (D78's shape).
 fn rig_with_pipeline(pipeline: usize) -> Rig {
-    rig_full(None, pipeline)
+    rig_full(None, pipeline, None)
 }
 
-fn rig_full(fail_start: Option<i32>, pipeline: usize) -> Rig {
+/// A rig whose backend reports a `CAPTURE` floor of `min` for every fourcc, standing in for a
+/// MediaCodec backend that has learned the codec's output-buffer need from an earlier session
+/// (the D78 residual, B16 §5.3).
+fn rig_with_min_capture(min: u32) -> Rig {
+    rig_full(None, 0, Some(min))
+}
+
+fn rig_full(fail_start: Option<i32>, pipeline: usize, min_capture: Option<u32>) -> Rig {
     let events = EventLog::default();
     let events_log = Rc::clone(&events.0);
     let guest = FakeGuest {
@@ -821,6 +837,7 @@ fn rig_full(fail_start: Option<i32>, pipeline: usize) -> Rig {
         log: Arc::clone(&log),
         fail_start,
         pipeline,
+        min_capture,
     };
     let pool = PoolBudget::unlimited();
     let device = VideoEncoder::new(
@@ -3962,10 +3979,14 @@ fn stream_bufs(r: &mut Rig, s: &mut Session, out_bufs: u32, cap_bufs: u32) -> u3
         .unwrap();
     r.device.reqbufs(s, OUTPUT, MemoryType::Mmap, out_bufs).unwrap();
     let sizeimage = pix(&r.device.g_fmt(s, CAPTURE).unwrap()).sizeimage;
-    r.device
+    // Queue what REQBUFS *granted*, not what was asked: ffmpeg allocates and queues `req.count`
+    // buffers, so a floor-raised grant is queued whole (the same count when there is no floor).
+    let granted = r
+        .device
         .reqbufs(s, CAPTURE, MemoryType::Mmap, cap_bufs)
-        .unwrap();
-    for i in 0..cap_bufs {
+        .unwrap()
+        .count;
+    for i in 0..granted {
         r.device
             .qbuf(
                 s,
@@ -4153,5 +4174,124 @@ fn streamoff_output_drain_with_no_capture_buffer_drops_and_counts() {
         2,
         "the two that fit came out; no more"
     );
+    close(&mut r.device, s);
+}
+
+// ---------------------------------------------------------------------------------------------
+// F20: the D78 residual -- a backend-learned CAPTURE floor raises a small client allocation.
+// See logs/vpu_wp/F20-encoder.md and B16-acceptance.md §5.3.
+// ---------------------------------------------------------------------------------------------
+
+/// The D78 residual (B16 §5.3): ffmpeg's `h264_v4l2m2m` sizes its encoder CAPTURE queue with a
+/// fixed `REQBUFS(CAPTURE, 4)` and drops frames when the codec outruns those 4 -- 246-260 of 300
+/// at the default, 300/300/300 with `-num_capture_buffers 16`, on the same command. An encoder
+/// must not offer `MIN_BUFFERS_FOR_CAPTURE` (`controls_are_enumerated_from_the_capabilities`
+/// pins that), so the only channel to such a client is the raise vb2 performs for a driver's own
+/// minimum: a small ask is granted the backend's floor, the decoder's D72/D77 on the encoder.
+/// The floor is the backend's *reported* count, not a constant of the device: backends with
+/// different numbers grant differently, and one that has learned nothing raises nothing.
+#[test]
+fn reqbufs_capture_is_raised_to_the_backend_floor() {
+    // ffmpeg's 4 against a backend that learned 16.
+    let mut r = rig_with_min_capture(16);
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, CAPTURE, capture_format(H264, 0)).unwrap();
+    let reply = r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
+    assert_eq!(reply.count, 16, "REQBUFS(CAPTURE, 4) is granted the floor 16");
+    assert_eq!(s.output.buffers.len(), 16, "and that many buffers really exist");
+
+    // A count already above the floor is left as asked (gst over-provisions on purpose).
+    r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0).unwrap();
+    let reply = r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 20).unwrap();
+    assert_eq!(reply.count, 20, "a count above the floor is not lowered");
+
+    // OUTPUT is never raised: the floor is the codec's bitstream side alone.
+    let reply = r.device.reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 4).unwrap();
+    assert_eq!(reply.count, 4, "OUTPUT REQBUFS is granted as asked");
+    close(&mut r.device, s);
+
+    // The floor tracks the backend's count: a backend that learned 9 grants 9 ...
+    let mut r = rig_with_min_capture(9);
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, CAPTURE, capture_format(H264, 0)).unwrap();
+    let reply = r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
+    assert_eq!(reply.count, 9, "the floor is the backend's count, not a device constant");
+    close(&mut r.device, s);
+
+    // ... and one that has learned nothing -- every first session of a fourcc since the helper
+    // started -- raises nothing, which is the pre-floor behaviour and the decoder's D77 shape.
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, CAPTURE, capture_format(H264, 0)).unwrap();
+    let reply = r.device.reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 4).unwrap();
+    assert_eq!(reply.count, 4, "no floor known, nothing raised");
+    close(&mut r.device, s);
+}
+
+/// The same floor at `CREATE_BUFS(CAPTURE)`, but only when it is the queue's *first* allocation,
+/// as vb2 does (`vb2_core_create_bufs` raises a count to the queue's minimum only while no
+/// buffer exists yet): GStreamer grows an existing pool through `CREATE_BUFS`, and an append
+/// must stay an append.
+#[test]
+fn create_bufs_capture_meets_the_floor_only_on_the_first_allocation() {
+    let mut r = rig_with_min_capture(9);
+    let mut s = session(&mut r.device);
+    r.device.s_fmt(&mut s, CAPTURE, capture_format(H264, 0)).unwrap();
+    let sizeimage = pix(&r.device.g_fmt(&s, CAPTURE).unwrap()).sizeimage;
+    let fmt = capture_format(H264, sizeimage);
+    let reply = r
+        .device
+        .create_bufs(&mut s, 2, CAPTURE, MemoryType::Mmap, fmt)
+        .unwrap();
+    assert_eq!(reply.index, 0);
+    assert_eq!(reply.count, 9, "a first CREATE_BUFS(CAPTURE, 2) is raised to the floor 9");
+    let reply = r
+        .device
+        .create_bufs(&mut s, 2, CAPTURE, MemoryType::Mmap, fmt)
+        .unwrap();
+    assert_eq!(reply.index, 9);
+    assert_eq!(reply.count, 2, "an append to a non-empty queue is granted as asked");
+    close(&mut r.device, s);
+}
+
+/// The D78 residual end to end: a feeder that outruns the codec past a CAPTURE queue of ffmpeg's
+/// 4 loses accepted frames at teardown -- the codec still holds a pipeline the `STREAMOFF` drain
+/// has nowhere to place -- and the *same* client ask over the *same* feed loses nothing once the
+/// floor applies, because the client allocates and queues what `REQBUFS` granted, exactly as
+/// ffmpeg queues `req.count` buffers. This is B16 §5.3 in the fake: 4 buffers drop frames,
+/// 16 (`-num_capture_buffers 16` there, the floor here) is whole.
+#[test]
+fn a_fast_feeder_past_a_small_capture_queue_loses_nothing_once_the_floor_applies() {
+    // No floor (every pre-fix session): 6 frames in flight, 4 CAPTURE buffers, 2 frames die.
+    let mut r = rig_full(None, 6, None);
+    let mut s = session(&mut r.device);
+    let _ = stream_bufs(&mut r, &mut s, 8, 4);
+    for i in 0..6u32 {
+        queue_frame(&mut r, &mut s, i, 0x30 + i as u8, i as i64);
+    }
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    assert_eq!(
+        r.log.lock().unwrap().dropped_by_streamoff,
+        2,
+        "4 client buffers cannot take a 6-deep pipeline: 2 accepted frames die (the residual)"
+    );
+    close(&mut r.device, s);
+
+    // The floor: the same REQBUFS(CAPTURE, 4) is granted 16 and the client queues all 16; the
+    // same 6-deep pipeline and the same feed lose nothing.
+    let mut r = rig_full(None, 6, Some(16));
+    let mut s = session(&mut r.device);
+    let _ = stream_bufs(&mut r, &mut s, 8, 4);
+    assert_eq!(s.output.buffers.len(), 16, "the client's ask of 4 was granted the floor 16");
+    for i in 0..6u32 {
+        queue_frame(&mut r, &mut s, i, 0x30 + i as u8, i as i64);
+    }
+    r.device.streamoff(&mut s, OUTPUT).unwrap();
+    assert_eq!(r.log.lock().unwrap().dropped_by_streamoff, 0, "no accepted frame is dropped");
+    let coded = dequeued_on(&r.events.borrow(), CAPTURE);
+    assert_eq!(coded.len(), 6, "every accepted frame reaches the client");
+    for (n, b) in coded.iter().enumerate() {
+        assert_eq!(b.timestamp().tv_sec, n as i64, "frame {n} in order");
+    }
     close(&mut r.device, s);
 }

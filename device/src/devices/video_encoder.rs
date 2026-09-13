@@ -578,6 +578,23 @@ pub trait VideoEncoderBackend {
 
     /// Close and destroy `session`, joining its thread.
     fn close_session(&mut self, session: Self::Session);
+
+    /// The `CAPTURE` (bitstream) floor an earlier session learned for `fourcc`, if any: the
+    /// codec's real output-buffer need, read from the codec itself, plus whatever margin the
+    /// backend justifies -- the encoder's analogue of the decoder's `min_capture_buffers` (D77).
+    /// An encoder must not offer `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` (that is a decoder control;
+    /// `v4l2-compliance` fails an encoder that has it, and this device's control table never
+    /// carries it), so the *only* channel to a client that under-provisions is the
+    /// `REQBUFS(CAPTURE)` raise. ffmpeg's `h264_v4l2m2m` allocates a fixed 4 bitstream buffers
+    /// unless `-num_capture_buffers` says otherwise, and 4 cannot absorb what the codec emits
+    /// under a fast feed: B16-acceptance §5.3 measured 246-260 of 300 frames at the default and
+    /// 300/300/300 with 16 on the same command -- the D78 residual. The backend only learns the
+    /// count from the codec's own output format, mid-stream on the first encode of a fourcc, so
+    /// the first session of a format runs unraised, exactly like the decoder's D77. The default
+    /// knows nothing; the device then keeps the bare floor of 1.
+    fn min_capture_buffers(&self, _fourcc: PixelFormat) -> Option<u32> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1213,6 +1230,13 @@ pub struct VideoEncoderSession<GM, S> {
     timeperframe: (u32, u32),
     /// The bitstream buffer size the client set through `S_FMT(CAPTURE)`, if it did.
     bitstream_size: Option<u32>,
+    /// The `CAPTURE` (bitstream) allocation floor: what an earlier session's codec reported it
+    /// needs for the coded format ([`VideoEncoderBackend::min_capture_buffers`]), seeded at
+    /// session creation, re-seeded when `S_FMT(CAPTURE)` picks a format and re-read at every
+    /// `CAPTURE` allocation (the backend learns it mid-stream, on the first encode of a fourcc).
+    /// A smaller `REQBUFS(CAPTURE)` or first `CREATE_BUFS(CAPTURE)` is raised to it (the D78
+    /// residual, B16-acceptance §5.3); 1 while nothing is known.
+    min_capture_buffers: u32,
     colorspace: V4l2FormatColorspace,
     /// Current control values, one per entry of the device's table (unused for class and
     /// button entries).
@@ -2117,6 +2141,9 @@ where
         let min_fps = first.frame_rate.min.max(1);
         let fps = DEFAULT_FRAME_RATE.clamp(min_fps, first.frame_rate.max.max(min_fps));
         let ctrl_values = self.controls.iter().map(|c| c.default()).collect();
+        // The CAPTURE floor for the format the session starts with; `s_fmt` re-seeds it when the
+        // client picks another (the decoder's D77 shape, on the encoder for the D78 residual).
+        let min_capture_buffers = self.backend.min_capture_buffers(fourcc).unwrap_or(1).max(1);
         let signal = Arc::new(EncoderSignal::new()?);
         let backend = self
             .backend
@@ -2139,6 +2166,7 @@ where
             timeperframe: (1, fps),
             bitstream_size: None,
             colorspace: Default::default(),
+            min_capture_buffers,
             ctrl_values,
             eos_subscribed: false,
             dead: false,
@@ -2444,6 +2472,14 @@ where
                 // SAFETY: multi-planar.
                 let pix_mp = unsafe { adjusted.fmt.pix_mp };
                 session.coded_format = PixelFormat::from_u32(pix_mp.pixelformat);
+                // The client picked the coded format; re-seed the CAPTURE floor from what an
+                // earlier session's codec reported for it (the decoder's D77 shape). This is
+                // always before any buffer exists (`has_buffers` was refused above).
+                session.min_capture_buffers = self
+                    .backend
+                    .min_capture_buffers(session.coded_format)
+                    .unwrap_or(1)
+                    .max(1);
                 let size = (pix_mp.width, pix_mp.height);
                 if size != session.coded_size {
                     session.coded_size = size;
@@ -2499,12 +2535,33 @@ where
         // Old buffers go first, mappings and all, so the reply never races a stale view. The
         // backend has stopped touching them (`streamoff` above, or the queue was not streaming).
         self.free_buffers(session.queue_mut(queue)?);
-        let want = (count as usize).min(MAX_BUFFERS);
+        let mut want = (count as usize).min(MAX_BUFFERS);
+        // A `REQBUFS(CAPTURE, n)` below the codec's output-buffer floor is raised to it, as vb2
+        // does (`vb2_core_reqbufs` bumps a non-zero count up to the driver's minimum,
+        // `videobuf2-core.c`) and as the decoder does for D72/D77: V4L2 lets `REQBUFS` grant
+        // more buffers than asked exactly so a driver can meet its own floor, and an encoder has
+        // no other channel to a client that under-provisions -- `MIN_BUFFERS_FOR_CAPTURE` is a
+        // decoder control an encoder must not offer, and the stateful encoder interface has no
+        // announce after which a client would re-ask. ffmpeg's `h264_v4l2m2m` allocates a fixed
+        // 4 here and drops frames when the codec outruns them: B16-acceptance §5.3 measured
+        // 246-260 of 300 frames at that default and 300/300/300 with 16 on the same command (the
+        // D78 residual). The floor is re-read at every allocation because the backend learns it
+        // from the codec's own output format, mid-stream on the first encode of a fourcc.
+        if want > 0 && direction == QueueDirection::Capture {
+            session.min_capture_buffers = self
+                .backend
+                .min_capture_buffers(session.coded_format)
+                .unwrap_or(session.min_capture_buffers)
+                .max(1);
+            want = want
+                .max(session.min_capture_buffers as usize)
+                .min(MAX_BUFFERS);
+        }
         // What the guest is told it got: `want`, unless the pool could only serve some of it
         // (D73). This device's floor is one buffer on either queue -- `streamon` takes any
         // non-empty queue, one OUTPUT buffer feeds a frame in and one CAPTURE buffer takes a
-        // coded frame out -- so a short answer still encodes; below it there is no queue and the
-        // answer stays `ENOMEM`.
+        // coded frame out -- so a short answer still encodes (unlike the decoder, whose CAPTURE
+        // shortfall is a stall, D72); below one there is no queue and the answer stays `ENOMEM`.
         let mut count = want;
         if want > 0 {
             let sizeimage = session.sizeimage(direction);
@@ -2575,7 +2632,22 @@ where
             }
         }
         let first = session.queue(queue)?.buffers.len();
-        let want = (count as usize).min(MAX_BUFFERS - first);
+        let mut want = (count as usize).min(MAX_BUFFERS - first);
+        // A `CREATE_BUFS(CAPTURE)` that is the queue's *first* allocation meets the same floor
+        // as `REQBUFS` (vb2 raises the count to the queue's minimum only when no buffer exists
+        // yet, `vb2_core_create_bufs`); one that appends to a queue is left as asked, as the
+        // decoder's is -- the floor was already met (or deliberately exceeded) when the queue
+        // was created.
+        if first == 0 && want > 0 && direction == QueueDirection::Capture {
+            session.min_capture_buffers = self
+                .backend
+                .min_capture_buffers(session.coded_format)
+                .unwrap_or(session.min_capture_buffers)
+                .max(1);
+            want = want
+                .max(session.min_capture_buffers as usize)
+                .min(MAX_BUFFERS);
+        }
         // `index` + `count` are what the guest indexes the new buffers by, so `count` must be
         // what was really created -- vb2 answers a short `CREATE_BUFS` the same way, failing
         // only when it could make none (D73).

@@ -23,7 +23,9 @@
  * Copyright (c) 2026 DroidVM contributors.
  */
 
+#include <linux/device.h>
 #include <linux/dma-buf.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/io.h>
@@ -32,6 +34,7 @@
 #include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
+#include <linux/swiotlb.h>
 #include <linux/videodev2.h>
 #include <linux/vmalloc.h>
 
@@ -605,8 +608,95 @@ void vmedia_queue_put_dbufs(struct virtio_media_queue_state *queue)
 /*
  * DMABUF import: the V4L2_MEMORY_DMABUF flavour of the driver-owned
  * substitution (VPU_DESIGN.md 7.7). See virtio_media_alloc.h for why the SG
- * list is built from sg_dma_address/sg_dma_len and not from sg_page.
+ * list is built from sg_dma_address/sg_dma_len and not from sg_page, and why
+ * the attachment goes to the resolver device below and not to the virtio
+ * device (D90: the protected VM's restricted DMA pool refuses resource
+ * mappings).
  */
+
+/**
+ * struct vmedia_import_dev - The dma-buf resolver device.
+ *
+ * A bare struct device, device_initialize()d and never device_add()ed: it
+ * exists only as a DMA mapping identity for dma_buf_attach(), so it needs
+ * refcounting, a name and DMA fields, not sysfs, PM or a bus. Staying
+ * unregistered is also what guarantees its DMA mode: no OF node, no bus, no
+ * driver bind means no code path -- of_dma_configure(),
+ * arch_setup_dma_ops(), of_reserved_mem device init -- ever assigns it
+ * dma_ops, a dma_range_map or a restricted swiotlb pool.
+ * device_initialize() leaves it on dma-direct with the default io_tlb_mem
+ * (not force-bounce), and dma_map_resource()/dma_map_sgtable() on it return
+ * physical addresses unchanged. It also takes no parent: an import held by
+ * an open fd outlives a D66 unbind, so the resolver outlives the virtio
+ * device, and with no sysfs entry and no parent pointer there is no teardown
+ * ordering against the transport to get wrong. @dma_parms only backs
+ * dma_set_max_seg_size(): an exporter must not have to split its sgt for us.
+ */
+struct vmedia_import_dev {
+	struct device dev;
+	struct device_dma_parameters dma_parms;
+};
+
+static void vmedia_import_dev_release(struct device *dev)
+{
+	kfree(container_of(dev, struct vmedia_import_dev, dev));
+}
+
+int vmedia_import_dev_create(struct virtio_media *vv)
+{
+	struct vmedia_import_dev *idev;
+	struct device *dev;
+	int ret;
+
+	idev = kzalloc(sizeof(*idev), GFP_KERNEL);
+	if (!idev)
+		return -ENOMEM;
+
+	dev = &idev->dev;
+	device_initialize(dev);
+	dev->release = vmedia_import_dev_release;
+	dev->dma_parms = &idev->dma_parms;
+
+	ret = dev_set_name(dev, "%s-dmabuf", dev_name(&vv->virtio_dev->dev));
+	if (ret)
+		goto err_put;
+
+	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(64));
+	if (ret)
+		goto err_put;
+	dma_set_max_seg_size(dev, UINT_MAX);
+
+	/*
+	 * Both must hold or D90 is back: dma_ops NULL means dma-direct, and a
+	 * non-force-bounce device is what lets dma_direct_map_phys() pass a
+	 * DMA_ATTR_MMIO (resource) address through as-is.
+	 */
+	if (get_dma_ops(dev) || is_swiotlb_force_bounce(dev))
+		pr_warn("virtio-media: dma-buf resolver %s is NOT dma-direct (dma_ops %s, swiotlb force-bounce %d): DMABUF imports of non-RAM exporters will fail\n",
+			dev_name(dev), get_dma_ops(dev) ? "set" : "null",
+			is_swiotlb_force_bounce(dev));
+	else
+		pr_info("virtio-media: dma-buf resolver %s: dma-direct, no swiotlb force-bounce; imported SG addresses are guest-physical\n",
+			dev_name(dev));
+
+	vv->import_dev = dev;
+	return 0;
+
+err_put:
+	/* Runs the release; frees @idev. */
+	put_device(dev);
+	return ret;
+}
+
+void vmedia_import_dev_destroy(struct virtio_media *vv)
+{
+	if (!vv->import_dev)
+		return;
+
+	/* Never device_add()ed, so the last put is the whole teardown. */
+	put_device(vv->import_dev);
+	vv->import_dev = NULL;
+}
 
 struct vmedia_dmabuf *vmedia_dmabuf_import(struct virtio_media *vv, int fd,
 					   size_t size, u32 data_offset)
@@ -646,7 +736,13 @@ struct vmedia_dmabuf *vmedia_dmabuf_import(struct virtio_media *vv, int fd,
 		goto err_put;
 	}
 
-	import->attach = dma_buf_attach(import->dmabuf, vv->dma_dev);
+	/*
+	 * Attach to the resolver device (direct DMA ops, so the mapping below
+	 * yields guest-physical addresses); the transport's DMA device is
+	 * only the fallback for a probe that could not create the resolver.
+	 */
+	import->attach = dma_buf_attach(import->dmabuf,
+					vv->import_dev ?: vv->dma_dev);
 	if (IS_ERR(import->attach)) {
 		ret = PTR_ERR(import->attach);
 		import->attach = NULL;
@@ -675,9 +771,10 @@ struct vmedia_dmabuf *vmedia_dmabuf_import(struct virtio_media *vv, int fd,
 
 	/*
 	 * Trim the DMA runs to [@data_offset, @data_offset + @size): skip the
-	 * offset, take the size. The address is the DMA address, which is the
-	 * guest-physical address on this IOMMU-less transport -- the same wire
-	 * form the driver-owned USERPTR path builds from sg_phys().
+	 * offset, take the size. The address is the DMA address, which the
+	 * resolver device's direct, identity mapping makes the guest-physical
+	 * address -- the same wire form the driver-owned USERPTR path builds
+	 * from sg_phys().
 	 */
 	for_each_sgtable_dma_sg(import->sgt, sg, i) {
 		dma_addr_t addr = sg_dma_address(sg);
@@ -804,6 +901,36 @@ void vmedia_dmabuf_buffer_from_host(struct v4l2_buffer *b,
 	} else if (imports[0]) {
 		b->m.fd = imports[0]->fd;
 		b->length = imports[0]->size;
+	}
+}
+
+void vmedia_dmabuf_warn_host_refused(const struct virtio_media_buffer *buffer,
+				     int err)
+{
+	u32 p;
+
+	for (p = 0; p < VIDEO_MAX_PLANES; p++) {
+		const struct vmedia_dmabuf *import = buffer->dmabuf[p];
+		u64 start, end;
+
+		if (!import || import->nents == 0)
+			continue;
+		start = import->sg[0].start;
+		end = import->sg[import->nents - 1].start +
+		      import->sg[import->nents - 1].len;
+		/*
+		 * Rate-limited (D51): a client that keeps re-queueing an
+		 * unreachable buffer answers every turn of its loop with this
+		 * line. The guest mapped the range fine; the host refused it
+		 * because it lies outside its SHARE'd windows -- in a pVM the
+		 * expected answer for plain RAM pages (e.g. a udmabuf over a
+		 * memfd), while SHARE'd pool memory (a GBM bo in the
+		 * gpu-guest pool) is accepted.
+		 */
+		pr_warn_ratelimited(
+			"virtio-media: host refused DMABUF plane %u (exporter %s, phys %#llx-%#llx, %u runs): %d -- range outside the host's SHARE'd windows\n",
+			p, import->dmabuf->exp_name ?: "?", start, end,
+			import->nents, err);
 	}
 }
 

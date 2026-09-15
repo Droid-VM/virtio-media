@@ -1237,6 +1237,12 @@ static void virtio_media_v4l2_release(struct v4l2_device *v4l2_dev)
 		container_of(v4l2_dev, struct virtio_media, v4l2_dev);
 
 	virtio_media_guest_pool_fini(vv);
+	/*
+	 * Every session -- and so every DMABUF import and its attachment --
+	 * is gone by now: each open file pins the v4l2_dev, and this is its
+	 * last reference dropping.
+	 */
+	vmedia_import_dev_destroy(vv);
 	put_device(vv->dma_dev);
 	kfree(vv->event_buffer);
 	kfree(vv);
@@ -1314,6 +1320,17 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	 * device until the final teardown.
 	 */
 	get_device(vv->dma_dev);
+
+	/*
+	 * The dma-buf resolver DMABUF imports attach to (D90; see
+	 * virtio_media.h). Failure is not fatal: imports fall back to
+	 * dma_dev, which still serves RAM-backed exporters outside a
+	 * protected VM.
+	 */
+	ret = vmedia_import_dev_create(vv);
+	if (ret)
+		pr_warn("virtio-media: no dma-buf resolver device (%d), DMABUF imports attach to the transport's DMA device\n",
+			ret);
 
 	init_waitqueue_head(&vv->wq);
 
@@ -1409,6 +1426,7 @@ err_find_vqs:
 	return ret;
 
 err_v4l2_register:
+	vmedia_import_dev_destroy(vv);
 	put_device(vv->dma_dev);
 	kfree(vv->event_buffer);
 	kfree(vv);

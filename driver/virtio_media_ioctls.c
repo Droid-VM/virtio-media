@@ -1659,8 +1659,16 @@ static int virtio_media_prepare_buf(struct file *file, void *priv_unused,
 	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_PREPARE_BUF, b, buffer,
 					     dmabuf_queue);
 	if (ret) {
-		if (dmabuf_queue)
+		if (dmabuf_queue) {
+			/*
+			 * EFAULT from the host answers the "is the range
+			 * SHARE'd" question the guest's DMA layer cannot:
+			 * name the exporter and the range.
+			 */
+			if (ret == -EFAULT)
+				vmedia_dmabuf_warn_host_refused(buffer, ret);
 			vmedia_buffer_put_dmabufs(buffer);
+		}
 		return ret;
 	}
 
@@ -1747,6 +1755,14 @@ static int virtio_media_qbuf(struct file *file, void *priv_unused,
 		if (queue->queued_bufs > 0)
 			queue->queued_bufs -= 1;
 		mutex_unlock(&session->dqbufs_lock);
+		/*
+		 * EFAULT from the host answers the "is the range SHARE'd"
+		 * question the guest's DMA layer cannot: name the exporter
+		 * and the range (prepared buffers included -- the import is
+		 * theirs, the refusal is still this QBUF's).
+		 */
+		if (dmabuf_queue && ret == -EFAULT)
+			vmedia_dmabuf_warn_host_refused(buffer, ret);
 		/*
 		 * Drop the import this QBUF made; a prepared buffer keeps its
 		 * import for a later QBUF, so leave that one alone.

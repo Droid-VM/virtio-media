@@ -52,6 +52,25 @@ struct virtio_media {
 	struct device *dma_dev;
 
 	/*
+	 * dma-buf resolver: a bare, driver-owned struct device DMABUF imports
+	 * attach to instead of @dma_dev. In a protected VM @dma_dev is bound
+	 * to a restricted DMA pool (swiotlb force-bounce), and such a device
+	 * cannot map a resource address at all -- dma_map_phys(DMA_ATTR_MMIO)
+	 * returns DMA_MAPPING_ERROR, so importing a virtio-gpu vram dma-buf
+	 * failed -EIO (D90). The resolver has no OF node, no bus and no
+	 * driver, so nothing ever runs of_dma_configure()/arch_setup_dma_ops()
+	 * on it: dma_ops stays NULL (dma-direct), dma_range_map stays NULL
+	 * (identity), and its swiotlb is the default, non-force-bounce pool --
+	 * dma_map_resource()/dma_map_sgtable() on it return the physical
+	 * address unchanged, which on this IOMMU-less transport is the
+	 * guest-physical address the host-facing SG list needs. NULL when its
+	 * creation failed at probe; imports then fall back to @dma_dev.
+	 * Created in probe, destroyed with the final teardown so an import
+	 * held by an open fd across an unbind can still detach (D66 lifetime).
+	 */
+	struct device *import_dev;
+
+	/*
 	 * media_guest pool: guest-physical range the host SHARE'd for buffers
 	 * the guest fills (OUTPUT queues by default), carved with drm_buddy.
 	 * guest_pool_ready is cleared under guest_pool_lock at the final

@@ -176,22 +176,56 @@ void vmedia_queue_put_dbufs(struct virtio_media_queue_state *queue);
  * travels to the host as USERPTR with a guest-physical SG list, but the memory
  * is not allocated by the driver -- it is a dma-buf the guest handed in at
  * QBUF time (a GBM/virtio-gpu surface, another V4L2 node, udmabuf, ...). The
- * import is attached to the virtio transport's DMA device and its sg_table is
- * read through sg_dma_address/sg_dma_len only: the virtio-gpu vram exporter's
- * sgt has no struct pages (virtgpu_vram.c virtio_gpu_vram_map_dma_buf uses
- * sg_set_page(sg, NULL, ...)), so sg_phys()/sg_page() would fault. On this
- * transport there is no IOMMU, so the DMA address equals the guest-physical
- * address -- exactly the wire form the driver-owned USERPTR path builds from
- * sg_phys() (scatterlist_filler.c prepare_userptr_to_host).
+ * import is attached to the per-device dma-buf resolver (virtio_media.h
+ * @import_dev) and its sg_table is read through sg_dma_address/sg_dma_len
+ * only: the virtio-gpu vram exporter's sgt has no struct pages
+ * (virtgpu_vram.c virtio_gpu_vram_map_dma_buf uses sg_set_page(sg, NULL,
+ * ...)), so sg_phys()/sg_page() would fault.
+ *
+ * Why a resolver device and not the transport's DMA device: in a protected VM
+ * every virtio device is bound to a restricted DMA pool (swiotlb
+ * force-bounce), and dma_direct_map_phys() refuses DMA_ATTR_MMIO on a
+ * force-bounce device -- an MMIO range cannot be bounced -- so attaching to
+ * the virtio device made every virtio-gpu vram import fail -EIO (D90,
+ * B21-acceptance section 3). The resolver has direct DMA ops and no
+ * restricted pool, so mapping through it returns the physical address
+ * unchanged: sg_dma_address == the guest-physical address, exactly the wire
+ * form the driver-owned USERPTR path builds from sg_phys()
+ * (scatterlist_filler.c prepare_userptr_to_host). Whether the host may
+ * actually touch a range is not the guest's DMA layer's question: the host
+ * checks the SG list against its SHARE'd access windows and answers EFAULT
+ * for anything outside them. A udmabuf over plain RAM pages therefore now
+ * maps fine in the guest and is refused by the host in a pVM -- the correct
+ * split (the exporter is not this driver's business, the windows are the
+ * host's).
  */
+
+/**
+ * vmedia_import_dev_create - Create the dma-buf resolver device for @vv.
+ *
+ * Initializes a bare struct device (never added to sysfs or a bus) with a
+ * 64-bit DMA mask and direct DMA ops, prints one line naming it and its DMA
+ * mode, and stores it in @vv->import_dev. On failure @vv->import_dev stays
+ * NULL and imports fall back to @vv->dma_dev (the r24 behaviour: RAM-backed
+ * dma-bufs import, vram exporters fail).
+ */
+int vmedia_import_dev_create(struct virtio_media *vv);
+
+/**
+ * vmedia_import_dev_destroy - Drop the resolver device (NULL is allowed).
+ * Called from the final teardown, after the last session -- and so the last
+ * import -- is gone.
+ */
+void vmedia_import_dev_destroy(struct virtio_media *vv);
 
 /**
  * struct vmedia_dmabuf - One imported DMABUF plane held on behalf of a queued
  * V4L2_MEMORY_DMABUF buffer.
  *
- * @vv: device the import is attached to (its DMA device).
+ * @vv: device the import is attached to (through its resolver device).
  * @dmabuf: the dma-buf the fd resolved to.
- * @attach: attachment to @vv's DMA device.
+ * @attach: attachment to @vv's resolver device (@vv->dma_dev when the
+ *	resolver could not be created at probe).
  * @sgt: mapped scatter-gather table (DMA_BIDIRECTIONAL).
  * @sg: guest-physical SG list sent to the host, trimmed to @size starting at
  *	the plane's @data_offset; built from sg_dma_address/sg_dma_len.
@@ -259,6 +293,17 @@ void vmedia_dmabuf_buffer_to_host(struct v4l2_buffer *b,
 void vmedia_dmabuf_buffer_from_host(struct v4l2_buffer *b,
 				    struct v4l2_plane *planes, u32 max_planes,
 				    struct vmedia_dmabuf *const *imports);
+
+/**
+ * vmedia_dmabuf_warn_host_refused - Rate-limited line naming each imported
+ * plane's exporter and physical range when the host answered EFAULT to a
+ * QBUF/PREPARE_BUF carrying them: the range is outside the host's SHARE'd
+ * access windows (in a pVM this is the expected answer for e.g. a udmabuf
+ * over plain RAM pages, which the guest maps fine but the host may not
+ * touch).
+ */
+void vmedia_dmabuf_warn_host_refused(const struct virtio_media_buffer *buffer,
+				     int err);
 
 /*
  * Upper bound on one bounced ioctl payload (defect D34). Compound-control

@@ -29,6 +29,7 @@ struct virtio_media_sg_entry {
 };
 
 struct vmedia_dbuf;
+struct vmedia_dmabuf;
 
 /**
  * struct virtio_media_buffer - Current state of a given buffer.
@@ -38,12 +39,18 @@ struct vmedia_dbuf;
  * @list: link into the list of buffers pending dequeue.
  * @dbuf: driver-owned backing of each plane (VPU_DESIGN.md 5.2), NULL for
  *	host-owned MMAP buffers and real USERPTR buffers.
+ * @dmabuf: imported DMABUF backing of each plane (VPU_DESIGN.md 7.7, the
+ *	"line contract"), NULL unless the queue is V4L2_MEMORY_DMABUF. Held
+ *	from QBUF/PREPARE_BUF until the buffer is dequeued, the queue is torn
+ *	down (REQBUFS(0)/STREAMOFF) or the session closes. Never set together
+ *	with @dbuf: a queue is one flavour of buffer at a time.
  */
 struct virtio_media_buffer {
 	struct v4l2_buffer buffer;
 	struct v4l2_plane planes[VIDEO_MAX_PLANES];
 	struct list_head list;
 	struct vmedia_dbuf *dbuf[VIDEO_MAX_PLANES];
+	struct vmedia_dmabuf *dmabuf[VIDEO_MAX_PLANES];
 };
 
 /**
@@ -61,7 +68,12 @@ struct virtio_media_buffer {
  * @memory: the V4L2_MEMORY_* type user-space set the queue up with, valid
  *	while @allocated_bufs is non-zero. Buffer ioctls must name it; it is
  *	not always what the host sees, which is USERPTR whenever
- *	@driver_owned.
+ *	@driver_owned or @memory == V4L2_MEMORY_DMABUF (VPU_DESIGN.md 7.7).
+ * @plane_sizes: expected per-plane size of a buffer, from the queue's format
+ *	at REQBUFS/CREATE_BUFS time. Only filled for a DMABUF queue, where QBUF
+ *	imports foreign memory and must know how much of it the host will use
+ *	(the host was told USERPTR buffers of exactly these sizes).
+ * @num_planes: number of entries in @plane_sizes, DMABUF queue only.
  */
 struct virtio_media_queue_state {
 	bool streaming;
@@ -73,6 +85,8 @@ struct virtio_media_queue_state {
 	struct list_head pending_dqbufs;
 	bool driver_owned;
 	u32 memory;
+	size_t plane_sizes[VIDEO_MAX_PLANES];
+	u32 num_planes;
 };
 
 /**

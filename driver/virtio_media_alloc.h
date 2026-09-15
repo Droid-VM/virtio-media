@@ -171,6 +171,96 @@ int vmedia_queue_alloc_dbufs(struct virtio_media *vv,
 void vmedia_queue_put_dbufs(struct virtio_media_queue_state *queue);
 
 /*
+ * DMABUF import (VPU_DESIGN.md 7.7). A V4L2_MEMORY_DMABUF buffer is the third
+ * flavour of the driver-owned substitution: like a driver-owned MMAP buffer it
+ * travels to the host as USERPTR with a guest-physical SG list, but the memory
+ * is not allocated by the driver -- it is a dma-buf the guest handed in at
+ * QBUF time (a GBM/virtio-gpu surface, another V4L2 node, udmabuf, ...). The
+ * import is attached to the virtio transport's DMA device and its sg_table is
+ * read through sg_dma_address/sg_dma_len only: the virtio-gpu vram exporter's
+ * sgt has no struct pages (virtgpu_vram.c virtio_gpu_vram_map_dma_buf uses
+ * sg_set_page(sg, NULL, ...)), so sg_phys()/sg_page() would fault. On this
+ * transport there is no IOMMU, so the DMA address equals the guest-physical
+ * address -- exactly the wire form the driver-owned USERPTR path builds from
+ * sg_phys() (scatterlist_filler.c prepare_userptr_to_host).
+ */
+
+/**
+ * struct vmedia_dmabuf - One imported DMABUF plane held on behalf of a queued
+ * V4L2_MEMORY_DMABUF buffer.
+ *
+ * @vv: device the import is attached to (its DMA device).
+ * @dmabuf: the dma-buf the fd resolved to.
+ * @attach: attachment to @vv's DMA device.
+ * @sgt: mapped scatter-gather table (DMA_BIDIRECTIONAL).
+ * @sg: guest-physical SG list sent to the host, trimmed to @size starting at
+ *	the plane's @data_offset; built from sg_dma_address/sg_dma_len.
+ * @nents: number of entries in @sg.
+ * @size: usable plane size the host is told (the queue's sizeimage), what the
+ *	USERPTR length carries on the wire.
+ * @fd: the fd the guest submitted, restored into m.fd on the reply/dequeue.
+ */
+struct vmedia_dmabuf {
+	struct virtio_media *vv;
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	struct virtio_media_sg_entry *sg;
+	u32 nents;
+	size_t size;
+	int fd;
+};
+
+/**
+ * vmedia_dmabuf_import - Import plane @fd for a buffer of @size usable bytes
+ * starting at @data_offset within the dma-buf.
+ *
+ * Returns the import (attachment + mapping + SG list held) or an ERR_PTR:
+ * -EINVAL for a non-dma-buf fd or a dma-buf smaller than @data_offset + @size,
+ * or the attach/map errno. A dma-buf larger than needed is accepted, the extra
+ * ignored. On success the caller owns the import until vmedia_dmabuf_release().
+ */
+struct vmedia_dmabuf *vmedia_dmabuf_import(struct virtio_media *vv, int fd,
+					   size_t size, u32 data_offset);
+
+/**
+ * vmedia_dmabuf_release - Unmap, detach and put an import (NULL is allowed).
+ */
+void vmedia_dmabuf_release(struct vmedia_dmabuf *import);
+
+/**
+ * vmedia_buffer_put_dmabufs - Release every imported plane of @buffer and NULL
+ * the slots. Called on DQBUF, queue teardown and session close.
+ */
+void vmedia_buffer_put_dmabufs(struct virtio_media_buffer *buffer);
+
+/**
+ * vmedia_queue_put_dmabufs - Release the imports of every buffer the queue
+ * still holds (a STREAMOFF/REQBUFS(0) with buffers queued but not dequeued).
+ */
+void vmedia_queue_put_dmabufs(struct virtio_media_queue_state *queue);
+
+/**
+ * vmedia_dmabuf_buffer_to_host - Rewrite @b for the host: memory USERPTR, a
+ * non-zero opaque m.userptr (so the USERPTR fixup keeps the plane length) and
+ * length the queue's sizeimage, per plane for multiplanar buffers. data_offset
+ * is zeroed because the SG list already begins at it. Planes without an import
+ * are left untouched.
+ */
+void vmedia_dmabuf_buffer_to_host(struct v4l2_buffer *b,
+				  struct vmedia_dmabuf *const *imports);
+
+/**
+ * vmedia_dmabuf_buffer_from_host - Rewrite @b back for user-space: memory
+ * DMABUF and m.fd the fd the guest submitted, per plane for multiplanar.
+ * @planes: the plane array to patch (b->m.planes may dangle in the kept state).
+ * @max_planes: number of entries in @planes.
+ */
+void vmedia_dmabuf_buffer_from_host(struct v4l2_buffer *b,
+				    struct v4l2_plane *planes, u32 max_planes,
+				    struct vmedia_dmabuf *const *imports);
+
+/*
  * Upper bound on one bounced ioctl payload (defect D34). Compound-control
  * payloads are tens of bytes to a few KiB; anything approaching this is a
  * corrupt size and is refused rather than allowed to drain the pool.

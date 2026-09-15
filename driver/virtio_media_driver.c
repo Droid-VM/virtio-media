@@ -204,6 +204,8 @@ static void virtio_media_session_close(struct virtio_media *vv,
 	for (i = 0; i <= VIRTIO_MEDIA_LAST_QUEUE; i++)
 		if (session->queues[i].buffers) {
 			vmedia_queue_put_dbufs(&session->queues[i]);
+			/* Release any DMABUF still imported at close (7.7). */
+			vmedia_queue_put_dmabufs(&session->queues[i]);
 			vfree(session->queues[i].buffers);
 		}
 
@@ -500,11 +502,16 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	/*
 	 * A driver-owned buffer went to the host as USERPTR: give user-space
 	 * back the MMAP memory type, its cookie and its length
-	 * (VPU_DESIGN.md 5.3 item 5).
+	 * (VPU_DESIGN.md 5.3 item 5). A DMABUF buffer went the same way: give
+	 * back the DMABUF memory type and the fd the guest submitted (7.7). The
+	 * two are mutually exclusive per buffer.
 	 */
 	if (dqbuf->dbuf[0])
 		vmedia_dbuf_buffer_from_host(&dqbuf->buffer, dqbuf->planes,
 					     VIDEO_MAX_PLANES, dqbuf->dbuf);
+	else if (dqbuf->dmabuf[0])
+		vmedia_dmabuf_buffer_from_host(&dqbuf->buffer, dqbuf->planes,
+					       VIDEO_MAX_PLANES, dqbuf->dmabuf);
 
 	/* Set the DONE flag as the buffer is waiting for being dequeued. */
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;

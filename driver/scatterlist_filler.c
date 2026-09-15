@@ -437,6 +437,40 @@ int scatterlist_filler_add_buffer_dbuf(struct scatterlist_filler *filler,
 	return 0;
 }
 
+static int scatterlist_filler_add_import(struct scatterlist_filler *filler,
+					 struct vmedia_dmabuf *import)
+{
+	return scatterlist_filler_add_data(filler, import->sg,
+					   sizeof(*import->sg) * import->nents);
+}
+
+int scatterlist_filler_add_buffer_dmabuf(struct scatterlist_filler *filler,
+					 struct v4l2_buffer *b,
+					 struct vmedia_dmabuf *const *imports)
+{
+	int i;
+	int ret;
+
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		for (i = 0; i < b->length && i < VIDEO_MAX_PLANES; i++) {
+			struct v4l2_plane *plane = &b->m.planes[i];
+
+			if (imports[i] && plane->length > 0) {
+				ret = scatterlist_filler_add_import(filler,
+								    imports[i]);
+				if (ret)
+					return ret;
+			}
+		}
+	} else if (imports[0] && b->length > 0) {
+		ret = scatterlist_filler_add_import(filler, imports[0]);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 /**
  * Add the SG list of a driver-owned bounce buffer: one entry, since a bounce
  * is physically contiguous. Same wire format as a pinned userptr payload

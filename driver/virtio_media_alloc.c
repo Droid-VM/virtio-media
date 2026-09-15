@@ -23,6 +23,7 @@
  * Copyright (c) 2026 DroidVM contributors.
  */
 
+#include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/io.h>
@@ -36,6 +37,9 @@
 
 #include "virtio_media.h"
 #include "virtio_media_alloc.h"
+
+/* The DMABUF import path (VPU_DESIGN.md 7.7) calls dma_buf_* symbols. */
+MODULE_IMPORT_NS("DMA_BUF");
 
 /*
  * Print one line per driver-owned allocation and release: which backend,
@@ -596,6 +600,211 @@ void vmedia_queue_put_dbufs(struct virtio_media_queue_state *queue)
 
 	for (i = 0; i < queue->allocated_bufs; i++)
 		vmedia_buffer_put_dbufs(&queue->buffers[i]);
+}
+
+/*
+ * DMABUF import: the V4L2_MEMORY_DMABUF flavour of the driver-owned
+ * substitution (VPU_DESIGN.md 7.7). See virtio_media_alloc.h for why the SG
+ * list is built from sg_dma_address/sg_dma_len and not from sg_page.
+ */
+
+struct vmedia_dmabuf *vmedia_dmabuf_import(struct virtio_media *vv, int fd,
+					   size_t size, u32 data_offset)
+{
+	struct vmedia_dmabuf *import;
+	struct virtio_media_sg_entry *ents;
+	struct scatterlist *sg;
+	size_t skip = data_offset;
+	size_t need = size;
+	u32 nents = 0, out = 0;
+	int ret, i;
+
+	if (size == 0)
+		return ERR_PTR(-EINVAL);
+
+	import = kzalloc(sizeof(*import), GFP_KERNEL);
+	if (!import)
+		return ERR_PTR(-ENOMEM);
+	import->vv = vv;
+	import->size = size;
+	import->fd = fd;
+
+	/* A non-dma-buf fd is a client error, reported as such before the host. */
+	import->dmabuf = dma_buf_get(fd);
+	if (IS_ERR(import->dmabuf)) {
+		import->dmabuf = NULL;
+		ret = -EINVAL;
+		goto err_free;
+	}
+
+	/*
+	 * The dma-buf must cover the plane; a larger one is fine, the extra is
+	 * ignored. A smaller one cannot back a buffer of the format's size.
+	 */
+	if (import->dmabuf->size < (u64)data_offset + size) {
+		ret = -EINVAL;
+		goto err_put;
+	}
+
+	import->attach = dma_buf_attach(import->dmabuf, vv->dma_dev);
+	if (IS_ERR(import->attach)) {
+		ret = PTR_ERR(import->attach);
+		import->attach = NULL;
+		goto err_put;
+	}
+
+	import->sgt = dma_buf_map_attachment(import->attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(import->sgt)) {
+		ret = PTR_ERR(import->sgt);
+		import->sgt = NULL;
+		goto err_detach;
+	}
+
+	for_each_sgtable_dma_sg(import->sgt, sg, i)
+		nents++;
+	if (nents == 0 || nents > VMEDIA_DBUF_MAX_ENTS) {
+		ret = nents == 0 ? -EINVAL : -ENOMEM;
+		goto err_unmap;
+	}
+
+	ents = kvmalloc_array(nents, sizeof(*ents), GFP_KERNEL | __GFP_ZERO);
+	if (!ents) {
+		ret = -ENOMEM;
+		goto err_unmap;
+	}
+
+	/*
+	 * Trim the DMA runs to [@data_offset, @data_offset + @size): skip the
+	 * offset, take the size. The address is the DMA address, which is the
+	 * guest-physical address on this IOMMU-less transport -- the same wire
+	 * form the driver-owned USERPTR path builds from sg_phys().
+	 */
+	for_each_sgtable_dma_sg(import->sgt, sg, i) {
+		dma_addr_t addr = sg_dma_address(sg);
+		size_t len = sg_dma_len(sg);
+
+		if (skip >= len) {
+			skip -= len;
+			continue;
+		}
+		addr += skip;
+		len -= skip;
+		skip = 0;
+		if (len > need)
+			len = need;
+		ents[out].start = addr;
+		ents[out].len = len;
+		out++;
+		need -= len;
+		if (need == 0)
+			break;
+	}
+	if (need > 0) {
+		/* Fragmented shorter than expected despite the size check. */
+		kvfree(ents);
+		ret = -EINVAL;
+		goto err_unmap;
+	}
+
+	import->sg = ents;
+	import->nents = out;
+	return import;
+
+err_unmap:
+	dma_buf_unmap_attachment(import->attach, import->sgt,
+				 DMA_BIDIRECTIONAL);
+err_detach:
+	dma_buf_detach(import->dmabuf, import->attach);
+err_put:
+	dma_buf_put(import->dmabuf);
+err_free:
+	kfree(import);
+	return ERR_PTR(ret);
+}
+
+void vmedia_dmabuf_release(struct vmedia_dmabuf *import)
+{
+	if (!import)
+		return;
+
+	kvfree(import->sg);
+	if (import->sgt)
+		dma_buf_unmap_attachment(import->attach, import->sgt,
+					 DMA_BIDIRECTIONAL);
+	if (import->attach)
+		dma_buf_detach(import->dmabuf, import->attach);
+	if (import->dmabuf)
+		dma_buf_put(import->dmabuf);
+	kfree(import);
+}
+
+void vmedia_buffer_put_dmabufs(struct virtio_media_buffer *buffer)
+{
+	u32 p;
+
+	for (p = 0; p < VIDEO_MAX_PLANES; p++) {
+		if (buffer->dmabuf[p]) {
+			vmedia_dmabuf_release(buffer->dmabuf[p]);
+			buffer->dmabuf[p] = NULL;
+		}
+	}
+}
+
+void vmedia_queue_put_dmabufs(struct virtio_media_queue_state *queue)
+{
+	size_t i;
+
+	for (i = 0; i < queue->allocated_bufs; i++)
+		vmedia_buffer_put_dmabufs(&queue->buffers[i]);
+}
+
+void vmedia_dmabuf_buffer_to_host(struct v4l2_buffer *b,
+				  struct vmedia_dmabuf *const *imports)
+{
+	u32 i;
+
+	b->memory = V4L2_MEMORY_USERPTR;
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		for (i = 0; i < b->length && i < VIDEO_MAX_PLANES; i++) {
+			if (!imports[i])
+				continue;
+			/*
+			 * Non-zero so scatterlist_filler_add_buffer()'s USERPTR
+			 * fixup keeps the plane length (a zero userptr zeroes
+			 * it); the value itself is opaque, the host uses the SG
+			 * list. data_offset is zeroed: the SG already starts at
+			 * it.
+			 */
+			b->m.planes[i].m.userptr = imports[i]->size;
+			b->m.planes[i].length = imports[i]->size;
+			b->m.planes[i].data_offset = 0;
+		}
+	} else if (imports[0]) {
+		b->m.userptr = imports[0]->size;
+		b->length = imports[0]->size;
+	}
+}
+
+void vmedia_dmabuf_buffer_from_host(struct v4l2_buffer *b,
+				    struct v4l2_plane *planes, u32 max_planes,
+				    struct vmedia_dmabuf *const *imports)
+{
+	u32 i;
+
+	b->memory = V4L2_MEMORY_DMABUF;
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
+		for (i = 0; i < b->length && i < max_planes &&
+			    i < VIDEO_MAX_PLANES;
+		     i++) {
+			if (!imports[i])
+				continue;
+			planes[i].m.fd = imports[i]->fd;
+			planes[i].length = imports[i]->size;
+		}
+	} else if (imports[0]) {
+		b->m.fd = imports[0]->fd;
+		b->length = imports[0]->size;
+	}
 }
 
 /*

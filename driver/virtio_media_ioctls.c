@@ -217,12 +217,22 @@ static int virtio_media_send_wr_ioctl(struct v4l2_fh *fh, u32 ioctl,
  */
 static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 					  struct v4l2_buffer *b,
-					  struct virtio_media_buffer *vbuf)
+					  struct virtio_media_buffer *vbuf,
+					  bool dmabuf_queue)
 {
 	struct video_device *video_dev = fh->vdev;
 	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_session *session = fh_to_session(fh);
 	const bool driver_owned = vbuf && vbuf->dbuf[0];
+	/*
+	 * The V4L2_MEMORY_DMABUF flavour of the driver-owned substitution
+	 * (VPU_DESIGN.md 7.7): the queue is DMABUF towards user-space and
+	 * USERPTR on the wire, exactly like a driver-owned MMAP queue, but the
+	 * SG list comes from a dma-buf the guest imported at QBUF rather than
+	 * from a driver allocation. QUERYBUF has no import yet (vbuf->dmabuf is
+	 * NULL) but its reply memory still has to be rewritten to DMABUF.
+	 */
+	const bool dmabuf = dmabuf_queue && !driver_owned;
 	struct v4l2_plane *planes_backup = NULL;
 	u32 length_backup = 0;
 	struct scatterlist *sgs[64];
@@ -260,6 +270,9 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 	/* Driver-owned planes: USERPTR + cookie towards the host. */
 	if (driver_owned)
 		vmedia_dbuf_buffer_to_host(b, vbuf->dbuf);
+	/* Imported DMABUF planes: USERPTR + the plane sizes towards the host. */
+	else if (dmabuf && vbuf)
+		vmedia_dmabuf_buffer_to_host(b, vbuf->dmabuf);
 
 	/* Command payload (struct v4l2_buffer) */
 	ret = scatterlist_filler_add_buffer(&filler, b);
@@ -277,6 +290,11 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 		if (ioctl_code != VIDIOC_QUERYBUF)
 			ret = scatterlist_filler_add_buffer_dbuf(&filler, b,
 								 vbuf->dbuf);
+	} else if (dmabuf) {
+		/* QUERYBUF has no import to hand over (VPU_DESIGN.md 7.7). */
+		if (ioctl_code != VIDIOC_QUERYBUF && vbuf)
+			ret = scatterlist_filler_add_buffer_dmabuf(
+				&filler, b, vbuf->dmabuf);
 	} else {
 		ret = scatterlist_filler_add_buffer_userptr(&filler, b);
 	}
@@ -348,6 +366,9 @@ out:
 	if (driver_owned)
 		vmedia_dbuf_buffer_from_host(b, b->m.planes, length_backup,
 					     vbuf->dbuf);
+	else if (dmabuf && vbuf)
+		vmedia_dmabuf_buffer_from_host(b, b->m.planes, length_backup,
+					       vbuf->dmabuf);
 	return ret;
 }
 
@@ -631,9 +652,17 @@ static void virtio_media_clear_queue(struct virtio_media *vv,
 	 * it drop an event still in flight for a streamed-off buffer.
 	 */
 
-	/* All buffers are now dequeued. */
+	/*
+	 * All buffers are now dequeued. A STREAMOFF (or the implicit one in
+	 * REQBUFS(0)) releases the queue, so any DMABUF still imported by a
+	 * buffer that was queued but never dequeued is dropped here: the host
+	 * let go of it with the STREAMOFF, and a later QBUF re-imports
+	 * (VPU_DESIGN.md 7.7). Under dqbufs_lock, where the event work reads
+	 * these buffers; the dma-buf unmap may sleep, which a mutex allows.
+	 */
 	for (i = 0; i < queue->allocated_bufs; i++) {
 		queue->buffers[i].buffer.flags = 0;
+		vmedia_buffer_put_dmabufs(&queue->buffers[i]);
 	}
 
 	queue->queued_bufs = 0;
@@ -1060,6 +1089,22 @@ static void virtio_media_fixup_driver_owned_reply(u32 *memory,
 }
 
 /**
+ * The per-queue truth about DMABUF (VPU_DESIGN.md 7.7): the driver imports a
+ * DMABUF buffer as USERPTR, so a queue supports DMABUF exactly when the host
+ * supports USERPTR on it -- which the host answers for both OUTPUT and CAPTURE
+ * of every m2m node. @host_userptr is read from the raw reply before the
+ * driver-owned MMAP fixup strips SUPPORTS_USERPTR from it. Replaces the blanket
+ * mask that used to clear SUPPORTS_DMABUF on every queue.
+ */
+static void virtio_media_fixup_dmabuf_cap(u32 *capabilities, bool host_userptr)
+{
+	if (host_userptr)
+		*capabilities |= V4L2_BUF_CAP_SUPPORTS_DMABUF;
+	else
+		*capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
+}
+
+/**
  * A buffer ioctl must name the memory type its queue was set up with. The
  * driver-owned substitution means the host sees USERPTR on a queue user-space
  * knows as MMAP, so the check cannot be made against what goes on the wire or
@@ -1094,11 +1139,14 @@ static void
 virtio_media_release_queue_bufs(struct virtio_media_queue_state *queue)
 {
 	vmedia_queue_put_dbufs(queue);
+	/* Release any imports still held by buffers that were never dequeued. */
+	vmedia_queue_put_dmabufs(queue);
 	vfree(queue->buffers);
 	queue->buffers = NULL;
 	queue->allocated_bufs = 0;
 	queue->driver_owned = false;
 	queue->memory = 0;
+	queue->num_planes = 0;
 	queue->queued_bufs = 0;
 	INIT_LIST_HEAD(&queue->pending_dqbufs);
 }
@@ -1118,7 +1166,16 @@ static int virtio_media_reqbufs(struct file *file, void *priv_unused,
 	u32 num_planes = 0;
 	const u32 user_memory = b->memory;
 	bool driver_owned = false;
+	/*
+	 * A DMABUF queue is the third flavour of the driver-owned substitution
+	 * (VPU_DESIGN.md 7.7): user-space sees DMABUF, the host sees USERPTR.
+	 * No memory is allocated at REQBUFS -- the guest hands a dma-buf in at
+	 * QBUF -- but the plane sizes are recorded now so QBUF knows how much
+	 * of each import the host (told USERPTR buffers of these sizes) uses.
+	 */
+	const bool dmabuf_q = user_memory == V4L2_MEMORY_DMABUF;
 	bool as_userptr;
+	bool host_userptr;
 	int ret;
 
 	if (!fh)
@@ -1134,7 +1191,8 @@ static int virtio_media_reqbufs(struct file *file, void *priv_unused,
 	 * MMAP on a queue the guest fills: the driver allocates the buffers
 	 * and the host sees a USERPTR queue (VPU_DESIGN.md 5.3 item 1). The
 	 * sizes come from the current format, fetched before anything on the
-	 * host changes so a failure here leaves both sides untouched.
+	 * host changes so a failure here leaves both sides untouched. A DMABUF
+	 * queue needs the same sizes, for the same reason.
 	 */
 	if (user_memory == V4L2_MEMORY_MMAP && b->count > 0) {
 		driver_owned = virtio_media_type_is_driver_owned(b->type);
@@ -1146,25 +1204,36 @@ static int virtio_media_reqbufs(struct file *file, void *priv_unused,
 		} else if (!virtio_media_host_mmap_available(vv)) {
 			return -ENOMEM;
 		}
+	} else if (dmabuf_q && b->count > 0) {
+		ret = virtio_media_queue_plane_sizes(fh, b->type, sizes,
+						     &num_planes);
+		if (ret)
+			return ret;
 	}
 
 	/*
 	 * REQBUFS(0) frees whatever the queue holds, and the type it must name
 	 * is the one the host has: USERPTR for a queue whose MMAP buffers this
-	 * driver owns, whatever user-space passed. A backend that checks
-	 * q->memory (v4l2-proxy does) returns -EINVAL otherwise (review
-	 * contract 3).
+	 * driver owns, or a DMABUF queue, whatever user-space passed. A backend
+	 * that checks q->memory (v4l2-proxy does) returns -EINVAL otherwise
+	 * (review contract 3).
 	 */
-	as_userptr = b->count > 0 ? driver_owned : queue->driver_owned;
+	as_userptr = b->count > 0 ?
+			     (driver_owned || dmabuf_q) :
+			     (queue->driver_owned ||
+			      queue->memory == V4L2_MEMORY_DMABUF);
 
 	if (as_userptr)
 		b->memory = V4L2_MEMORY_USERPTR;
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_REQBUFS, b, sizeof(*b),
 					 sizeof(*b));
+	/* Read before the MMAP fixup below strips SUPPORTS_USERPTR. */
+	host_userptr = b->capabilities & V4L2_BUF_CAP_SUPPORTS_USERPTR;
 	if (as_userptr)
 		virtio_media_fixup_driver_owned_reply(&b->memory,
 						      &b->capabilities,
 						      user_memory);
+	virtio_media_fixup_dmabuf_cap(&b->capabilities, host_userptr);
 	if (ret)
 		return ret;
 
@@ -1222,6 +1291,17 @@ static int virtio_media_reqbufs(struct file *file, void *priv_unused,
 		if (ret)
 			goto err_release_host;
 		queue->driver_owned = true;
+	} else if (b->count > 0 && dmabuf_q) {
+		/*
+		 * No allocation: record the plane sizes QBUF validates each
+		 * import against. Safe outside dqbufs_lock for the same reason
+		 * the dbuf backing is (QBUF cannot run before this returns).
+		 */
+		u32 i;
+
+		queue->num_planes = num_planes;
+		for (i = 0; i < num_planes && i < VIDEO_MAX_PLANES; i++)
+			queue->plane_sizes[i] = sizes[i];
 	}
 
 	/*
@@ -1231,9 +1311,6 @@ static int virtio_media_reqbufs(struct file *file, void *priv_unused,
 	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
 		session->uses_mplane = true;
 	}
-
-	/* TODO remove once we support DMABUFs */
-	b->capabilities &= ~V4L2_BUF_CAP_SUPPORTS_DMABUF;
 
 	return 0;
 
@@ -1289,9 +1366,12 @@ static int virtio_media_querybuf(struct file *file, void *priv_unused,
 	/*
 	 * The host answers with its view (flags, timestamps, ...); for a
 	 * driver-owned buffer the memory type, offset and length are then
-	 * replaced with ours on the way back (VPU_DESIGN.md 5.3 item 2).
+	 * replaced with ours on the way back (VPU_DESIGN.md 5.3 item 2), and
+	 * for a DMABUF queue the memory type is set back to DMABUF (7.7).
 	 */
-	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QUERYBUF, b, buffer);
+	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QUERYBUF, b, buffer,
+					     queue->memory ==
+						     V4L2_MEMORY_DMABUF);
 	if (ret)
 		return ret;
 
@@ -1316,7 +1396,11 @@ static int virtio_media_create_bufs(struct file *file, void *priv_unused,
 	u32 num_planes = 0;
 	u32 type = b->format.type;
 	const u32 user_memory = b->memory;
+	/* A DMABUF queue is USERPTR on the wire, as in REQBUFS (7.7). */
+	const bool dmabuf_q = user_memory == V4L2_MEMORY_DMABUF;
 	bool driver_owned = false;
+	bool as_userptr;
+	bool host_userptr;
 	u32 last_buf;
 	int ret;
 
@@ -1345,14 +1429,18 @@ static int virtio_media_create_bufs(struct file *file, void *priv_unused,
 			return -ENOMEM;
 	}
 
-	if (driver_owned)
+	as_userptr = driver_owned || dmabuf_q;
+	if (as_userptr)
 		b->memory = V4L2_MEMORY_USERPTR;
 	ret = virtio_media_send_wr_ioctl(fh, VIDIOC_CREATE_BUFS, b, sizeof(*b),
 					 sizeof(*b));
-	if (driver_owned)
+	/* Read before the MMAP fixup strips SUPPORTS_USERPTR. */
+	host_userptr = b->capabilities & V4L2_BUF_CAP_SUPPORTS_USERPTR;
+	if (as_userptr)
 		virtio_media_fixup_driver_owned_reply(&b->memory,
 						      &b->capabilities,
 						      user_memory);
+	virtio_media_fixup_dmabuf_cap(&b->capabilities, host_userptr);
 	if (ret)
 		return ret;
 
@@ -1429,7 +1517,95 @@ static int virtio_media_create_bufs(struct file *file, void *priv_unused,
 			return ret;
 		}
 		queue->driver_owned = true;
+	} else if (dmabuf_q) {
+		/*
+		 * No allocation; record the plane sizes QBUF validates each
+		 * import against, from the host's (possibly adjusted) reply.
+		 */
+		u32 i;
+
+		ret = vmedia_dbuf_plane_sizes(&b->format, sizes, &num_planes);
+		if (ret) {
+			v4l2_err(&vv->v4l2_dev,
+				 "cannot size %u DMABUF buffers: %d\n",
+				 b->count, ret);
+			return ret;
+		}
+		queue->num_planes = num_planes;
+		for (i = 0; i < num_planes && i < VIDEO_MAX_PLANES; i++)
+			queue->plane_sizes[i] = sizes[i];
 	}
+
+	return 0;
+}
+
+/**
+ * Import every plane's dma-buf for a QBUF/PREPARE_BUF on a DMABUF queue
+ * (VPU_DESIGN.md 7.7). Slots already imported by a preceding PREPARE_BUF are
+ * left untouched; the ones this call creates are committed to @buffer only
+ * once all planes succeeded, so a mid-way failure leaves the buffer exactly
+ * as it was (no half-imported state, no touched host). The fd of each plane
+ * is taken from @b; the usable size is the queue's recorded plane size (the
+ * USERPTR length the host was told), and a shorter dma-buf is refused before
+ * the host is reached.
+ */
+static int virtio_media_import_dmabufs(struct virtio_media *vv,
+				       struct virtio_media_queue_state *queue,
+				       struct virtio_media_buffer *buffer,
+				       struct v4l2_buffer *b)
+{
+	struct vmedia_dmabuf *imported[VIDEO_MAX_PLANES] = {};
+	const bool mp = V4L2_TYPE_IS_MULTIPLANAR(b->type);
+	u32 n = queue->num_planes;
+	u32 i;
+	int ret;
+
+	if (n == 0 || n > VIDEO_MAX_PLANES)
+		return -EINVAL;
+	/* A multiplanar QBUF must carry a plane slot per format plane. */
+	if (mp && b->length < n)
+		return -EINVAL;
+
+	for (i = 0; i < n; i++) {
+		struct vmedia_dmabuf *import;
+		int fd;
+		u32 data_offset;
+
+		/* Kept from a preceding PREPARE_BUF: reuse, do not re-import. */
+		if (buffer->dmabuf[i])
+			continue;
+
+		if (mp) {
+			fd = b->m.planes[i].m.fd;
+			data_offset = b->m.planes[i].data_offset;
+		} else {
+			fd = b->m.fd;
+			data_offset = 0;
+		}
+
+		import = vmedia_dmabuf_import(vv, fd, queue->plane_sizes[i],
+					      data_offset);
+		if (IS_ERR(import)) {
+			ret = PTR_ERR(import);
+			/*
+			 * Rate-limited like the driver-owned allocation
+			 * failure (D51): a client that keeps re-queueing a bad
+			 * fd must not flood the ring.
+			 */
+			pr_warn_ratelimited(
+				"virtio-media: DMABUF import of fd %d (buffer %u plane %u) failed: %d\n",
+				fd, b->index, i, ret);
+			while (i-- > 0)
+				vmedia_dmabuf_release(imported[i]);
+			return ret;
+		}
+		imported[i] = import;
+	}
+
+	/* All planes imported: commit the ones this call created. */
+	for (i = 0; i < n; i++)
+		if (imported[i])
+			buffer->dmabuf[i] = imported[i];
 
 	return 0;
 }
@@ -1437,10 +1613,13 @@ static int virtio_media_create_bufs(struct file *file, void *priv_unused,
 static int virtio_media_prepare_buf(struct file *file, void *priv_unused,
 				    struct v4l2_buffer *b)
 {
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct v4l2_fh *fh = file->private_data;
 	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
+	bool dmabuf_queue;
 	int i, ret;
 
 	if (!fh)
@@ -1456,6 +1635,7 @@ static int virtio_media_prepare_buf(struct file *file, void *priv_unused,
 	if (ret)
 		return ret;
 	buffer = &queue->buffers[b->index];
+	dmabuf_queue = queue->memory == V4L2_MEMORY_DMABUF;
 
 	buffer->buffer.m = b->m;
 	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
@@ -1465,9 +1645,24 @@ static int virtio_media_prepare_buf(struct file *file, void *priv_unused,
 			buffer->planes[i].m = b->m.planes[i].m;
 	}
 
-	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_PREPARE_BUF, b, buffer);
-	if (ret)
+	/*
+	 * The dma-buf(s) must be imported now: PREPARE_BUF sends the SG list
+	 * to the host just as QBUF does (the wire buffer is USERPTR), and the
+	 * following QBUF reuses the import.
+	 */
+	if (dmabuf_queue) {
+		ret = virtio_media_import_dmabufs(vv, queue, buffer, b);
+		if (ret)
+			return ret;
+	}
+
+	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_PREPARE_BUF, b, buffer,
+					     dmabuf_queue);
+	if (ret) {
+		if (dmabuf_queue)
+			vmedia_buffer_put_dmabufs(buffer);
 		return ret;
+	}
 
 	buffer->buffer.flags = V4L2_BUF_FLAG_PREPARED;
 
@@ -1477,11 +1672,14 @@ static int virtio_media_prepare_buf(struct file *file, void *priv_unused,
 static int virtio_media_qbuf(struct file *file, void *priv_unused,
 			     struct v4l2_buffer *b)
 {
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct v4l2_fh *fh = file->private_data;
 	struct virtio_media_session *session;
 	struct virtio_media_queue_state *queue;
 	struct virtio_media_buffer *buffer;
 	bool prepared;
+	bool dmabuf_queue;
 	u32 old_flags;
 	int i, ret;
 
@@ -1499,6 +1697,7 @@ static int virtio_media_qbuf(struct file *file, void *priv_unused,
 		return ret;
 	buffer = &queue->buffers[b->index];
 	prepared = buffer->buffer.flags & V4L2_BUF_FLAG_PREPARED;
+	dmabuf_queue = queue->memory == V4L2_MEMORY_DMABUF;
 
 	/*
 	 * Store the buffer and plane `m` information so we can retrieve it again
@@ -1513,6 +1712,18 @@ static int virtio_media_qbuf(struct file *file, void *priv_unused,
 				buffer->planes[i].m = b->m.planes[i].m;
 		}
 	}
+
+	/*
+	 * Import the plane dma-buf(s) before the host sees the QBUF, so a bad
+	 * fd or a too-small dma-buf fails cleanly with nothing queued
+	 * (VPU_DESIGN.md 7.7). A prepared buffer already holds its import.
+	 */
+	if (dmabuf_queue && !prepared) {
+		ret = virtio_media_import_dmabufs(vv, queue, buffer, b);
+		if (ret)
+			return ret;
+	}
+
 	/*
 	 * Flag and count the buffer as queued under dqbufs_lock *before* the
 	 * host sees the QBUF: the completion event can arrive before this
@@ -1527,7 +1738,8 @@ static int virtio_media_qbuf(struct file *file, void *priv_unused,
 	queue->queued_bufs += 1;
 	mutex_unlock(&session->dqbufs_lock);
 
-	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QBUF, b, buffer);
+	ret = virtio_media_send_buffer_ioctl(fh, VIDIOC_QBUF, b, buffer,
+					     dmabuf_queue);
 	if (ret) {
 		/* Rollback the previous flags as the buffer is not queued. */
 		mutex_lock(&session->dqbufs_lock);
@@ -1535,6 +1747,12 @@ static int virtio_media_qbuf(struct file *file, void *priv_unused,
 		if (queue->queued_bufs > 0)
 			queue->queued_bufs -= 1;
 		mutex_unlock(&session->dqbufs_lock);
+		/*
+		 * Drop the import this QBUF made; a prepared buffer keeps its
+		 * import for a later QBUF, so leave that one alone.
+		 */
+		if (dmabuf_queue && !prepared)
+			vmedia_buffer_put_dmabufs(buffer);
 		return ret;
 	}
 
@@ -1620,6 +1838,18 @@ static int virtio_media_dqbuf(struct file *file, void *priv_unused,
 	if (V4L2_TYPE_IS_CAPTURE(b->type) && b->flags & V4L2_BUF_FLAG_LAST) {
 		queue->is_capture_last = true;
 	}
+
+	/*
+	 * The buffer is out of the host's hands now, so release the DMABUF
+	 * import(s) it held (VPU_DESIGN.md 7.7). The user's fd and DMABUF
+	 * memory type were already restored into @b (the event work's
+	 * vmedia_dmabuf_buffer_from_host plus the preserved m union). A later
+	 * QBUF of this buffer re-imports. Off dqbufs_lock: the buffer is no
+	 * longer on any list and its flags are DONE-cleared, so the event work
+	 * will not touch it.
+	 */
+	if (dqbuf->dmabuf[0])
+		vmedia_buffer_put_dmabufs(dqbuf);
 
 	return 0;
 }
@@ -1845,6 +2075,12 @@ const struct v4l2_ioctl_ops virtio_media_ioctl_ops = {
 	.vidioc_reqbufs = virtio_media_reqbufs,
 	.vidioc_querybuf = virtio_media_querybuf,
 	.vidioc_qbuf = virtio_media_qbuf,
+	/*
+	 * EXPBUF stays unimplemented: route B imports a GPU-allocated dma-buf
+	 * into the decoder (V4L2_MEMORY_DMABUF above), it does not export the
+	 * decoder's own buffers, so no exporter is needed (VPU_DESIGN.md 7.7,
+	 * "route B"; A -- exporting -- is the fallback that is not built).
+	 */
 	.vidioc_expbuf = NULL,
 	.vidioc_dqbuf = virtio_media_dqbuf,
 	.vidioc_create_bufs = virtio_media_create_bufs,

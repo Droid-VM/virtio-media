@@ -14,6 +14,7 @@
 #include "session.h"
 
 struct vmedia_dbuf;
+struct vmedia_dmabuf;
 struct vmedia_bounce;
 
 /**
@@ -101,6 +102,21 @@ int scatterlist_filler_add_buffer_userptr(struct scatterlist_filler *filler,
 int scatterlist_filler_add_buffer_dbuf(struct scatterlist_filler *filler,
 				       struct v4l2_buffer *b,
 				       struct vmedia_dbuf *const *dbufs);
+
+/**
+ * scatterlist_filler_add_buffer_dmabuf - Add an imported DMABUF buffer's SG
+ * lists to the list.
+ *
+ * The counterpart of scatterlist_filler_add_buffer_dbuf() for the
+ * V4L2_MEMORY_DMABUF flavour (VPU_DESIGN.md 7.7): the guest-physical SG list
+ * was built from the dma-buf's sg_table at import time, so no page walk
+ * happens here and the shadow buffer is not used.
+ *
+ * @imports: the buffer's per-plane imports; planes without one are skipped.
+ */
+int scatterlist_filler_add_buffer_dmabuf(struct scatterlist_filler *filler,
+					 struct v4l2_buffer *b,
+					 struct vmedia_dmabuf *const *imports);
 
 /**
  * scatterlist_filler_add_ext_ctrls - Add a v4l2_ext_controls and its controls to the list.

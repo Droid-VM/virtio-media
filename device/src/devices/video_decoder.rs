@@ -1061,6 +1061,8 @@ where
         index: usize,
     ) -> IoctlResult<()> {
         let sizeimage = session.capture_sizeimage();
+        // Resolve the CAPTURE stride before the mutable borrow of `entry` below (E0502).
+        let capture_stride = session.capture_bytesperline() as usize;
         let entry = session.output.buffers.get_mut(index).ok_or(libc::EINVAL)?;
         let len = entry.capacity() as usize;
         let ptr = entry.data_ptr().ok_or(libc::EIO)?;
@@ -1088,7 +1090,7 @@ where
             len,
             // The stride the backend must write the NV12 at: the tight coded width, or the wider
             // stride the client negotiated via S_FMT(CAPTURE) for a GPU-importable bo (VA2g).
-            stride: session.capture_bytesperline() as usize,
+            stride: capture_stride,
         })?;
         entry.lent = true;
         Ok(())

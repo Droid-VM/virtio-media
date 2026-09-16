@@ -255,6 +255,13 @@ pub struct OutputBuffer {
     pub ptr: SendPtr,
     /// Bytes available at `ptr`: at least one NV12 frame of the coded size.
     pub len: usize,
+    /// The luma stride (`bytesperline`) the frame must be written at: the coded width, or a wider
+    /// stride the client negotiated via `S_FMT(CAPTURE)` (VA2g). A backend that repacks into this
+    /// buffer must lay out the NV12 at this stride so the guest's own dma-buf -- whose GPU-side
+    /// allocation rounds the row up (GBM's 64 B alignment) -- has its export pitch, its bo stride
+    /// and the data's row pitch all equal, which is what a zero-copy GL importer (turnip) requires
+    /// at a non-16-aligned width. Equals the coded width when the client did not pad.
+    pub stride: usize,
 }
 
 /// Something the backend reports on its event path.
@@ -685,6 +692,16 @@ pub struct VideoDecoderSession<GM, S> {
     /// The CAPTURE frame size: the `S_FMT(OUTPUT)` placeholder until the backend parses the
     /// stream, then the value from [`DecoderEvent::FormatChanged`].
     coded_size: (u32, u32),
+    /// A CAPTURE luma stride wider than the coded width that the client asked for via
+    /// `S_FMT(CAPTURE)` (VA2g). `None` means the tight default (`bytesperline == coded width`).
+    /// A guest that backs CAPTURE with GPU-importable dma-bufs (libva-v4l2's zero-copy path) must
+    /// export the buffer at its bo's own row stride, which GBM rounds up to 64 B; at a
+    /// non-16-aligned width (854 -> 896) the tight stride and the bo stride diverge and the GL
+    /// importer rejects the mismatch. The client requests the bo stride here; the device adopts it
+    /// (so `G_FMT`/`sizeimage` report it) and lends every CAPTURE buffer at it, so the backend
+    /// writes the NV12 at the aligned stride and the data pitch, bo stride and export pitch match.
+    /// Cleared on a coded-size change (a new size means a new bo and a fresh negotiation).
+    capture_stride_override: Option<u32>,
     /// The OUTPUT bitstream buffer size, client-set via `S_FMT(OUTPUT)` or defaulted.
     output_sizeimage: u32,
     crop: CropRectangle,
@@ -759,9 +776,17 @@ impl<GM, S> VideoDecoderSession<GM, S> {
         }
     }
 
-    /// The CAPTURE (NV12) `sizeimage` for the current coded size.
+    /// The CAPTURE luma stride: the client-negotiated padded stride (VA2g) or the tight coded
+    /// width. Never narrower than the coded width, so a frame always fits row for row.
+    fn capture_bytesperline(&self) -> u32 {
+        self.capture_stride_override
+            .filter(|&s| s >= self.coded_size.0)
+            .unwrap_or(self.coded_size.0)
+    }
+
+    /// The CAPTURE (NV12) `sizeimage` for the current coded size and (possibly padded) stride.
     fn capture_sizeimage(&self) -> u32 {
-        nv12_sizeimage(self.coded_size.0, self.coded_size.1)
+        nv12_sizeimage(self.capture_bytesperline(), self.coded_size.1)
     }
 
     fn sizeimage(&self, direction: QueueDirection) -> u32 {
@@ -777,7 +802,9 @@ impl<GM, S> VideoDecoderSession<GM, S> {
         let (pixelformat, bytesperline, queue) = match direction {
             QueueDirection::Output => (self.coded_format.to_u32(), 0, QueueType::VideoOutputMplane),
             QueueDirection::Capture => {
-                (NV12.to_u32(), self.coded_size.0, QueueType::VideoCaptureMplane)
+                // `bytesperline` is the (possibly client-padded, VA2g) luma stride; `width` below
+                // stays the visible coded width, so the padding rides as stride, not as pixels.
+                (NV12.to_u32(), self.capture_bytesperline(), QueueType::VideoCaptureMplane)
             }
         };
         let mut pix_mp = bindings::v4l2_pix_format_mplane {
@@ -1059,6 +1086,9 @@ where
             index: index as u32,
             ptr: SendPtr(ptr),
             len,
+            // The stride the backend must write the NV12 at: the tight coded width, or the wider
+            // stride the client negotiated via S_FMT(CAPTURE) for a GPU-importable bo (VA2g).
+            stride: session.capture_bytesperline() as usize,
         })?;
         entry.lent = true;
         Ok(())
@@ -1279,6 +1309,11 @@ where
                 // real resolution change, where the client reallocates and restarts CAPTURE).
                 session.format_change_pending =
                     !(session.state.capture_streaming && session.coded_size == coded_size);
+                // A new coded size means the guest reallocates CAPTURE (a new bo, a fresh stride to
+                // negotiate), so a stride padded for the old size no longer applies (VA2g).
+                if session.coded_size != coded_size {
+                    session.capture_stride_override = None;
+                }
                 session.coded_size = coded_size;
                 session.crop = CropRectangle::FromStream(visible_rect);
                 // The announce may raise the CAPTURE minimum above the count the client is already
@@ -1385,6 +1420,7 @@ where
             output: Queue::default(),
             coded_format: fourcc,
             coded_size,
+            capture_stride_override: None,
             output_sizeimage: MIN_BITSTREAM_SIZE,
             crop: CropRectangle::Settable(v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1)),
             min_capture_buffers,
@@ -1647,8 +1683,22 @@ where
                 Ok(adjusted)
             }
             QueueDirection::Capture => {
-                // The client may set the CAPTURE format but the decoder only offers NV12 at the
-                // established coded size; the pixel format is not negotiable.
+                // The decoder only offers NV12 at the established coded size; the pixel format is
+                // not negotiable. The luma stride is: a guest that will export CAPTURE buffers to
+                // the GPU (libva-v4l2's zero-copy path) needs the device to write the NV12 at the
+                // guest bo's own row stride, which GBM rounds up to 64 B. At a non-16-aligned width
+                // the tight stride (== the coded width) and the bo stride diverge and the GL
+                // importer rejects it, so the client asks here for the wider stride and the device
+                // adopts it: `G_FMT`/`sizeimage` then report it and every lent CAPTURE buffer is
+                // written at it (VA2g). A stride wider than twice the width, or one no wider than
+                // the tight default, is rejected -- the tight stride stands. `S_FMT` before the
+                // CAPTURE queue is allocated (libva negotiates during provisioning), so no lent
+                // buffer's geometry changes underneath it.
+                // SAFETY: multi-planar.
+                let asked = unsafe { format.fmt.pix_mp }.plane_fmt[0].bytesperline;
+                session.capture_stride_override =
+                    (asked > session.coded_size.0 && asked <= session.coded_size.0.saturating_mul(2))
+                        .then_some(asked);
                 Ok(session.format(QueueDirection::Capture))
             }
         }

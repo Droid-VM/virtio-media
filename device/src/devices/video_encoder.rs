@@ -40,8 +40,17 @@
 //! Buffers are guest-owned (`USERPTR`) or host-owned (`MMAP`, from the device's
 //! [`VirtioMediaBufferAllocator`] -- the `media_host` pool on DroidVM): a raw `OUTPUT` frame is
 //! guest-owned in the usual mode (`VPU_DESIGN.md` §2.1), a `CAPTURE` bitstream buffer is
-//! host-owned unless `driver_owned_queues=all`. Only one encoding session per device instance
-//! is allowed; a second session's `REQBUFS`/`CREATE_BUFS` is refused with `EBUSY`.
+//! host-owned unless `driver_owned_queues=all`.
+//!
+//! One guest `open()` is one encoding session, and sessions are independent: each holds its own
+//! backend session -- its own codec -- its own two queues, its own buffers out of the device's
+//! pool, its own `MMAP` offsets (unique device-wide), its own formats, frame rate, crop, control
+//! values and drain state, and its own events, tagged with its id. A second session provisions
+//! and streams while the first still holds buffers and encodes. Nothing device-wide gates that;
+//! what bounds it is the two real resources: the buffer pool, which answers `ENOMEM` once a
+//! `REQBUFS`/`CREATE_BUFS` no longer fits (D73), and the host's codec store, whose refusal the
+//! backend passes through as the errno it gave (`EBUSY` out of
+//! [`VideoEncoderBackend::new_session`] or [`VideoEncoderBackendSession::start`]).
 //!
 //! # Threads and buffers
 //!
@@ -1363,6 +1372,13 @@ impl<GM, S> VideoEncoderSession<GM, S> {
 }
 
 /// A stateful V4L2 video encoder over a [`VideoEncoderBackend`]. See the module documentation.
+///
+/// What lives here is what every session shares -- the backend, the event queue, the guest and
+/// host mappers, the buffer pool, the one `MMAP` offset space and the control *table* built from
+/// the capabilities (its definitions, not its values). An encode does not: a session (one guest
+/// `open()`) keeps its codec, queues, buffers, formats, frame rate, control values and drain
+/// state in [`VideoEncoderSession`], and several run side by side. The ceilings are the pool
+/// (`ENOMEM`) and whatever the host's codec store refuses (`EBUSY`, from the backend).
 pub struct VideoEncoder<
     B: VideoEncoderBackend,
     Q: VirtioMediaEventQueue,
@@ -1379,9 +1395,6 @@ pub struct VideoEncoder<
     allocator: A,
     /// Freed `MMAP` buffers the guest still maps.
     retired: RetiredBuffers,
-    /// The one session allowed to hold buffers: one encode at a time, `EBUSY` for a second
-    /// (`v4l2-compliance` checks a second session is refused).
-    active_session: Option<u32>,
     /// The controls, sorted by id, built from the capabilities.
     controls: Vec<CtrlDef>,
 }
@@ -1403,7 +1416,6 @@ where
             mmap_manager: MmapMappingManager::from(mapper),
             allocator,
             retired: RetiredBuffers::new(),
-            active_session: None,
             controls,
         }
     }
@@ -2175,9 +2187,6 @@ where
     }
 
     fn close_session(&mut self, mut session: Self::Session) {
-        if self.active_session == Some(session.id) {
-            self.active_session = None;
-        }
         // The backend first, so no thread is touching a buffer that goes away below.
         session.backend.stop();
         session.codec_started = false;
@@ -2518,10 +2527,6 @@ where
         if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
         }
-        match self.active_session {
-            Some(id) if id != session.id => return Err(libc::EBUSY),
-            _ => (),
-        }
         // `REQBUFS(0)` is an implicit `STREAMOFF`; any other count on a streaming queue is
         // refused, as vb2 does, because its buffers may be lent. A dead session may free, never
         // allocate: pool space an encode can never use (review-m6 R6-11's shape).
@@ -2575,9 +2580,6 @@ where
                 "REQBUFS",
             )?;
             session.queue_mut(queue)?.memory = Some(memory);
-            self.active_session = Some(session.id);
-        } else if !session.has_buffers() {
-            self.active_session = None;
         }
 
         Ok(v4l2_requestbuffers {
@@ -2606,10 +2608,6 @@ where
         }
         if session.dead {
             return Err(libc::ENODEV);
-        }
-        match self.active_session {
-            Some(id) if id != session.id => return Err(libc::EBUSY),
-            _ => (),
         }
         // `CREATE_BUFS` is the one call where the guest sizes the buffers itself, so the format
         // it hands over is checked rather than adjusted (D6.2/D9, as the loopback and camera do):
@@ -2663,7 +2661,6 @@ where
                 "CREATE_BUFS",
             )?;
             session.queue_mut(queue)?.memory = Some(memory);
-            self.active_session = Some(session.id);
         }
 
         Ok(v4l2_create_buffers {

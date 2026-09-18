@@ -14,6 +14,7 @@
 //! ordering invariants and the `v4l2-compliance` probes.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -947,6 +948,22 @@ fn collect_capture(r: &mut Rig, s: &mut Session, n: usize) {
     }
 }
 
+/// Drive `process_events` for one session until it has produced `n` CAPTURE buffers, and return
+/// them in order. The rig's event log is device-wide and a `DQBUF` event does not carry its
+/// session id, so each batch is sliced off the log around the one `process_events` call that made
+/// it -- that call only ever drains the session it is handed, which is what lets a test with two
+/// sessions tell whose coded frames these are.
+fn collect_capture_for(r: &mut Rig, s: &mut Session, n: usize) -> Vec<V4l2Buffer> {
+    let mut packets = Vec::new();
+    while packets.len() < n {
+        assert!(wait_ready(s), "no CAPTURE buffer within 2s");
+        let mark = r.events.borrow().len();
+        process(&mut r.device, s);
+        packets.extend(dequeued_on(&r.events.borrow()[mark..], CAPTURE));
+    }
+    packets
+}
+
 /// Drive `process_events` until `n` OUTPUT buffers have come back.
 fn collect_output(r: &mut Rig, s: &mut Session, n: usize) {
     while dequeued_on(&r.events.borrow(), OUTPUT).len() < n {
@@ -1004,6 +1021,24 @@ fn capture_bytes(s: &Session, index: usize, len: usize) -> Vec<u8> {
     } else {
         panic!("not a host-owned CAPTURE buffer");
     }
+}
+
+/// The device-wide `MMAP` offset a host-owned buffer was registered at.
+fn host_offset(buffer: &Buffer<FakeMapping>) -> u32 {
+    match &buffer.backing {
+        Backing::Host { offset, .. } => *offset,
+        _ => panic!("not a host-owned buffer"),
+    }
+}
+
+/// The coded units sitting in a session's CAPTURE buffer, as the packet that was dequeued from
+/// it describes them.
+fn coded_units(s: &Session, packet: &V4l2Buffer) -> Vec<Unit> {
+    parse_units(&capture_bytes(
+        s,
+        packet.index() as usize,
+        *packet.get_first_plane().bytesused as usize,
+    ))
 }
 
 /// Queue a frame with luma `luma` and timestamp `n` on OUTPUT buffer `index` (MMAP).
@@ -1227,6 +1262,9 @@ fn enumerate_controls(r: &mut Rig, s: &Session) -> Vec<u32> {
 /// Take a session from OPEN to both queues streaming at 320x240 H.264, MMAP buffers (four on
 /// each queue, the CAPTURE ones queued), and return the CAPTURE `sizeimage`.
 fn start_streaming(r: &mut Rig, s: &mut Session) -> u32 {
+    // Relative, not absolute: `started` is device-wide, so a session brought up while another
+    // already streams must only check that *its* codec was created.
+    let codecs_before = r.log.lock().unwrap().started.len();
     r.device.s_fmt(s, CAPTURE, capture_format(H264, 0)).unwrap();
     r.device
         .s_fmt(s, OUTPUT, output_format(NV12, SIZE.0, SIZE.1))
@@ -1251,7 +1289,7 @@ fn start_streaming(r: &mut Rig, s: &mut Session) -> u32 {
     r.device.streamon(s, CAPTURE).unwrap();
     assert_eq!(
         r.log.lock().unwrap().started.len(),
-        1,
+        codecs_before + 1,
         "codec created once both stream"
     );
     sizeimage
@@ -3144,43 +3182,279 @@ fn lifecycle_invariants_join_the_backend_before_freeing() {
     );
 }
 
-/// One encode at a time: a second session's `REQBUFS`/`CREATE_BUFS` is refused with `EBUSY` while
-/// the first holds buffers, and succeeds once it lets go.
+/// One guest `open()` is one encode session and sessions are independent: both provision OUTPUT
+/// and CAPTURE, both stream, each codec is configured from its own session's controls, each
+/// encodes its own raw frames into its own bitstream buffers, and closing one leaves the other
+/// streaming with everything it holds intact.
+///
+/// The device used to let one session hold buffers at a time and answered a second's
+/// `REQBUFS`/`CREATE_BUFS` with `EBUSY`, for a `v4l2-compliance` check that never applied to it:
+/// `testReqBufs` does require `EBUSY` from a second `open()` of the node
+/// (`v4l2-test-buffers.cpp:788-792,856`), but inside `if (!node->is_m2m)`, and this encoder
+/// advertises `V4L2_CAP_VIDEO_M2M_MPLANE`. P-6b took the same gate off the decoder after
+/// `P6b-verify` §3.2/§6.1 measured what it cost a libva that opens the node once per context.
 #[test]
-fn a_second_session_is_refused_while_one_holds_buffers() {
+fn two_sessions_encode_side_by_side() {
     let mut r = rig();
-    let mut s = session(&mut r.device);
-    r.device
-        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 2)
-        .unwrap();
+    let mut a = new_session(&mut r.device, 0);
+    let a_sizeimage = start_streaming(&mut r, &mut a);
 
-    let mut other = new_session(&mut r.device, 1);
+    // The second session provisions and streams while the first holds buffers and streams: its
+    // `REQBUFS(OUTPUT)` is the call the gate refused. Its GOP size, set before its codec exists,
+    // is its own.
+    let mut b = new_session(&mut r.device, 1);
+    assert_eq!(r.device.s_ctrl(&mut b, CID_GOP, 7).unwrap().value, 7);
+    let b_sizeimage = start_streaming(&mut r, &mut b);
+    assert_eq!(a_sizeimage, b_sizeimage);
+    assert!(
+        a.state.output_streaming && a.state.capture_streaming,
+        "A still streams"
+    );
+    assert!(
+        b.state.output_streaming && b.state.capture_streaming,
+        "B streams too"
+    );
+    assert_eq!((a.input.buffers.len(), a.output.buffers.len()), (4, 4));
+    assert_eq!((b.input.buffers.len(), b.output.buffers.len()), (4, 4));
+    let configs = r.log.lock().unwrap().started.clone();
+    assert_eq!(configs.len(), 2, "two codecs are running at once");
+    assert_eq!(
+        (configs[0].gop_size, configs[1].gop_size),
+        (30, 7),
+        "each codec was configured from its own session's control values"
+    );
+
+    // Nothing is shared: the sixteen buffers are sixteen distinct `MMAP` offsets.
+    let offsets: HashSet<u32> = a
+        .input
+        .buffers
+        .iter()
+        .chain(a.output.buffers.iter())
+        .chain(b.input.buffers.iter())
+        .chain(b.output.buffers.iter())
+        .map(host_offset)
+        .collect();
+    assert_eq!(
+        offsets.len(),
+        16,
+        "every buffer of both sessions has its own offset"
+    );
+
+    // And a control that *does* change under a running codec changes one session only.
+    let b_bitrate = r.device.g_ctrl(&b, CID_BITRATE).unwrap().value;
     assert_eq!(
         r.device
-            .reqbufs(&mut other, OUTPUT, MemoryType::Mmap, 1)
-            .err(),
-        Some(libc::EBUSY)
+            .s_ctrl(&mut a, CID_BITRATE, 8_000_000)
+            .unwrap()
+            .value,
+        8_000_000
     );
-    let big = capture_format(H264, 1 << 20);
+    assert_eq!(
+        r.device.g_ctrl(&b, CID_BITRATE).unwrap().value,
+        b_bitrate,
+        "B's bitrate is not A's"
+    );
+
+    // A different raw frame into each, at the same time: neither coded frame lands in the
+    // other's buffers.
+    queue_frame(&mut r, &mut a, 0, 0x20, 0);
+    queue_frame(&mut r, &mut b, 0, 0x40, 0);
+    let a_packet = collect_capture_for(&mut r, &mut a, 1).remove(0);
+    let b_packet = collect_capture_for(&mut r, &mut b, 1).remove(0);
+    let a_frame = Unit::Frame {
+        key: true,
+        frame_no: 0,
+        digest: digest_of(0x20, SIZE),
+    };
+    let b_frame = Unit::Frame {
+        key: true,
+        frame_no: 0,
+        digest: digest_of(0x40, SIZE),
+    };
+    assert_eq!(
+        coded_units(&a, &a_packet),
+        vec![Unit::Sps, Unit::Pps, a_frame],
+        "A encoded A's frame"
+    );
+    assert_eq!(
+        coded_units(&b, &b_packet),
+        vec![Unit::Sps, Unit::Pps, b_frame],
+        "B encoded B's frame"
+    );
+    assert_eq!(
+        *r.log.lock().unwrap().released_while_capture_active.borrow(),
+        0
+    );
+
+    // Closing B leaves A streaming, with its buffers where they were and its coded frame intact.
+    let a_offsets: Vec<u32> = a
+        .input
+        .buffers
+        .iter()
+        .chain(a.output.buffers.iter())
+        .map(host_offset)
+        .collect();
+    close(&mut r.device, b);
+    assert!(
+        a.state.output_streaming && a.state.capture_streaming,
+        "A survives B's close"
+    );
+    assert_eq!((a.input.buffers.len(), a.output.buffers.len()), (4, 4));
+    assert_eq!(
+        a.input
+            .buffers
+            .iter()
+            .chain(a.output.buffers.iter())
+            .map(host_offset)
+            .collect::<Vec<_>>(),
+        a_offsets,
+        "not one of A's buffers was freed or re-registered"
+    );
+    assert_eq!(
+        coded_units(&a, &a_packet),
+        vec![Unit::Sps, Unit::Pps, a_frame],
+        "A's coded frame is still there"
+    );
+
+    // And A encodes on, into the CAPTURE buffers still lent to its own codec.
+    queue_frame(&mut r, &mut a, 1, 0x60, 1);
+    let last = collect_capture_for(&mut r, &mut a, 1).remove(0);
+    assert_eq!(
+        coded_units(&a, &last),
+        vec![Unit::Frame {
+            key: false,
+            frame_no: 1,
+            digest: digest_of(0x60, SIZE)
+        }],
+        "A keeps encoding after B is gone"
+    );
+
+    close(&mut r.device, a);
+    assert_eq!(r.pool.used(), 0, "both sessions gave every buffer back");
+}
+
+/// A second session provisions while the first is mid-encode -- its CAPTURE buffers lent to the
+/// codec thread -- and nothing of the first's is touched. Both queues come out of the one pool,
+/// so what matters is that provisioning only ever *adds*: no lent buffer is freed, re-registered
+/// or given back to the allocator behind the codec that is writing it (§2.5).
+#[test]
+fn a_second_session_provisions_while_the_first_holds_lent_buffers() {
+    let mut r = rig();
+    let mut a = new_session(&mut r.device, 0);
+    let sizeimage = start_streaming(&mut r, &mut a);
+    queue_frame(&mut r, &mut a, 0, 0x20, 0);
+    collect_capture_for(&mut r, &mut a, 1);
+
+    // A is mid-encode: the three CAPTURE buffers its first coded frame did not use are still
+    // lent to the codec thread.
+    let lent_before: Vec<bool> = a.output.buffers.iter().map(|b| b.lent).collect();
+    assert_eq!(
+        lent_before.iter().filter(|l| **l).count(),
+        3,
+        "three CAPTURE buffers are lent"
+    );
+    assert!(
+        r.log.lock().unwrap().capture_active,
+        "the codec thread has them"
+    );
+    let a_offsets: Vec<u32> = a
+        .input
+        .buffers
+        .iter()
+        .chain(a.output.buffers.iter())
+        .map(host_offset)
+        .collect();
+    let used_before = r.pool.used();
+
+    // All of the second session's provisioning happens while that is true. `CREATE_BUFS` had a
+    // gate of its own, so B builds its whole OUTPUT queue with it -- the way a GStreamer pool
+    // grows -- and `REQBUFS` provisions CAPTURE.
+    let mut b = new_session(&mut r.device, 1);
+    r.device
+        .s_fmt(&mut b, CAPTURE, capture_format(H264, 0))
+        .unwrap();
+    r.device
+        .s_fmt(&mut b, OUTPUT, output_format(NV12, SIZE.0, SIZE.1))
+        .unwrap();
+    let raw = r.device.g_fmt(&b, OUTPUT).unwrap();
+    let first = r
+        .device
+        .create_bufs(&mut b, 1, OUTPUT, MemoryType::Mmap, raw)
+        .unwrap();
+    assert_eq!((first.index, first.count), (0, 1), "B's first OUTPUT buffer");
+    let grown = r
+        .device
+        .create_bufs(&mut b, 2, OUTPUT, MemoryType::Mmap, raw)
+        .unwrap();
+    assert_eq!(
+        (grown.index, grown.count),
+        (1, 2),
+        "and two more, appended to B's own queue"
+    );
     assert_eq!(
         r.device
-            .create_bufs(&mut other, 1, CAPTURE, MemoryType::Mmap, big)
-            .err(),
-        Some(libc::EBUSY)
+            .reqbufs(&mut b, CAPTURE, MemoryType::Mmap, 4)
+            .unwrap()
+            .count,
+        4
     );
-    // The second session's own controls are its own, untouched by the first's.
-    r.device.s_ctrl(&mut s, CID_GOP, 7).unwrap();
-    assert_eq!(r.device.g_ctrl(&other, CID_GOP).unwrap().value, 30);
+    for i in 0..4 {
+        r.device
+            .qbuf(
+                &mut b,
+                mmap_buffer(CAPTURE, i, sizeimage),
+                vec![],
+                PayloadValidity::ALL,
+            )
+            .unwrap();
+    }
+    r.device.streamon(&mut b, OUTPUT).unwrap();
+    r.device.streamon(&mut b, CAPTURE).unwrap();
+    assert_eq!(
+        r.log.lock().unwrap().started.len(),
+        2,
+        "B's codec started under A's"
+    );
 
-    r.device
-        .reqbufs(&mut s, OUTPUT, MemoryType::Mmap, 0)
-        .unwrap();
-    close(&mut r.device, s);
-    r.device
-        .reqbufs(&mut other, OUTPUT, MemoryType::Mmap, 1)
-        .unwrap();
-    close(&mut r.device, other);
-    assert_eq!(r.device.active_session, None);
+    // A is exactly as it was, and its buffers are still the codec thread's.
+    assert_eq!(
+        a.output.buffers.iter().map(|b| b.lent).collect::<Vec<_>>(),
+        lent_before
+    );
+    assert_eq!(
+        a.input
+            .buffers
+            .iter()
+            .chain(a.output.buffers.iter())
+            .map(host_offset)
+            .collect::<Vec<_>>(),
+        a_offsets,
+        "not one of A's buffers was freed or re-registered"
+    );
+    assert_eq!(
+        *r.log.lock().unwrap().released_while_capture_active.borrow(),
+        0
+    );
+    assert!(
+        r.pool.used() > used_before,
+        "B's buffers came out of the same pool, on top of A's"
+    );
+
+    // And A encodes into its own lent buffers as if nothing had happened.
+    queue_frame(&mut r, &mut a, 1, 0x60, 1);
+    let packet = collect_capture_for(&mut r, &mut a, 1).remove(0);
+    assert_eq!(
+        coded_units(&a, &packet),
+        vec![Unit::Frame {
+            key: false,
+            frame_no: 1,
+            digest: digest_of(0x60, SIZE)
+        }]
+    );
+
+    close(&mut r.device, b);
+    close(&mut r.device, a);
+    assert_eq!(r.pool.used(), 0, "both sessions gave every buffer back");
 }
 
 /// A backend whose codec will not start (reclaimed, out of memory) fails the `STREAMON` that
@@ -3725,7 +3999,6 @@ fn streamoff_never_fails_a_backend_that_will_not_flush() {
         .reqbufs(&mut s, CAPTURE, MemoryType::Mmap, 0)
         .unwrap();
     assert!(s.input.buffers.is_empty() && s.output.buffers.is_empty());
-    assert_eq!(r.device.active_session, None);
     close(&mut r.device, s);
 }
 
@@ -3904,7 +4177,6 @@ fn reqbufs_on_an_empty_pool_is_still_enomem_and_holds_nothing() {
     );
     assert!(s.input.buffers.is_empty());
     assert_eq!(s.input.memory, None);
-    assert_eq!(r.device.active_session, None);
     assert_eq!(r.pool.used(), 0);
 
     r.pool.holds(2, sizeimage as u64);

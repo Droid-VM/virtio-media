@@ -32,8 +32,16 @@
 //! Buffers are host-owned (`MMAP`, from the device's [`VirtioMediaBufferAllocator`] -- the
 //! `media_host` pool on DroidVM) or guest-owned (`USERPTR`): an `OUTPUT` bitstream buffer is
 //! guest-owned in the usual mode (`VPU_DESIGN.md` §2.1), a `CAPTURE` frame buffer is guest-owned
-//! only in `driver_owned_queues=all`. Only one decoding session per device instance is allowed;
-//! a second session's `REQBUFS`/`STREAMON` is refused with `EBUSY`.
+//! only in `driver_owned_queues=all`.
+//!
+//! One guest `open()` is one decoding session, and sessions are independent: each holds its own
+//! backend session -- its own codec -- its own two queues, its own buffers out of the device's
+//! pool, its own `MMAP` offsets (unique device-wide) and its own events, tagged with its id. A
+//! second session provisions and streams while the first still holds buffers and decodes. Nothing
+//! device-wide gates that; what bounds it is the two real resources: the buffer pool, which
+//! answers `ENOMEM` once a `REQBUFS`/`CREATE_BUFS` no longer fits (D73), and the host's codec
+//! store, whose refusal the backend passes through as the errno it gave (`EBUSY` out of
+//! [`VideoDecoderBackend::new_session`] or [`VideoDecoderBackendSession::start`]).
 //!
 //! # Threads and buffers
 //!
@@ -765,10 +773,6 @@ impl<GM, S> VideoDecoderSession<GM, S> {
         }
     }
 
-    fn has_buffers(&self) -> bool {
-        !self.input.buffers.is_empty() || !self.output.buffers.is_empty()
-    }
-
     fn streaming(&self, direction: QueueDirection) -> bool {
         match direction {
             QueueDirection::Output => self.state.output_streaming,
@@ -833,6 +837,12 @@ impl<GM, S> VideoDecoderSession<GM, S> {
 }
 
 /// A stateful V4L2 video decoder over a [`VideoDecoderBackend`]. See the module documentation.
+///
+/// What lives here is what every session shares -- the backend, the event queue, the guest and
+/// host mappers, the buffer pool and the one `MMAP` offset space. A decode does not: a session
+/// (one guest `open()`) keeps its codec, queues, buffers, format and drain state in
+/// [`VideoDecoderSession`], and several run side by side. The ceilings are the pool (`ENOMEM`)
+/// and whatever the host's codec store refuses (`EBUSY`, from the backend).
 pub struct VideoDecoder<
     B: VideoDecoderBackend,
     Q: VirtioMediaEventQueue,
@@ -849,9 +859,6 @@ pub struct VideoDecoder<
     allocator: A,
     /// Freed `MMAP` buffers the guest still maps.
     retired: RetiredBuffers,
-    /// The one session allowed to hold buffers: one decode at a time, `EBUSY` for a second
-    /// (`v4l2-compliance` checks a second session is refused).
-    active_session: Option<u32>,
 }
 
 impl<B, Q, M, HM, A> VideoDecoder<B, Q, M, HM, A>
@@ -870,7 +877,6 @@ where
             mmap_manager: MmapMappingManager::from(mapper),
             allocator,
             retired: RetiredBuffers::new(),
-            active_session: None,
         }
     }
 
@@ -1440,9 +1446,6 @@ where
     }
 
     fn close_session(&mut self, mut session: Self::Session) {
-        if self.active_session == Some(session.id) {
-            self.active_session = None;
-        }
         // The backend first, so no thread is writing into a buffer that goes away below.
         session.backend.stop();
         self.free_buffers(&mut session.input);
@@ -1717,10 +1720,6 @@ where
         if !matches!(memory, MemoryType::Mmap | MemoryType::UserPtr) {
             return Err(libc::EINVAL);
         }
-        match self.active_session {
-            Some(id) if id != session.id => return Err(libc::EBUSY),
-            _ => (),
-        }
         // `REQBUFS(0)` is an implicit `STREAMOFF`; any other count on a streaming queue is
         // refused, as vb2 does (`vb2_core_reqbufs`, Linux 6.18.21
         // `drivers/media/common/videobuf2/videobuf2-core.c:883-886`), because the buffers it
@@ -1771,9 +1770,6 @@ where
                 "REQBUFS",
             )?;
             session.queue_mut(queue)?.memory = Some(memory);
-            self.active_session = Some(session.id);
-        } else if !session.has_buffers() {
-            self.active_session = None;
         }
 
         Ok(v4l2_requestbuffers {
@@ -1802,10 +1798,6 @@ where
         }
         if session.dead {
             return Err(libc::ENODEV);
-        }
-        match self.active_session {
-            Some(id) if id != session.id => return Err(libc::EBUSY),
-            _ => (),
         }
         // Unlike `REQBUFS`, `CREATE_BUFS` is *not* refused on a streaming queue: vb2 does not
         // refuse it either (`vb2_core_create_bufs` has no `q->streaming` check, Linux 6.18.21
@@ -1851,7 +1843,6 @@ where
                 "CREATE_BUFS",
             )?;
             session.queue_mut(queue)?.memory = Some(memory);
-            self.active_session = Some(session.id);
         }
 
         Ok(v4l2_create_buffers {

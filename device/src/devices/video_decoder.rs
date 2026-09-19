@@ -29,6 +29,14 @@
 //! carries `LAST` too, but **no `EOS` follows it**, and the decoder stays stopped until the
 //! client restarts the `CAPTURE` queue (`dev-decoder.rst`, "Dynamic Resolution Change").
 //!
+//! The decoder's controls are read-only and describe the host codec: `MIN_BUFFERS_FOR_CAPTURE`
+//! (D29), and -- per coded format -- the standard profile and level menus
+//! (`V4L2_CID_MPEG_VIDEO_{H264,HEVC,VP9,AV1}_PROFILE`, `_H264_LEVEL`, `_HEVC_LEVEL`), whose items
+//! are exactly the profiles and levels the backend published for that format (VA1b,
+//! `VPU_DESIGN.md` §7.6 item 2). A format the backend published nothing for gets no control at
+//! all, and no list is invented here: a client that reads the menus -- our own libva backend does,
+//! to decide which `VAProfile`s it may offer -- is reading the host codec store.
+//!
 //! Buffers are host-owned (`MMAP`, from the device's [`VirtioMediaBufferAllocator`] -- the
 //! `media_host` pool on DroidVM) or guest-owned (`USERPTR`): an `OUTPUT` bitstream buffer is
 //! guest-owned in the usual mode (`VPU_DESIGN.md` §2.1), a `CAPTURE` frame buffer is guest-owned
@@ -190,10 +198,21 @@ pub struct CodedFormat {
     /// Whether the format carries resolution in the bitstream, i.e. whether the decoder can
     /// raise a `SOURCE_CHANGE`. Sets `V4L2_FMT_FLAG_DYN_RESOLUTION` in `ENUM_FMT`.
     pub dynamic_resolution: bool,
+    /// Profiles of this format the backend's decoder accepts, as the V4L2 menu values of the
+    /// format's profile control (`V4L2_MPEG_VIDEO_H264_PROFILE_*`, `_HEVC_PROFILE_*`,
+    /// `_VP9_PROFILE_*`, `_AV1_PROFILE_*`). The first is what `G_CTRL` answers. **Empty: the
+    /// format gets no profile control at all** -- a backend that cannot say what its decoder
+    /// supports must not have the device invent a list (`VPU_DESIGN.md` §7.6 item 2).
+    pub profiles: Vec<i32>,
+    /// Levels, as the V4L2 menu values of the format's level control -- H.264 and HEVC are the
+    /// two the kernel gives a stateful decoder a level menu for. The first is what `G_CTRL`
+    /// answers; the backend lists the highest first, because what a decoder's level conveys is
+    /// the most it can decode. Empty: no level control.
+    pub levels: Vec<i32>,
 }
 
 /// What a decoder can do, enumerated once at device creation (on Android by warming the
-/// `AMediaCodecStore` up on a single thread, `VPU_DESIGN.md` §7.2). Controls (M5) extend this.
+/// `AMediaCodecStore` up on a single thread, `VPU_DESIGN.md` §7.2).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecoderCapabilities {
     /// The coded formats, in `ENUM_FMT(OUTPUT)` order.
@@ -859,6 +878,8 @@ pub struct VideoDecoder<
     allocator: A,
     /// Freed `MMAP` buffers the guest still maps.
     retired: RetiredBuffers,
+    /// The controls, sorted by id, built from the capabilities at device creation.
+    controls: Vec<DecoderControl>,
 }
 
 impl<B, Q, M, HM, A> VideoDecoder<B, Q, M, HM, A>
@@ -870,6 +891,7 @@ where
     A: VirtioMediaBufferAllocator,
 {
     pub fn new(backend: B, evt_queue: Q, mem: M, mapper: HM, allocator: A) -> Self {
+        let controls = controls_for(backend.capabilities());
         Self {
             backend,
             evt_queue,
@@ -877,6 +899,7 @@ where
             mmap_manager: MmapMappingManager::from(mapper),
             allocator,
             retired: RetiredBuffers::new(),
+            controls,
         }
     }
 
@@ -2261,16 +2284,18 @@ where
                 Ok(())
             }
             // A control event (D50): D29 gave the decoder a control table, so
-            // `SUBSCRIBE_EVENT(V4L2_EVENT_CTRL)` must be accepted for the class marker and each
+            // `SUBSCRIBE_EVENT(V4L2_EVENT_CTRL)` must be accepted for the class markers and each
             // exposed control (the encoder does the same at `video_encoder.rs:2895`; refusing it
             // cost the decoder a `v4l2-compliance` subtest, `testEvents`). Only the initial event
-            // is ever sent -- the decoder's one real control (`MIN_BUFFERS_FOR_CAPTURE`) is
-            // read-only and per session, so no other subscriber can see it change -- and the class
-            // marker gets no initial value, as the kernel's `v4l2_ctrl_add_event` does.
+            // is ever sent -- every decoder control is read-only, and the one that changes
+            // (`MIN_BUFFERS_FOR_CAPTURE`) is per session, so no other subscriber can see it change
+            // -- and a class marker gets no initial value, as `v4l2_ctrl_add_event` does.
             EventType::Ctrl(id) => {
-                let def = decoder_control(id).ok_or(libc::EINVAL)?;
-                if flags.contains(SubscribeEventFlags::SEND_INITIAL) && !def.is_class {
-                    let event = decoder_ctrl_event(session, def);
+                let def = decoder_control(&self.controls, id).ok_or(libc::EINVAL)?;
+                let initial = (flags.contains(SubscribeEventFlags::SEND_INITIAL)
+                    && !def.is_class())
+                .then(|| decoder_ctrl_event(&self.controls, session, def));
+                if let Some(event) = initial {
                     self.evt_queue
                         .send_event(V4l2Event::Event(SessionEvent::new(session.id, event)));
                 }
@@ -2310,15 +2335,17 @@ where
     }
 
     /// Enumerate a control by id, walking with `V4L2_CTRL_FLAG_NEXT_CTRL`. The decoder exposes the
-    /// user-control class marker and the read-only `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` (D29); the
-    /// walk from the last one ends in `EINVAL`, as `v4l2-compliance` expects.
+    /// user-control class marker, the read-only `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` (D29) and -- for
+    /// each coded format the backend published profile data for -- the codec class marker and that
+    /// format's profile and level menus (VA1b); the walk from the last one ends in `EINVAL`, as
+    /// `v4l2-compliance` expects.
     fn queryctrl(
         &mut self,
         _session: &Self::Session,
         id: CtrlId,
         flags: QueryCtrlFlags,
     ) -> IoctlResult<v4l2_queryctrl> {
-        let def = decoder_query_control(id, flags)?;
+        let def = decoder_query_control(&self.controls, id, flags)?;
         let (minimum, maximum, step, default_value) = def.bounds();
         let mut out = v4l2_queryctrl {
             id: def.id,
@@ -2340,7 +2367,7 @@ where
         id: CtrlId,
         flags: QueryCtrlFlags,
     ) -> IoctlResult<v4l2_query_ext_ctrl> {
-        let def = decoder_query_control(id, flags)?;
+        let def = decoder_query_control(&self.controls, id, flags)?;
         let (minimum, maximum, step, default_value) = def.bounds();
         let mut out = v4l2_query_ext_ctrl {
             id: def.id,
@@ -2358,20 +2385,37 @@ where
         Ok(out)
     }
 
-    /// The decoder has no menu control, so every `QUERYMENU` is `EINVAL` (never `ENOTTY`, which
-    /// hid the whole control interface before D29).
+    /// A menu item of a profile or level control, by index (`QUERYMENU`). Only items the host
+    /// codec store reported are named: an index inside the control's range that the codec does not
+    /// support is a hole and answers `EINVAL`, which is how `v4l2-ctl -L` and GStreamer's
+    /// `gst_v4l2_get_controls` come to list the supported set and nothing more. An integer control
+    /// or an id the decoder does not have is `EINVAL` too (never `ENOTTY`, which hid the whole
+    /// control interface before D29).
     fn querymenu(
         &mut self,
         _session: &Self::Session,
-        _id: u32,
-        _index: u32,
+        id: u32,
+        index: u32,
     ) -> IoctlResult<v4l2_querymenu> {
-        Err(libc::EINVAL)
+        let def = decoder_control(&self.controls, id).ok_or(libc::EINVAL)?;
+        let name = i32::try_from(index)
+            .ok()
+            .and_then(|i| def.menu_name(i))
+            .ok_or(libc::EINVAL)?;
+        let mut out = v4l2_querymenu {
+            id,
+            index,
+            __bindgen_anon_1: bindings::v4l2_querymenu__bindgen_ty_1 { name: [0; 32] },
+            reserved: 0,
+        };
+        // SAFETY: `name` is the member a menu (not integer-menu) control fills.
+        copy_name(unsafe { &mut out.__bindgen_anon_1.name }, name);
+        Ok(out)
     }
 
-    /// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, which GStreamer reads to size its CAPTURE pool. Its
-    /// value follows the last `SOURCE_CHANGE` (`min_capture_buffers`). Full codec-control
-    /// enumeration (the codec control class, profile/level menus) is M5; see the report.
+    /// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, which GStreamer reads to size its CAPTURE pool (its
+    /// value follows the last `SOURCE_CHANGE`, `min_capture_buffers`), or a profile / level menu's
+    /// value, which is one of the values the host codec reported supporting.
     ///
     /// On a 6.15+ guest kernel `VIDIOC_G_CTRL` reaches the device as `G_EXT_CTRLS`, so this is
     /// answered by [`Self::g_ext_ctrls`] there; it stays for an older kernel that forwards the
@@ -2379,21 +2423,23 @@ where
     fn g_ctrl(&mut self, session: &Self::Session, id: u32) -> IoctlResult<v4l2_control> {
         Ok(v4l2_control {
             id,
-            value: decoder_control_value(session, id)?,
+            value: decoder_control_value(&self.controls, session, id)?,
         })
     }
 
-    /// Every decoder control is read-only (`MIN_BUFFERS_FOR_CAPTURE`) or a class marker, so a
-    /// `S_CTRL` is `EACCES` for a known control and `EINVAL` otherwise -- what the kernel answers,
-    /// and what `v4l2-compliance` checks of a read-only control.
+    /// Every decoder control is read-only (`MIN_BUFFERS_FOR_CAPTURE`, the profile and level menus)
+    /// or a class marker, so a `S_CTRL` is `EACCES` for a known control and `EINVAL` otherwise --
+    /// what the kernel answers, and what `v4l2-compliance` checks of a read-only control. A
+    /// stateful decoder has nothing to select: the profile and level of what it decodes are in the
+    /// bitstream.
     fn s_ctrl(
         &mut self,
         _session: &mut Self::Session,
         id: u32,
         _value: i32,
     ) -> IoctlResult<v4l2_control> {
-        match decoder_control(id) {
-            Some(def) if def.is_class => Err(libc::EINVAL),
+        match decoder_control(&self.controls, id) {
+            Some(def) if def.is_class() => Err(libc::EINVAL),
             Some(_) => Err(libc::EACCES),
             None => Err(libc::EINVAL),
         }
@@ -2407,7 +2453,7 @@ where
         ctrl_array: &mut Vec<v4l2_ext_control>,
         _user_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<()> {
-        match check_ext_ctrls(session, ExtCtrlOp::Get, which, ctrl_array) {
+        match check_ext_ctrls(&self.controls, session, ExtCtrlOp::Get, which, ctrl_array) {
             Ok(values) => {
                 write_back_ext_ctrls(ctrls, ctrl_array, &values);
                 Ok(())
@@ -2427,7 +2473,7 @@ where
         ctrl_array: &mut Vec<v4l2_ext_control>,
         _user_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<()> {
-        match check_ext_ctrls(session, ExtCtrlOp::Set, which, ctrl_array) {
+        match check_ext_ctrls(&self.controls, session, ExtCtrlOp::Set, which, ctrl_array) {
             Ok(values) => {
                 write_back_ext_ctrls(ctrls, ctrl_array, &values);
                 Ok(())
@@ -2447,7 +2493,7 @@ where
         ctrl_array: &mut Vec<v4l2_ext_control>,
         _user_regions: Vec<Vec<SgEntry>>,
     ) -> IoctlResult<()> {
-        match check_ext_ctrls(session, ExtCtrlOp::Try, which, ctrl_array) {
+        match check_ext_ctrls(&self.controls, session, ExtCtrlOp::Try, which, ctrl_array) {
             Ok(values) => {
                 write_back_ext_ctrls(ctrls, ctrl_array, &values);
                 Ok(())
@@ -2511,67 +2557,274 @@ where
 // Controls
 // ---------------------------------------------------------------------------------------------
 
-/// One control a stateful decoder answers for. The decoder exposes only the user-control class
-/// marker and the read-only `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` that GStreamer reads to size its
-/// `CAPTURE` pool (`M6-crate` §9 item 1); full codec-control enumeration (profile/level menus) is
-/// M5.
+/// The kernel's menu strings (`drivers/media/v4l2-core/v4l2-ctrls-defs.c`, `v4l2_ctrl_get_menu`),
+/// indexed by menu value. `video_encoder.rs` holds the same tables: the two devices are behind
+/// separate cargo features and neither may depend on the other, so the kernel's enums are written
+/// out once per device, as `copy_name`, `ctrl_class` and `fourcc_description` already are.
+const H264_PROFILE_NAMES: [&str; 18] = [
+    "Baseline",
+    "Constrained Baseline",
+    "Main",
+    "Extended",
+    "High",
+    "High 10",
+    "High 422",
+    "High 444 Predictive",
+    "High 10 Intra",
+    "High 422 Intra",
+    "High 444 Intra",
+    "CAVLC 444 Intra",
+    "Scalable Baseline",
+    "Scalable High",
+    "Scalable High Intra",
+    "Stereo High",
+    "Multiview High",
+    "Constrained High",
+];
+const H264_LEVEL_NAMES: [&str; 20] = [
+    "1", "1b", "1.1", "1.2", "1.3", "2", "2.1", "2.2", "3", "3.1", "3.2", "4", "4.1", "4.2", "5",
+    "5.1", "5.2", "6.0", "6.1", "6.2",
+];
+const HEVC_PROFILE_NAMES: [&str; 3] = ["Main", "Main Still Picture", "Main 10"];
+const HEVC_LEVEL_NAMES: [&str; 13] = [
+    "1", "2", "2.1", "3", "3.1", "4", "4.1", "5", "5.1", "5.2", "6", "6.1", "6.2",
+];
+const VP9_PROFILE_NAMES: [&str; 4] = ["0", "1", "2", "3"];
+/// AV1 is the one profile menu the encoder has no table for (it encodes no AV1). Names and menu
+/// values are the kernel's `av1_profile[]` against `enum v4l2_mpeg_video_av1_profile` in
+/// `/usr/include/linux/v4l2-controls.h` (`MAIN = 0`, `HIGH = 1`, `PROFESSIONAL = 2`; the control
+/// id `V4L2_CID_MPEG_VIDEO_AV1_PROFILE = V4L2_CID_CODEC_BASE + 655` is in the generated bindings
+/// on both the Android and the dev-box header, so it is used from there and not written out).
+const AV1_PROFILE_NAMES: [&str; 3] = ["Main", "High", "Professional"];
+
+/// What kind of control an entry of the table is. Every one of them is read-only: a stateful
+/// decoder is told what to decode by the bitstream, so its profile and level menus *describe* the
+/// host codec rather than select anything (`vidioc-queryctrl.rst`, "the control is read-only").
+#[derive(Clone, Debug)]
+enum DecoderCtrlType {
+    /// A `V4L2_CTRL_TYPE_CTRL_CLASS` marker: neither readable nor writable.
+    Class,
+    /// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`: read-only, and volatile because it follows the last
+    /// `SOURCE_CHANGE`.
+    MinCaptureBuffers,
+    /// A read-only menu (a profile or a level). `items` are `(value, name)` pairs sorted by
+    /// value, holding only values the host codec store reported: values in between are holes
+    /// `QUERYMENU` answers `EINVAL` for, so `v4l2-ctl -L` lists the supported set and nothing
+    /// else. `default` is one of the items -- what `G_CTRL` answers.
+    Menu {
+        items: Vec<(i32, &'static str)>,
+        default: i32,
+    },
+}
+
+/// One control a stateful decoder answers for: the user-control class marker, the read-only
+/// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` that GStreamer reads to size its `CAPTURE` pool
+/// (`M6-crate` §9 item 1), and -- per coded format the backend published profile data for -- the
+/// codec class marker with that format's profile and level menus (VA1b, `VPU_DESIGN.md` §7.6
+/// item 2). Nothing here is hard-coded per codec: which controls exist, and which menu items each
+/// has, come from [`DecoderCapabilities`], so a format the host codec store says nothing about
+/// gets no control rather than an invented list.
 ///
 /// Answering these at all matters on a 6.15+ guest kernel: the virtio-media driver stops defining
 /// `.vidioc_g_ctrl` / `.vidioc_queryctrl` there and lets the V4L2 core emulate the legacy ioctls
 /// through their `EXT` forms (`driver/virtio_media_ioctls.c:1879`), so a decoder that answered only
 /// `g_ctrl` was invisible to every client -- `QUERYCTRL`, `QUERY_EXT_CTRL`, `QUERYMENU` and
-/// `G_CTRL` all `ENOTTY`, and GStreamer never read its pool size (defect D29). The entries are in
-/// ascending id order, which is the order `V4L2_CTRL_FLAG_NEXT_CTRL` walks.
+/// `G_CTRL` all `ENOTTY`, and GStreamer never read its pool size (defect D29). The table is sorted
+/// by id, which is the order `V4L2_CTRL_FLAG_NEXT_CTRL` walks.
+#[derive(Clone, Debug)]
 struct DecoderControl {
     id: u32,
     name: &'static str,
-    /// A `V4L2_CTRL_TYPE_CTRL_CLASS` marker: neither readable nor writable.
-    is_class: bool,
+    ty: DecoderCtrlType,
 }
 
-const DECODER_CONTROLS: [DecoderControl; 2] = [
-    DecoderControl {
-        id: bindings::V4L2_CID_USER_CLASS,
-        name: "User Controls",
-        is_class: true,
-    },
-    DecoderControl {
-        id: bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
-        name: "Min Number of Capture Buffers",
-        is_class: false,
-    },
-];
-
 impl DecoderControl {
+    fn is_class(&self) -> bool {
+        matches!(self.ty, DecoderCtrlType::Class)
+    }
+
     fn v4l2_type(&self) -> u32 {
-        if self.is_class {
-            bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_CTRL_CLASS
-        } else {
-            bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER
+        match self.ty {
+            DecoderCtrlType::Class => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_CTRL_CLASS,
+            DecoderCtrlType::MinCaptureBuffers => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER,
+            DecoderCtrlType::Menu { .. } => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU,
         }
     }
 
     fn flags(&self) -> u32 {
-        if self.is_class {
+        match self.ty {
             // "You can neither read nor write these" (the kernel's `v4l2_ctrl_fill`).
-            bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_WRITE_ONLY
-        } else {
+            DecoderCtrlType::Class => {
+                bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_WRITE_ONLY
+            }
             // `MIN_BUFFERS_FOR_CAPTURE` is read-only and changes with every `SOURCE_CHANGE`, so
             // it is volatile: a client must re-read it rather than trust a cached value.
-            bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE
+            DecoderCtrlType::MinCaptureBuffers => {
+                bindings::V4L2_CTRL_FLAG_READ_ONLY | bindings::V4L2_CTRL_FLAG_VOLATILE
+            }
+            // A profile or level menu is read-only but *not* volatile: it is the host codec's
+            // fixed capability, the same before and after every format change.
+            DecoderCtrlType::Menu { .. } => bindings::V4L2_CTRL_FLAG_READ_ONLY,
         }
     }
 
-    /// `(minimum, maximum, step, default)`.
+    /// `(minimum, maximum, step, default)`. A menu's bounds are its lowest and highest item, so
+    /// `QUERYMENU` of either end always finds one, which is what `v4l2-compliance` checks.
     fn bounds(&self) -> (i32, i32, i32, i32) {
-        if self.is_class {
-            (0, 0, 0, 0)
-        } else {
+        match &self.ty {
+            DecoderCtrlType::Class => (0, 0, 0, 0),
             // A stateful decoder never needs more than the queue's ceiling; the live value comes
             // from `G_CTRL` / `G_EXT_CTRLS`, not from this default.
-            (1, MAX_BUFFERS as i32, 1, 1)
+            DecoderCtrlType::MinCaptureBuffers => (1, MAX_BUFFERS as i32, 1, 1),
+            DecoderCtrlType::Menu { items, default } => (
+                items.first().map(|i| i.0).unwrap_or(0),
+                items.last().map(|i| i.0).unwrap_or(0),
+                1,
+                *default,
+            ),
         }
     }
+
+    /// The name of menu item `index`, if this is a menu and the host codec supports that item.
+    fn menu_name(&self, index: i32) -> Option<&'static str> {
+        match &self.ty {
+            DecoderCtrlType::Menu { items, .. } => {
+                items.iter().find(|i| i.0 == index).map(|i| i.1)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A read-only menu control from the values a backend published, held to the kernel's enum
+/// (`names`), sorted and deduplicated; the first published value is the default. `None` -- so no
+/// control at all -- if nothing is left: that is the rule "a format the store said nothing about
+/// gets no profile control", and it also drops a value the running kernel has no name for rather
+/// than letting `QUERYMENU` answer with an empty string.
+fn menu_from(values: &[i32], names: &[&'static str]) -> Option<DecoderCtrlType> {
+    let mut items: Vec<(i32, &'static str)> = Vec::new();
+    for &v in values {
+        match usize::try_from(v).ok().and_then(|i| names.get(i)) {
+            Some(name) if !items.iter().any(|i| i.0 == v) => items.push((v, *name)),
+            Some(_) => (),
+            None => log::warn!(
+                "decoder: menu value {} is not in the kernel's enum, dropped",
+                v
+            ),
+        }
+    }
+    let default = values
+        .iter()
+        .copied()
+        .find(|v| items.iter().any(|i| i.0 == *v))?;
+    items.sort_by_key(|i| i.0);
+    Some(DecoderCtrlType::Menu { items, default })
+}
+
+/// The control table for a set of capabilities, sorted by id (the `NEXT_CTRL` enumeration order).
+///
+/// The profile and level menus exist per coded format and for every format the backend published
+/// data for, whatever the current `OUTPUT` format: a client picks its decoder by reading the
+/// menus before it selects the codec with `S_FMT(OUTPUT)` (our own libva backend does exactly
+/// that, `VPU_DESIGN.md` §7.6 item 2), so the answer cannot depend on what is selected. The
+/// codec class marker exists only when at least one codec control does, as the kernel's handler
+/// creates a class control only for a class it has controls in.
+///
+/// VP8 is left without a profile control on purpose: its single profile carries no information a
+/// client could act on, and the fourcc the V4L2 level control pairs with (H.264, HEVC) is the
+/// same pair the kernel gives a stateful decoder.
+fn controls_for(caps: &DecoderCapabilities) -> Vec<DecoderControl> {
+    let mut out = vec![
+        DecoderControl {
+            id: bindings::V4L2_CID_USER_CLASS,
+            name: "User Controls",
+            ty: DecoderCtrlType::Class,
+        },
+        DecoderControl {
+            id: bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+            name: "Min Number of Capture Buffers",
+            ty: DecoderCtrlType::MinCaptureBuffers,
+        },
+    ];
+    let mut has_codec_controls = false;
+    for f in &caps.coded_formats {
+        // `(profile id, level id, profile names, level names, profile name, level name)`; a zero
+        // level id is a format the kernel has no level menu for. The names are the kernel's
+        // (`v4l2_ctrl_get_name`).
+        let (profile_id, level_id, profile_names, level_names, profile_name, level_name): (
+            u32,
+            u32,
+            &[&'static str],
+            &[&'static str],
+            &'static str,
+            &'static str,
+        ) = match &f.fourcc.to_fourcc() {
+            b"H264" => (
+                bindings::V4L2_CID_MPEG_VIDEO_H264_PROFILE,
+                bindings::V4L2_CID_MPEG_VIDEO_H264_LEVEL,
+                &H264_PROFILE_NAMES,
+                &H264_LEVEL_NAMES,
+                "H264 Profile",
+                "H264 Level",
+            ),
+            b"HEVC" => (
+                bindings::V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+                bindings::V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
+                &HEVC_PROFILE_NAMES,
+                &HEVC_LEVEL_NAMES,
+                "HEVC Profile",
+                "HEVC Level",
+            ),
+            b"VP90" => (
+                bindings::V4L2_CID_MPEG_VIDEO_VP9_PROFILE,
+                0,
+                &VP9_PROFILE_NAMES,
+                &[],
+                "VP9 Profile",
+                "",
+            ),
+            b"AV01" => (
+                bindings::V4L2_CID_MPEG_VIDEO_AV1_PROFILE,
+                0,
+                &AV1_PROFILE_NAMES,
+                &[],
+                "AV1 Profile",
+                "",
+            ),
+            _ => continue,
+        };
+        if out.iter().any(|c| c.id == profile_id) {
+            // The same fourcc twice: the first entry's controls stand.
+            continue;
+        }
+        if let Some(ty) = menu_from(&f.profiles, profile_names) {
+            out.push(DecoderControl {
+                id: profile_id,
+                name: profile_name,
+                ty,
+            });
+            has_codec_controls = true;
+        }
+        if level_id != 0 {
+            if let Some(ty) = menu_from(&f.levels, level_names) {
+                out.push(DecoderControl {
+                    id: level_id,
+                    name: level_name,
+                    ty,
+                });
+                has_codec_controls = true;
+            }
+        }
+    }
+    if has_codec_controls {
+        out.push(DecoderControl {
+            id: bindings::V4L2_CID_CODEC_CLASS,
+            name: "Codec Controls",
+            ty: DecoderCtrlType::Class,
+        });
+    }
+    out.sort_by_key(|c| c.id);
+    out
 }
 
 /// The control class an id belongs to (`V4L2_CTRL_ID2WHICH`).
@@ -2579,40 +2832,43 @@ fn ctrl_class(id: u32) -> u32 {
     id & 0x0fff_0000
 }
 
-/// The exact control an id names, if the decoder has it.
-fn decoder_control(id: u32) -> Option<&'static DecoderControl> {
-    DECODER_CONTROLS.iter().find(|c| c.id == id)
+/// The exact control an id names, if the device has it.
+fn decoder_control(controls: &[DecoderControl], id: u32) -> Option<&DecoderControl> {
+    controls.iter().find(|c| c.id == id)
 }
 
 /// The control an id with query flags names: the exact one, or -- with `NEXT_CTRL` -- the first
 /// with a greater id, ending in `EINVAL` past the last. `NEXT_COMPOUND` alone finds nothing (the
 /// decoder has no compound control).
 fn decoder_query_control(
+    controls: &[DecoderControl],
     id: CtrlId,
     flags: QueryCtrlFlags,
-) -> IoctlResult<&'static DecoderControl> {
+) -> IoctlResult<&DecoderControl> {
     let id: u32 = id.into();
     if flags.contains(QueryCtrlFlags::NEXT) {
-        DECODER_CONTROLS
-            .iter()
-            .find(|c| c.id > id)
-            .ok_or(libc::EINVAL)
+        controls.iter().find(|c| c.id > id).ok_or(libc::EINVAL)
     } else if flags.contains(QueryCtrlFlags::COMPOUND) {
         Err(libc::EINVAL)
     } else {
-        decoder_control(id).ok_or(libc::EINVAL)
+        decoder_control(controls, id).ok_or(libc::EINVAL)
     }
 }
 
 /// What `G_CTRL` / `G_EXT_CTRLS` answer for a control: `EINVAL` for a class marker (the kernel's
-/// `is_int` check), the live value otherwise. `MIN_BUFFERS_FOR_CAPTURE` reads the session's value.
-fn decoder_control_value<GM, S>(session: &VideoDecoderSession<GM, S>, id: u32) -> IoctlResult<i32> {
+/// `is_int` check), the live value otherwise. `MIN_BUFFERS_FOR_CAPTURE` reads the session's value;
+/// a profile or level menu answers its default, which is a value the host codec reported
+/// supporting (`menu_from`) -- the menus are read-only, so it is the same value for every session.
+fn decoder_control_value<GM, S>(
+    controls: &[DecoderControl],
+    session: &VideoDecoderSession<GM, S>,
+    id: u32,
+) -> IoctlResult<i32> {
     match id {
         bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE => Ok(session.min_capture_buffers.max(1) as i32),
-        _ => match decoder_control(id) {
-            Some(def) if def.is_class => Err(libc::EINVAL),
-            // No other readable control exists yet (codec controls are M5).
-            Some(_) => Ok(0),
+        _ => match decoder_control(controls, id) {
+            Some(def) if def.is_class() => Err(libc::EINVAL),
+            Some(def) => Ok(def.bounds().3),
             None => Err(libc::EINVAL),
         },
     }
@@ -2620,17 +2876,18 @@ fn decoder_control_value<GM, S>(session: &VideoDecoderSession<GM, S>, id: u32) -
 
 /// The `V4L2_EVENT_CTRL` event describing a control's current state, for `SUBSCRIBE_EVENT` with
 /// `SEND_INITIAL` (D50). Modelled on the encoder's `ctrl_event` (`video_encoder.rs:1577`): the
-/// bounds and flags come from the static [`DecoderControl`] table, the value from the session
+/// bounds and flags come from the device's [`DecoderControl`] table, the value from the session
 /// (`MIN_BUFFERS_FOR_CAPTURE` follows the last `SOURCE_CHANGE`). A class marker carries no value.
 fn decoder_ctrl_event<GM, S>(
+    controls: &[DecoderControl],
     session: &VideoDecoderSession<GM, S>,
     def: &DecoderControl,
 ) -> bindings::v4l2_event {
     let (minimum, maximum, step, default_value) = def.bounds();
-    let value = if def.is_class {
+    let value = if def.is_class() {
         0
     } else {
-        decoder_control_value(session, def.id).unwrap_or(0)
+        decoder_control_value(controls, session, def.id).unwrap_or(0)
     };
     bindings::v4l2_event {
         type_: bindings::V4L2_EVENT_CTRL,
@@ -2665,6 +2922,7 @@ enum ExtCtrlOp {
 /// or a class every control must belong to. The decoder has no writable control, so every `SET`
 /// or `TRY` of a real control is refused with `EACCES` (read-only), which is what the kernel does.
 fn check_ext_ctrls<GM, S>(
+    controls: &[DecoderControl],
     session: &VideoDecoderSession<GM, S>,
     op: ExtCtrlOp,
     which: CtrlWhich,
@@ -2693,7 +2951,7 @@ fn check_ext_ctrls<GM, S>(
         // The access flags are checked before what the control is, as the kernel does: a
         // `WRITE_ONLY` control (the class marker carries the flag) is refused for a get, a
         // `READ_ONLY` one for a set or try, both with `EACCES`.
-        let flags = match decoder_control(id) {
+        let flags = match decoder_control(controls, id) {
             Some(def) => def.flags(),
             None => return Err((libc::EINVAL, fail_idx(i))),
         };
@@ -2704,11 +2962,14 @@ fn check_ext_ctrls<GM, S>(
         if refused {
             return Err((libc::EACCES, fail_idx(i)));
         }
-        // Only a readable, non-class control reaches here (a get of `MIN_BUFFERS_FOR_CAPTURE`).
+        // Only a readable, non-class control reaches here (a get of `MIN_BUFFERS_FOR_CAPTURE`, or
+        // of a profile / level menu).
         let value = if defaults {
-            decoder_control(id).map(|def| def.bounds().3).unwrap_or(0)
+            decoder_control(controls, id)
+                .map(|def| def.bounds().3)
+                .unwrap_or(0)
         } else {
-            decoder_control_value(session, id).map_err(|e| (e, fail_idx(i)))?
+            decoder_control_value(controls, session, id).map_err(|e| (e, fail_idx(i)))?
         };
         values.push(value);
     }

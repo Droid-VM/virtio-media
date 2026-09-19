@@ -31,6 +31,7 @@ const CAPTURE: QueueType = QueueType::VideoCaptureMplane;
 const H264: PixelFormat = PixelFormat::from_fourcc(b"H264");
 const HEVC: PixelFormat = PixelFormat::from_fourcc(b"HEVC");
 const VP90: PixelFormat = PixelFormat::from_fourcc(b"VP90");
+const AV01: PixelFormat = PixelFormat::from_fourcc(b"AV01");
 
 // ---------------------------------------------------------------------------------------------
 // The VMM-side fakes (event queue, guest memory, host mapper, allocator) -- as in camera::tests.
@@ -855,6 +856,23 @@ struct Rig {
 
 const GUEST_MEMORY: usize = 8 << 20;
 
+/// The profiles and levels the fake backend publishes, as the MediaCodec backend would for
+/// `c2.qti.avc.decoder` and `c2.qti.hevc.decoder` on 5566 (`B5-acceptance.md` §"Profiles"), cut
+/// down to what makes the control tests readable:
+///
+/// * **H264** -- Baseline (0), Constrained Baseline (1), Main (2), High (4), Constrained High
+///   (17): the store's five, with Extended (3) and every `High 4xx` a hole in between;
+/// * **H264 levels** -- 4 (11), 4.1 (12), 5 (14), 5.1 (15), highest first, so the default is 5.1;
+/// * **HEVC** -- Main (0) and Main 10 (2), with Main Still Picture (1) the hole, levels 6.2 (12)
+///   and 5.1 (8);
+/// * **VP9** -- profile 0 only, and **no levels**, the format with a profile control but no level
+///   control.
+const H264_PROFILES: [i32; 5] = [0, 1, 2, 4, 17];
+const H264_LEVELS: [i32; 4] = [15, 14, 12, 11];
+const HEVC_PROFILES: [i32; 2] = [0, 2];
+const HEVC_LEVELS: [i32; 2] = [12, 8];
+const VP9_PROFILES: [i32; 1] = [0];
+
 fn caps() -> DecoderCapabilities {
     let range = SizeRange::new(16, 4096, 2);
     DecoderCapabilities {
@@ -864,12 +882,16 @@ fn caps() -> DecoderCapabilities {
                 width: range,
                 height: range,
                 dynamic_resolution: true,
+                profiles: H264_PROFILES.to_vec(),
+                levels: H264_LEVELS.to_vec(),
             },
             CodedFormat {
                 fourcc: HEVC,
                 width: range,
                 height: range,
                 dynamic_resolution: true,
+                profiles: HEVC_PROFILES.to_vec(),
+                levels: HEVC_LEVELS.to_vec(),
             },
             // A narrower range than the others, as VP9's is on 5566 (B5 §5.1), so a query that
             // answers the wrong format's range is caught.
@@ -878,9 +900,23 @@ fn caps() -> DecoderCapabilities {
                 width: SizeRange::new(16, 2048, 2),
                 height: SizeRange::new(16, 2048, 2),
                 dynamic_resolution: true,
+                profiles: VP9_PROFILES.to_vec(),
+                levels: Vec::new(),
             },
         ],
     }
+}
+
+/// Capabilities whose formats carry no profile data at all -- a backend that could not ask the
+/// host codec store, or a platform whose store has nothing to say. Every coded format is still
+/// offered; none of them gets a profile or level control (VA1b).
+fn caps_without_profiles() -> DecoderCapabilities {
+    let mut caps = caps();
+    for f in &mut caps.coded_formats {
+        f.profiles.clear();
+        f.levels.clear();
+    }
+    caps
 }
 
 /// The default grace the fake holds an unannounceable buffer for. Long enough that a test which
@@ -918,6 +954,22 @@ fn rig_full_learned(
     announce_min: u32,
     learned_min: Option<u32>,
 ) -> Rig {
+    rig_caps(caps(), fail_start, grace, announce_min, learned_min)
+}
+
+/// A rig whose fake backend publishes `caps`: what the control tests vary, since the device
+/// builds its control table from the capabilities at creation.
+fn rig_with_caps(caps: DecoderCapabilities) -> Rig {
+    rig_caps(caps, None, FAKE_GRACE, 4, None)
+}
+
+fn rig_caps(
+    caps: DecoderCapabilities,
+    fail_start: Option<i32>,
+    grace: Duration,
+    announce_min: u32,
+    learned_min: Option<u32>,
+) -> Rig {
     let events = EventLog::default();
     let events_log = Rc::clone(&events.0);
     let log: SharedLog = Default::default();
@@ -927,7 +979,7 @@ fn rig_full_learned(
         log: Arc::clone(&log),
     };
     let backend = FakeBackend {
-        caps: caps(),
+        caps,
         log: Arc::clone(&log),
         announce_min,
         fail_start,
@@ -4049,8 +4101,10 @@ fn min_buffers_for_capture_is_enumerated_and_readable() {
     let mut s = session(&mut r.device);
     const CID_MIN_CAP: u32 = bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
 
-    // The NEXT_CTRL walk: id 0 -> the User Controls class marker -> MIN_BUFFERS_FOR_CAPTURE ->
-    // EINVAL (the end).
+    // The NEXT_CTRL walk starts at the User Controls class marker and reaches
+    // MIN_BUFFERS_FOR_CAPTURE; past it the walk goes on into the codec class (VA1b's profile and
+    // level menus, whose own walk `profile_and_level_menus_enumerate_what_the_backend_published`
+    // checks end to end).
     let walk = |r: &mut Rig, s: &Session, from: u32| -> Result<u32, i32> {
         let (id, flags) =
             v4l2r::ioctl::parse_ctrl_id_and_flags(from | bindings::V4L2_CTRL_FLAG_NEXT_CTRL);
@@ -4061,7 +4115,11 @@ fn min_buffers_for_capture_is_enumerated_and_readable() {
         walk(&mut r, &s, bindings::V4L2_CID_USER_CLASS).unwrap(),
         CID_MIN_CAP
     );
-    assert_eq!(walk(&mut r, &s, CID_MIN_CAP), Err(libc::EINVAL), "walk ends");
+    assert_eq!(
+        walk(&mut r, &s, CID_MIN_CAP).unwrap(),
+        bindings::V4L2_CID_CODEC_CLASS,
+        "the user class ends at MIN_BUFFERS_FOR_CAPTURE; the codec class follows"
+    );
 
     // QUERY_EXT_CTRL of the control itself: read-only integer, 1..=MAX_BUFFERS.
     let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(CID_MIN_CAP);
@@ -4177,7 +4235,427 @@ fn decoder_controls_reject_writes_and_the_class_marker() {
     close(&mut r.device, s);
 }
 
+/// VA1b (`VPU_DESIGN.md` §7.6 item 2): the decoder's profile and level menus are the host codec
+/// store's, item for item. The fake publishes H.264 {Baseline, Constrained Baseline, Main, High,
+/// Constrained High} with levels {4, 4.1, 5, 5.1}, HEVC {Main, Main 10} with levels {5.1, 6.2}, and
+/// VP9 {0} with no levels at all; the device must enumerate exactly that -- the codec class
+/// marker, one profile control per format, a level control only where the backend gave levels --
+/// with the kernel's own menu values and names, and answer `EINVAL` for every value in between.
+/// The holes are the point: `v4l2-ctl -L`, GStreamer and a VA driver all learn the supported set
+/// by walking the range and keeping what `QUERYMENU` accepts, so a menu that answered for an
+/// unsupported profile would advertise a codec the host does not have.
+#[test]
+fn profile_and_level_menus_enumerate_what_the_backend_published() {
+    let mut r = rig();
+    let s = session(&mut r.device);
+
+    // The whole NEXT_CTRL walk, in id order: the two user controls (D29), then the codec class
+    // marker and one control per (format, kind) the backend published. VP9 published no levels,
+    // so there is no VP9 level control -- and there is no control for a format the fake does not
+    // offer at all (AV1).
+    let mut expected = vec![
+        bindings::V4L2_CID_USER_CLASS,
+        bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+        bindings::V4L2_CID_CODEC_CLASS,
+        CID_H264_PROFILE,
+        CID_H264_LEVEL,
+        CID_HEVC_PROFILE,
+        CID_HEVC_LEVEL,
+        CID_VP9_PROFILE,
+    ];
+    expected.sort_unstable();
+    assert_eq!(walk_controls(&mut r, &s), expected, "the NEXT_CTRL walk");
+    for absent in [
+        bindings::V4L2_CID_MPEG_VIDEO_VP9_LEVEL,
+        bindings::V4L2_CID_MPEG_VIDEO_AV1_PROFILE,
+    ] {
+        let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(absent);
+        assert_eq!(
+            r.device.query_ext_ctrl(&s, id, flags).map(|_| ()),
+            Err(libc::EINVAL),
+            "no control for what the backend published nothing for ({absent:#x})"
+        );
+    }
+
+    // Each menu is a read-only V4L2_CTRL_TYPE_MENU whose bounds are its lowest and highest item
+    // (so QUERYMENU of either end always finds one, which v4l2-compliance checks) and whose
+    // default is the first value the backend listed.
+    let q = query_ext(&mut r, &s, CID_H264_PROFILE);
+    assert_eq!(q.type_, bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU);
+    assert_eq!((q.minimum, q.maximum, q.step), (0, 17, 1));
+    assert_eq!(q.default_value, 0, "the first profile the backend listed");
+    assert_ne!(q.flags & bindings::V4L2_CTRL_FLAG_READ_ONLY, 0, "read-only");
+    assert_eq!(
+        q.flags & bindings::V4L2_CTRL_FLAG_VOLATILE,
+        0,
+        "a codec's profiles do not change with the stream, unlike MIN_BUFFERS_FOR_CAPTURE"
+    );
+    assert_eq!(ext_ctrl_name(&q), "H264 Profile", "the kernel's own name");
+
+    // The H.264 profile menu: exactly the five published, with the kernel's names. Extended (3)
+    // and the High 4xx family (5..16) are holes the codec does not support.
+    assert_eq!(
+        menu_items(&mut r, &s, CID_H264_PROFILE),
+        vec![
+            (0, "Baseline".to_string()),
+            (1, "Constrained Baseline".to_string()),
+            (2, "Main".to_string()),
+            (4, "High".to_string()),
+            (17, "Constrained High".to_string()),
+        ]
+    );
+    for hole in [3, 5, 9, 16] {
+        assert_eq!(
+            r.device.querymenu(&s, CID_H264_PROFILE, hole).map(|_| ()),
+            Err(libc::EINVAL),
+            "profile {hole} is not supported, so it is not a menu item"
+        );
+    }
+    // Past the enum entirely, and past the control's own range.
+    assert_eq!(
+        r.device.querymenu(&s, CID_H264_PROFILE, 18).map(|_| ()),
+        Err(libc::EINVAL)
+    );
+    assert_eq!(
+        r.device.querymenu(&s, CID_H264_PROFILE, 4096).map(|_| ()),
+        Err(libc::EINVAL)
+    );
+
+    // The H.264 level menu: the four published, the highest first in the backend's list, so the
+    // default is 5.1 -- what a decoder's level conveys is the most it can decode.
+    let q = query_ext(&mut r, &s, CID_H264_LEVEL);
+    assert_eq!((q.minimum, q.maximum, q.default_value), (11, 15, 15));
+    assert_eq!(ext_ctrl_name(&q), "H264 Level");
+    assert_eq!(
+        menu_items(&mut r, &s, CID_H264_LEVEL),
+        vec![
+            (11, "4".to_string()),
+            (12, "4.1".to_string()),
+            (14, "5".to_string()),
+            (15, "5.1".to_string()),
+        ]
+    );
+    assert_eq!(
+        r.device.querymenu(&s, CID_H264_LEVEL, 13).map(|_| ()),
+        Err(libc::EINVAL),
+        "4.2 is between two supported levels and is still a hole"
+    );
+
+    // HEVC: Main and Main 10, with Main Still Picture the hole in between; its levels too.
+    assert_eq!(
+        menu_items(&mut r, &s, CID_HEVC_PROFILE),
+        vec![(0, "Main".to_string()), (2, "Main 10".to_string())]
+    );
+    assert_eq!(
+        r.device.querymenu(&s, CID_HEVC_PROFILE, 1).map(|_| ()),
+        Err(libc::EINVAL)
+    );
+    assert_eq!(
+        menu_items(&mut r, &s, CID_HEVC_LEVEL),
+        vec![(8, "5.1".to_string()), (12, "6.2".to_string())]
+    );
+
+    // VP9: one profile, and QUERYMENU of the old integer control is still EINVAL (D29).
+    assert_eq!(
+        menu_items(&mut r, &s, CID_VP9_PROFILE),
+        vec![(0, "0".to_string())]
+    );
+    assert_eq!(
+        r.device
+            .querymenu(&s, bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, 0)
+            .map(|_| ()),
+        Err(libc::EINVAL),
+        "an integer control has no menu"
+    );
+
+    // The legacy QUERYCTRL says the same about a menu as QUERY_EXT_CTRL does.
+    let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(CID_H264_PROFILE);
+    let qc = r.device.queryctrl(&s, id, flags).unwrap();
+    assert_eq!(qc.type_, bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU);
+    assert_eq!((qc.minimum, qc.maximum, qc.default_value), (0, 17, 0));
+    close(&mut r.device, s);
+}
+
+/// VA1b: what a client reads off a profile or level control is always one of the values the host
+/// codec reported supporting, through every path -- `G_CTRL`, the `G_EXT_CTRLS` form a 6.15+ guest
+/// kernel turns it into, and `V4L2_CTRL_WHICH_DEF_VAL` -- and the menus stay read-only, because a
+/// stateful decoder selects nothing: the profile and level of what it decodes are in the
+/// bitstream.
+#[test]
+fn profile_and_level_controls_read_a_supported_value_and_refuse_writes() {
+    let mut r = rig();
+    let mut s = session(&mut r.device);
+
+    for (id, expected) in [(CID_H264_PROFILE, 0), (CID_H264_LEVEL, 15), (CID_VP9_PROFILE, 0)] {
+        let value = r.device.g_ctrl(&s, id).unwrap().value;
+        assert_eq!(value, expected);
+        assert_eq!(g_ctrl_ext(&mut r, &mut s, id), Ok(expected), "via G_EXT_CTRLS");
+        assert!(
+            menu_items(&mut r, &s, id).iter().any(|i| i.0 == value),
+            "G_CTRL({id:#x}) answered {value}, which is not one of its menu items"
+        );
+    }
+
+    // G_EXT_CTRLS with WHICH_DEF_VAL answers the same default.
+    let mut ctrls = ext_controls_current(1);
+    let mut arr = vec![ext_ctrl(CID_H264_LEVEL, 0)];
+    r.device
+        .g_ext_ctrls(&s, CtrlWhich::Default, &mut ctrls, &mut arr, vec![])
+        .unwrap();
+    // SAFETY: a plain value control.
+    assert_eq!(unsafe { arr[0].__bindgen_anon_1.value }, 15);
+
+    // Read-only: S_CTRL is EACCES, and so are S/TRY_EXT_CTRLS, with the kernel's error_idx.
+    assert_eq!(
+        r.device.s_ctrl(&mut s, CID_H264_PROFILE, 2).map(|_| ()),
+        Err(libc::EACCES),
+        "a supported value is refused too: the control is read-only"
+    );
+    assert_eq!(
+        r.device.s_ctrl(&mut s, CID_H264_PROFILE, 3).map(|_| ()),
+        Err(libc::EACCES),
+        "read-only is checked before the value (the kernel's order)"
+    );
+    let mut ctrls = ext_controls_current(1);
+    let mut arr = vec![ext_ctrl(CID_HEVC_PROFILE, 0)];
+    assert_eq!(
+        r.device.try_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![]),
+        Err(libc::EACCES)
+    );
+    assert_eq!(ctrls.error_idx, 0, "TRY names the failing control");
+    assert_eq!(r.device.g_ctrl(&s, CID_H264_PROFILE).unwrap().value, 0);
+
+    // The codec class marker follows the same rules as the user one: EINVAL for G_CTRL / S_CTRL
+    // (it is not an int), EACCES for G_EXT_CTRLS (it carries WRITE_ONLY).
+    assert_eq!(
+        r.device.g_ctrl(&s, bindings::V4L2_CID_CODEC_CLASS).map(|_| ()),
+        Err(libc::EINVAL)
+    );
+    assert_eq!(
+        r.device.s_ctrl(&mut s, bindings::V4L2_CID_CODEC_CLASS, 0).map(|_| ()),
+        Err(libc::EINVAL)
+    );
+    let mut ctrls = ext_controls_current(1);
+    let mut arr = vec![ext_ctrl(bindings::V4L2_CID_CODEC_CLASS, 0)];
+    assert_eq!(
+        r.device.g_ext_ctrls(&s, CtrlWhich::Current, &mut ctrls, &mut arr, vec![]),
+        Err(libc::EACCES)
+    );
+
+    // A control event can be subscribed for a menu, and its initial value is that same supported
+    // value (D50: v4l2-compliance's testEvents subscribes to every control it enumerated). The
+    // codec class marker is accepted too and carries no initial value.
+    r.device
+        .subscribe_event(
+            &mut s,
+            EventType::Ctrl(CID_H264_PROFILE),
+            SubscribeEventFlags::SEND_INITIAL,
+        )
+        .unwrap();
+    r.device
+        .subscribe_event(
+            &mut s,
+            EventType::Ctrl(bindings::V4L2_CID_CODEC_CLASS),
+            SubscribeEventFlags::SEND_INITIAL,
+        )
+        .unwrap();
+    assert_eq!(
+        ctrl_events(&r.events.borrow()),
+        vec![(CID_H264_PROFILE, 0)],
+        "one initial event, carrying the menu's value"
+    );
+    close(&mut r.device, s);
+}
+
+/// VA1b's floor: a coded format the host codec store said nothing about gets **no** profile
+/// control -- the device never invents a list. With no format carrying profile data the codec
+/// control class disappears entirely and the control interface is what D29 left it; with only
+/// some formats carrying it, the ones that do get their menus and the ones that do not are
+/// absent, which is exactly how a client tells "this decoder does not publish its profiles" from
+/// "this decoder does not support that profile".
+#[test]
+fn a_format_the_store_said_nothing_about_gets_no_profile_control() {
+    let mut r = rig_with_caps(caps_without_profiles());
+    let s = session(&mut r.device);
+
+    assert_eq!(
+        walk_controls(&mut r, &s),
+        vec![
+            bindings::V4L2_CID_USER_CLASS,
+            bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+        ],
+        "no profile data anywhere: no codec class, no codec controls"
+    );
+    for id in [CID_H264_PROFILE, CID_H264_LEVEL, CID_HEVC_PROFILE, CID_VP9_PROFILE] {
+        let (qid, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(id);
+        assert_eq!(r.device.query_ext_ctrl(&s, qid, flags).map(|_| ()), Err(libc::EINVAL));
+        assert_eq!(r.device.querymenu(&s, id, 0).map(|_| ()), Err(libc::EINVAL));
+        assert_eq!(r.device.g_ctrl(&s, id).map(|_| ()), Err(libc::EINVAL));
+    }
+    // The decoder still decodes: the formats are offered, they just describe nothing.
+    assert_eq!(r.device.capabilities().coded_formats.len(), 3);
+    close(&mut r.device, s);
+
+    // One format with data, one without: H.264 loses both its controls, HEVC keeps both, and the
+    // codec class marker stays because something is in that class.
+    let mut mixed = caps();
+    mixed.coded_formats[0].profiles.clear();
+    mixed.coded_formats[0].levels.clear();
+    let mut r = rig_with_caps(mixed);
+    let s = session(&mut r.device);
+    let mut expected = vec![
+        bindings::V4L2_CID_USER_CLASS,
+        bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+        bindings::V4L2_CID_CODEC_CLASS,
+        CID_HEVC_PROFILE,
+        CID_HEVC_LEVEL,
+        CID_VP9_PROFILE,
+    ];
+    expected.sort_unstable();
+    assert_eq!(walk_controls(&mut r, &s), expected);
+    close(&mut r.device, s);
+
+    // A format with profiles but no levels keeps its profile control and has no level control --
+    // the VP9 case above, checked here on H.264, where a level control does exist for other
+    // backends.
+    let mut no_levels = caps();
+    no_levels.coded_formats[0].levels.clear();
+    let mut r = rig_with_caps(no_levels);
+    let s = session(&mut r.device);
+    assert_eq!(
+        menu_items(&mut r, &s, CID_H264_PROFILE).len(),
+        H264_PROFILES.len()
+    );
+    let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(CID_H264_LEVEL);
+    assert_eq!(
+        r.device.query_ext_ctrl(&s, id, flags).map(|_| ()),
+        Err(libc::EINVAL),
+        "no levels published, no level control"
+    );
+    close(&mut r.device, s);
+}
+
+/// VA1b: AV1. `V4L2_CID_MPEG_VIDEO_AV1_PROFILE` is the one profile menu the encoder device has no
+/// table for, and the kernel gives AV1 no level control a stateful decoder would fill, so an AV1
+/// format gets a profile menu and nothing else. Its menu values and names are the kernel's
+/// (`v4l2_ctrl_get_menu`'s `av1_profile[]` against `enum v4l2_mpeg_video_av1_profile` in
+/// `v4l2-controls.h`: `MAIN = 0`, `HIGH = 1`, `PROFESSIONAL = 2`). A value the running kernel has
+/// no name for is dropped rather than enumerated with an empty name.
+#[test]
+fn the_av1_profile_menu_comes_from_the_backend() {
+    let range = SizeRange::new(16, 4096, 2);
+    let av1_only = DecoderCapabilities {
+        coded_formats: vec![CodedFormat {
+            fourcc: AV01,
+            width: range,
+            height: range,
+            dynamic_resolution: true,
+            // Main (what `c2.qti.av1.decoder` reports for both `AV1ProfileMain8` and
+            // `AV1ProfileMain10`: one AV1 `seq_profile`), plus a value past the kernel's enum.
+            profiles: vec![0, 9],
+            levels: Vec::new(),
+        }],
+    };
+    let mut r = rig_with_caps(av1_only);
+    let s = session(&mut r.device);
+
+    let mut expected = vec![
+        bindings::V4L2_CID_USER_CLASS,
+        bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+        bindings::V4L2_CID_CODEC_CLASS,
+        bindings::V4L2_CID_MPEG_VIDEO_AV1_PROFILE,
+    ];
+    expected.sort_unstable();
+    assert_eq!(walk_controls(&mut r, &s), expected);
+
+    let id = bindings::V4L2_CID_MPEG_VIDEO_AV1_PROFILE;
+    assert_eq!(
+        menu_items(&mut r, &s, id),
+        vec![(0, "Main".to_string())],
+        "the profile past the kernel's enum was dropped"
+    );
+    let q = query_ext(&mut r, &s, id);
+    assert_eq!(ext_ctrl_name(&q), "AV1 Profile");
+    assert_eq!((q.minimum, q.maximum, q.default_value), (0, 0, 0));
+    assert_eq!(r.device.g_ctrl(&s, id).unwrap().value, 0);
+    for absent in [1, 2] {
+        assert_eq!(
+            r.device.querymenu(&s, id, absent).map(|_| ()),
+            Err(libc::EINVAL),
+            "AV1 profile {absent} is not supported by this codec"
+        );
+    }
+    assert_eq!(
+        r.device
+            .query_ext_ctrl(
+                &s,
+                v4l2r::ioctl::parse_ctrl_id_and_flags(bindings::V4L2_CID_MPEG_VIDEO_AV1_LEVEL).0,
+                v4l2r::ioctl::parse_ctrl_id_and_flags(bindings::V4L2_CID_MPEG_VIDEO_AV1_LEVEL).1,
+            )
+            .map(|_| ()),
+        Err(libc::EINVAL),
+        "no AV1 level control"
+    );
+    close(&mut r.device, s);
+}
+
 // helpers used by several tests ---------------------------------------------------------------
+
+const CID_H264_PROFILE: u32 = bindings::V4L2_CID_MPEG_VIDEO_H264_PROFILE;
+const CID_H264_LEVEL: u32 = bindings::V4L2_CID_MPEG_VIDEO_H264_LEVEL;
+const CID_HEVC_PROFILE: u32 = bindings::V4L2_CID_MPEG_VIDEO_HEVC_PROFILE;
+const CID_HEVC_LEVEL: u32 = bindings::V4L2_CID_MPEG_VIDEO_HEVC_LEVEL;
+const CID_VP9_PROFILE: u32 = bindings::V4L2_CID_MPEG_VIDEO_VP9_PROFILE;
+
+/// Every control id the `V4L2_CTRL_FLAG_NEXT_CTRL` walk visits, in order -- what `v4l2-ctl -L`
+/// and `v4l2-compliance` enumerate the device's controls with.
+fn walk_controls(r: &mut Rig, s: &Session) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut from = 0u32;
+    loop {
+        let (id, flags) =
+            v4l2r::ioctl::parse_ctrl_id_and_flags(from | bindings::V4L2_CTRL_FLAG_NEXT_CTRL);
+        match r.device.query_ext_ctrl(s, id, flags) {
+            Ok(q) => {
+                assert!(q.id > from, "the walk must advance");
+                out.push(q.id);
+                from = q.id;
+            }
+            Err(e) => {
+                assert_eq!(e, libc::EINVAL, "the walk ends in EINVAL");
+                return out;
+            }
+        }
+        assert!(out.len() < 64, "the walk does not terminate");
+    }
+}
+
+/// `QUERY_EXT_CTRL` of one control by id.
+fn query_ext(r: &mut Rig, s: &Session, id: u32) -> bindings::v4l2_query_ext_ctrl {
+    let (id, flags) = v4l2r::ioctl::parse_ctrl_id_and_flags(id);
+    r.device.query_ext_ctrl(s, id, flags).unwrap()
+}
+
+/// The `name` a `v4l2_query_ext_ctrl` carries (a `[c_char; 32]`).
+fn ext_ctrl_name(q: &bindings::v4l2_query_ext_ctrl) -> String {
+    let bytes: Vec<u8> = q.name.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Every `(value, name)` `QUERYMENU` accepts over a menu control's whole range: the supported set
+/// as a client discovers it.
+fn menu_items(r: &mut Rig, s: &Session, id: u32) -> Vec<(i32, String)> {
+    let q = query_ext(r, s, id);
+    (q.minimum..=q.maximum)
+        .filter_map(|v| {
+            let m = r.device.querymenu(s, id, v as u32).ok()?;
+            // SAFETY: `name` is the member a menu (not integer-menu) control fills.
+            let name = unsafe { m.__bindgen_anon_1.name };
+            let bytes: Vec<u8> = name.iter().take_while(|c| **c != 0).copied().collect();
+            Some((v as i32, String::from_utf8_lossy(&bytes).into_owned()))
+        })
+        .collect()
+}
 
 /// A `v4l2_ext_control` for a plain (value) control.
 fn ext_ctrl(id: u32, value: i32) -> bindings::v4l2_ext_control {

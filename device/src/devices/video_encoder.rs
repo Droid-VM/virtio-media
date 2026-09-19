@@ -1721,8 +1721,12 @@ where
             b"VP90" => (bindings::V4L2_CID_MPEG_VIDEO_VP9_PROFILE, 0, None),
             _ => (0, 0, None),
         };
+        // A format with no control of that kind (`id == 0`: the match above has no cid for it)
+        // configures nothing, even if the backend published values -- the guest had no way to ask
+        // for one, so the codec's own default stands. AV1 is such a format, and the backend's
+        // profile list for it is the decoder device's (VA1b), not something to encode by.
         let pick = |id: u32, choices: &[i32]| -> Option<i32> {
-            if choices.is_empty() {
+            if id == 0 || choices.is_empty() {
                 return None;
             }
             value(id)

@@ -115,6 +115,20 @@ pub trait GuestMemoryRange {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// A dma-buf over the same guest pages, for a backend whose hardware writes (or reads) the
+    /// guest's memory itself instead of the CPU copying through [`Self::as_ptr`]. Valid while the
+    /// mapping lives. The default has none.
+    fn dmabuf(&self) -> Option<BorrowedFd<'_>> {
+        None
+    }
+
+    /// Whether dropping the mapping does nothing the guest needs (no copy written back), so a
+    /// device may hold it after the buffer goes back to the guest, for
+    /// [`VirtioMediaGuestMemoryMapper::renew_mapping_for`] to reuse. The default answers `false`.
+    fn outlives_return(&self) -> bool {
+        false
+    }
 }
 
 /// Trait enabling guest memory linear access for the device.
@@ -156,6 +170,34 @@ pub trait VirtioMediaGuestMemoryMapper {
     ) -> anyhow::Result<Self::GuestMemoryMapping> {
         let _ = writable;
         self.new_mapping(sgs)
+    }
+
+    /// [`Self::new_mapping_for`] for a buffer whose last mapping is `spare`: an implementation
+    /// that can tell `spare` already maps `sgs` that way, and that the host may still touch them,
+    /// hands it back instead of mapping the pages again (a scattered 4K frame is hundreds of
+    /// entries, each an `mmap` and later a `munmap`). The default always maps again.
+    fn renew_mapping_for(
+        &self,
+        spare: Option<Self::GuestMemoryMapping>,
+        sgs: Vec<SgEntry>,
+        writable: bool,
+    ) -> anyhow::Result<Self::GuestMemoryMapping> {
+        drop(spare);
+        self.new_mapping_for(sgs, writable)
+    }
+
+    /// As [`Self::renew_mapping_for`], for a buffer that only the backend's hardware will touch,
+    /// through [`GuestMemoryRange::dmabuf`]: a mapper that can import `sgs` as a dma-buf without a
+    /// host view of the bytes does so, its mapping's pointer being null (a 4K P010 frame scattered
+    /// over 6528 guest pages is that many `mmap`s otherwise, and a few such frames exhaust the
+    /// process's map count). The default maps the pages as usual.
+    fn renew_dmabuf_for(
+        &self,
+        spare: Option<Self::GuestMemoryMapping>,
+        sgs: Vec<SgEntry>,
+        writable: bool,
+    ) -> anyhow::Result<Self::GuestMemoryMapping> {
+        self.renew_mapping_for(spare, sgs, writable)
     }
 }
 

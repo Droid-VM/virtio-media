@@ -86,6 +86,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use v4l2r::bindings;
@@ -289,6 +290,11 @@ pub struct OutputBuffer {
     /// and the data's row pitch all equal, which is what a zero-copy GL importer (turnip) requires
     /// at a non-16-aligned width. Equals the coded width when the client did not pad.
     pub stride: usize,
+    /// A dma-buf over the same guest pages, where the mapping has one
+    /// ([`GuestMemoryRange::dmabuf`]): a backend whose hardware decodes straight into it writes
+    /// the guest's memory with no CPU copy. Valid until the buffer comes back
+    /// ([`DecoderEvent::FrameDecoded`] or [`VideoDecoderBackendSession::clear_capture_buffers`]).
+    pub dmabuf: Option<RawFd>,
 }
 
 /// Something the backend reports on its event path.
@@ -331,6 +337,17 @@ pub enum DecoderEvent {
         /// Minimum `CAPTURE` buffers the backend needs to decode; answered by
         /// `G_CTRL(V4L2_CID_MIN_BUFFERS_FOR_CAPTURE)`.
         min_capture_buffers: u32,
+    },
+    /// The `CAPTURE` layout the backend will decode into, when it is not tightly packed NV12 at
+    /// the coded size: a hardware decoder writing straight into guest buffers needs them laid out
+    /// its own way (msm_vidc's linear P010 for a 10-bit stream: 16-bit samples, rows of
+    /// `bytesperline`, chroma right after `height` luma rows). Sent right before the
+    /// [`DecoderEvent::FormatChanged`] it belongs to and applied with it; `G_FMT`/`ENUM_FMT` then
+    /// report it and every `CAPTURE` buffer must hold `sizeimage` bytes.
+    CaptureLayout {
+        pixelformat: PixelFormat,
+        bytesperline: u32,
+        sizeimage: u32,
     },
     /// The session failed and produces nothing more; the string is for the log.
     Error(String),
@@ -467,6 +484,24 @@ pub trait VideoDecoderBackendSession {
 
     /// Every event since the last call, oldest first.
     fn take_events(&mut self) -> Vec<DecoderEvent>;
+
+    /// `V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE` / `_DISPLAY_DELAY`, before the codec starts: with
+    /// `Some(n)`, a frame comes out `n` frames after it went in, in decode order (0: each as soon as it
+    /// is decoded, none kept back for reordering); `None`, the codec's own display order. Only a
+    /// backend whose [`VideoDecoderBackend::decode_order`] is true is asked. A backend that cannot
+    /// keep the promise must fail here, or fail [`Self::start`] rather than decode in display order:
+    /// a client that gives the next unit only once the last one's frame is out (the macOS guest's
+    /// synchronous `VTDecompressionSessionDecodeFrame`) waits for ever on a frame kept back.
+    fn set_display_delay(&mut self, _delay: Option<u32>) -> IoctlResult<()> {
+        Err(libc::EINVAL)
+    }
+
+    /// Whether this session decodes into the `CAPTURE` buffers' dma-bufs
+    /// ([`OutputBuffer::dmabuf`]) rather than through their pointers: only then does the device
+    /// build one (it pins the guest pages). The default uses the pointer.
+    fn wants_dmabuf(&self) -> bool {
+        false
+    }
 }
 
 /// A decoder, as a device sees it: what it can decode, and how to open a session.
@@ -493,6 +528,13 @@ pub trait VideoDecoderBackend {
     /// the device then keeps the bare floor of 1 until the codec announces.
     fn min_capture_buffers(&self, _fourcc: PixelFormat) -> Option<u32> {
         None
+    }
+
+    /// Whether a session can be told to put its frames out in decode order
+    /// ([`VideoDecoderBackendSession::set_display_delay`]): only then does the device offer the
+    /// two display-delay controls. The default cannot.
+    fn decode_order(&self) -> bool {
+        false
     }
 }
 
@@ -631,6 +673,10 @@ struct Buffer<GM> {
     size: u32,
     /// `(bytesused, length)` `PREPARE_BUF` accepted for this buffer, while it is prepared.
     prepared: Option<(u32, u32)>,
+    /// A guest-owned buffer's mapping from its last loan, kept after the buffer went back when
+    /// dropping it would have done nothing for the guest
+    /// ([`GuestMemoryRange::outlives_return`]), for the next `QBUF` to reuse.
+    spare: Option<GM>,
 }
 
 impl<GM: GuestMemoryRange> Buffer<GM> {
@@ -657,9 +703,20 @@ impl<GM: GuestMemoryRange> Buffer<GM> {
         }
     }
 
+    /// The guest mapping's dma-buf, while the buffer is mapped and the mapping has one.
+    fn dmabuf(&self) -> Option<RawFd> {
+        match &self.backing {
+            Backing::Guest(Some(mapping)) => mapping.dmabuf().map(|fd| fd.as_raw_fd()),
+            _ => None,
+        }
+    }
+
     fn drop_guest_mapping(&mut self) {
         if let Backing::Guest(mapping) = &mut self.backing {
-            *mapping = None;
+            match mapping.take() {
+                Some(m) if m.outlives_return() => self.spare = Some(m),
+                _ => {}
+            }
         }
     }
 
@@ -708,6 +765,9 @@ pub struct VideoDecoderSession<GM, S> {
     backend: S,
     /// Whether [`VideoDecoderBackendSession::start`] has been called (the codec exists).
     codec_started: bool,
+    /// `V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE` and `_DISPLAY_DELAY` as last set.
+    display_delay_enable: bool,
+    display_delay: u32,
     state: StreamingState,
     drain: Drain,
     /// OUTPUT (bitstream) queue.
@@ -729,6 +789,12 @@ pub struct VideoDecoderSession<GM, S> {
     /// writes the NV12 at the aligned stride and the data pitch, bo stride and export pitch match.
     /// Cleared on a coded-size change (a new size means a new bo and a fresh negotiation).
     capture_stride_override: Option<u32>,
+    /// The layout a backend announced for `CAPTURE` ([`DecoderEvent::CaptureLayout`]): pixel
+    /// format, `bytesperline` and `sizeimage`. `None` is tightly packed NV12 (with the VA2g
+    /// stride override, if any).
+    capture_layout: Option<(PixelFormat, u32, u32)>,
+    /// A [`DecoderEvent::CaptureLayout`] waiting for the `FormatChanged` it precedes.
+    pending_capture_layout: Option<(PixelFormat, u32, u32)>,
     /// The OUTPUT bitstream buffer size, client-set via `S_FMT(OUTPUT)` or defaulted.
     output_sizeimage: u32,
     crop: CropRectangle,
@@ -802,6 +868,9 @@ impl<GM, S> VideoDecoderSession<GM, S> {
     /// The CAPTURE luma stride: the client-negotiated padded stride (VA2g) or the tight coded
     /// width. Never narrower than the coded width, so a frame always fits row for row.
     fn capture_bytesperline(&self) -> u32 {
+        if let Some((_, bytesperline, _)) = self.capture_layout {
+            return bytesperline;
+        }
         self.capture_stride_override
             .filter(|&s| s >= self.coded_size.0)
             .unwrap_or(self.coded_size.0)
@@ -809,7 +878,15 @@ impl<GM, S> VideoDecoderSession<GM, S> {
 
     /// The CAPTURE (NV12) `sizeimage` for the current coded size and (possibly padded) stride.
     fn capture_sizeimage(&self) -> u32 {
+        if let Some((_, _, sizeimage)) = self.capture_layout {
+            return sizeimage;
+        }
         nv12_sizeimage(self.capture_bytesperline(), self.coded_size.1)
+    }
+
+    /// The CAPTURE pixel format: the backend's announced one, else NV12.
+    fn capture_pixelformat(&self) -> PixelFormat {
+        self.capture_layout.map_or(NV12, |(format, _, _)| format)
     }
 
     fn sizeimage(&self, direction: QueueDirection) -> u32 {
@@ -827,7 +904,11 @@ impl<GM, S> VideoDecoderSession<GM, S> {
             QueueDirection::Capture => {
                 // `bytesperline` is the (possibly client-padded, VA2g) luma stride; `width` below
                 // stays the visible coded width, so the padding rides as stride, not as pixels.
-                (NV12.to_u32(), self.capture_bytesperline(), QueueType::VideoCaptureMplane)
+                (
+                    self.capture_pixelformat().to_u32(),
+                    self.capture_bytesperline(),
+                    QueueType::VideoCaptureMplane,
+                )
             }
         };
         let mut pix_mp = bindings::v4l2_pix_format_mplane {
@@ -891,7 +972,7 @@ where
     A: VirtioMediaBufferAllocator,
 {
     pub fn new(backend: B, evt_queue: Q, mem: M, mapper: HM, allocator: A) -> Self {
-        let controls = controls_for(backend.capabilities());
+        let controls = controls_for(backend.capabilities(), backend.decode_order());
         Self {
             backend,
             evt_queue,
@@ -1023,6 +1104,7 @@ where
                 lent: false,
                 size: sizeimage,
                 prepared: None,
+                spare: None,
             });
         }
 
@@ -1120,6 +1202,11 @@ where
             // The stride the backend must write the NV12 at: the tight coded width, or the wider
             // stride the client negotiated via S_FMT(CAPTURE) for a GPU-importable bo (VA2g).
             stride: capture_stride,
+            dmabuf: if session.backend.wants_dmabuf() {
+                entry.dmabuf()
+            } else {
+                None
+            },
         })?;
         entry.lent = true;
         Ok(())
@@ -1304,11 +1391,20 @@ where
                     }
                 }
             }
+            DecoderEvent::CaptureLayout {
+                pixelformat,
+                bytesperline,
+                sizeimage,
+            } => {
+                session.pending_capture_layout = Some((pixelformat, bytesperline, sizeimage));
+            }
             DecoderEvent::FormatChanged {
                 coded_size,
                 visible_rect,
                 min_capture_buffers,
             } => {
+                // The layout announced with this change, or none (tight NV12) when it came alone.
+                session.capture_layout = session.pending_capture_layout.take();
                 // A mid-stream change is the kernel's implicit drain: the decoder is stopped
                 // until the client restarts the CAPTURE queue (`STREAMON(CAPTURE)` after the
                 // reallocation, or `V4L2_DEC_CMD_START`). Nothing lent is lost by this -- the
@@ -1442,6 +1538,8 @@ where
             signal,
             backend,
             codec_started: false,
+            display_delay_enable: false,
+            display_delay: 0,
             state: StreamingState {
                 output_streaming: false,
                 capture_streaming: false,
@@ -1452,6 +1550,8 @@ where
             coded_format: fourcc,
             coded_size,
             capture_stride_override: None,
+            capture_layout: None,
+            pending_capture_layout: None,
             output_sizeimage: MIN_BITSTREAM_SIZE,
             crop: CropRectangle::Settable(v4l2r::Rect::new(0, 0, coded_size.0, coded_size.1)),
             min_capture_buffers,
@@ -1550,7 +1650,7 @@ where
 
     fn enum_fmt(
         &mut self,
-        _session: &Self::Session,
+        session: &Self::Session,
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<v4l2_fmtdesc> {
@@ -1572,7 +1672,7 @@ where
                 if index != 0 {
                     return Err(libc::EINVAL);
                 }
-                (NV12, 0)
+                (session.capture_pixelformat(), 0)
             }
             _ => return Err(libc::EINVAL),
         };
@@ -1605,7 +1705,7 @@ where
         // For NV12 (CAPTURE) the sizes follow the coded format `S_FMT(OUTPUT)` selected (the
         // first offered one until then), not always the first: on 5566 that is H264's
         // `96..8192` against VP9's `96..4096` (review-m6 R6-16).
-        let coded = if asked == NV12 {
+        let coded = if asked == NV12 || asked == session.capture_pixelformat() {
             caps.coded_format(session.coded_format)
                 .or_else(|| caps.coded_formats.first())
         } else {
@@ -1723,6 +1823,7 @@ where
                 // CAPTURE queue is allocated (libva negotiates during provisioning), so no lent
                 // buffer's geometry changes underneath it.
                 // SAFETY: multi-planar.
+                // A backend-announced layout (`CaptureLayout`) is the hardware's own and fixed.
                 let asked = unsafe { format.fmt.pix_mp }.plane_fmt[0].bytesperline;
                 session.capture_stride_override =
                     (asked > session.coded_size.0 && asked <= session.coded_size.0.saturating_mul(2))
@@ -1909,6 +2010,8 @@ where
         }
         let index = buffer.index() as usize;
         let sizeimage = session.sizeimage(direction);
+        // A CAPTURE buffer the backend's hardware writes through its dma-buf needs no host view.
+        let dmabuf_only = direction == QueueDirection::Capture && session.backend.wants_dmabuf();
         let q = session.queue_mut(queue_type)?;
         let entry = q.buffers.get_mut(index).ok_or(libc::EINVAL)?;
         if entry.queued || Some(buffer.memory()) != q.memory {
@@ -1966,7 +2069,13 @@ where
                 let sgs = guest_regions.into_iter().next().ok_or(libc::EINVAL)?;
                 // OUTPUT is read by the backend; CAPTURE is written by it.
                 let writable = direction == QueueDirection::Capture;
-                let mapping = self.mem.new_mapping_for(sgs, writable).map_err(|e| {
+                let spare = entry.spare.take();
+                let mapping = if dmabuf_only {
+                    self.mem.renew_dmabuf_for(spare, sgs, writable)
+                } else {
+                    self.mem.renew_mapping_for(spare, sgs, writable)
+                };
+                let mapping = mapping.map_err(|e| {
                     log::error!("failed to map USERPTR buffer: {:#}", e);
                     guest_mapping_errno(&e)
                 })?;
@@ -2427,19 +2536,24 @@ where
         })
     }
 
-    /// Every decoder control is read-only (`MIN_BUFFERS_FOR_CAPTURE`, the profile and level menus)
-    /// or a class marker, so a `S_CTRL` is `EACCES` for a known control and `EINVAL` otherwise --
-    /// what the kernel answers, and what `v4l2-compliance` checks of a read-only control. A
-    /// stateful decoder has nothing to select: the profile and level of what it decodes are in the
-    /// bitstream.
+    /// Every decoder control but the display-delay pair is read-only (`MIN_BUFFERS_FOR_CAPTURE`, the
+    /// profile and level menus) or a class marker, so a `S_CTRL` is `EACCES` for one of those and
+    /// `EINVAL` for an unknown id -- what the kernel answers, and what `v4l2-compliance` checks of a
+    /// read-only control. A stateful decoder has nothing else to select: the profile and level of
+    /// what it decodes are in the bitstream.
     fn s_ctrl(
         &mut self,
-        _session: &mut Self::Session,
+        session: &mut Self::Session,
         id: u32,
-        _value: i32,
+        value: i32,
     ) -> IoctlResult<v4l2_control> {
         match decoder_control(&self.controls, id) {
             Some(def) if def.is_class() => Err(libc::EINVAL),
+            Some(def) if def.flags() & bindings::V4L2_CTRL_FLAG_READ_ONLY == 0 => {
+                check_writable_value(def, value)?;
+                set_display_delay_control(session, id, value)?;
+                Ok(v4l2_control { id, value })
+            }
             Some(_) => Err(libc::EACCES),
             None => Err(libc::EINVAL),
         }
@@ -2475,6 +2589,13 @@ where
     ) -> IoctlResult<()> {
         match check_ext_ctrls(&self.controls, session, ExtCtrlOp::Set, which, ctrl_array) {
             Ok(values) => {
+                // Every one checked first, then set: only the display-delay pair passes the check.
+                for (ctrl, value) in ctrl_array.iter().zip(&values) {
+                    if let Err(errno) = set_display_delay_control(session, ctrl.id, *value) {
+                        ctrls.error_idx = ctrl_array.len() as u32;
+                        return Err(errno);
+                    }
+                }
                 write_back_ext_ctrls(ctrls, ctrl_array, &values);
                 Ok(())
             }
@@ -2597,9 +2718,14 @@ const VP9_PROFILE_NAMES: [&str; 4] = ["0", "1", "2", "3"];
 /// on both the Android and the dev-box header, so it is used from there and not written out).
 const AV1_PROFILE_NAMES: [&str; 3] = ["Main", "High", "Professional"];
 
-/// What kind of control an entry of the table is. Every one of them is read-only: a stateful
-/// decoder is told what to decode by the bitstream, so its profile and level menus *describe* the
-/// host codec rather than select anything (`vidioc-queryctrl.rst`, "the control is read-only").
+/// The largest `V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY` offered (the kernel's venus and msm_vidc
+/// drivers take 0 or 1; more is never needed to get frames out early).
+const MAX_DISPLAY_DELAY: i32 = 1;
+
+/// What kind of control an entry of the table is. All but the display-delay pair are read-only: a
+/// stateful decoder is told what to decode by the bitstream, so its profile and level menus
+/// *describe* the host codec rather than select anything (`vidioc-queryctrl.rst`, "the control is
+/// read-only"). The display delay is the one choice a client makes: when frames come out.
 #[derive(Clone, Debug)]
 enum DecoderCtrlType {
     /// A `V4L2_CTRL_TYPE_CTRL_CLASS` marker: neither readable nor writable.
@@ -2615,6 +2741,11 @@ enum DecoderCtrlType {
         items: Vec<(i32, &'static str)>,
         default: i32,
     },
+    /// `V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE`: a writable boolean, set before the codec
+    /// starts ([`VideoDecoderBackendSession::set_display_delay`]).
+    DisplayDelayEnable,
+    /// `V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY`: a writable integer, frames, likewise.
+    DisplayDelay,
 }
 
 /// One control a stateful decoder answers for: the user-control class marker, the read-only
@@ -2648,6 +2779,8 @@ impl DecoderControl {
             DecoderCtrlType::Class => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_CTRL_CLASS,
             DecoderCtrlType::MinCaptureBuffers => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER,
             DecoderCtrlType::Menu { .. } => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_MENU,
+            DecoderCtrlType::DisplayDelayEnable => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_BOOLEAN,
+            DecoderCtrlType::DisplayDelay => bindings::v4l2_ctrl_type_V4L2_CTRL_TYPE_INTEGER,
         }
     }
 
@@ -2665,6 +2798,7 @@ impl DecoderControl {
             // A profile or level menu is read-only but *not* volatile: it is the host codec's
             // fixed capability, the same before and after every format change.
             DecoderCtrlType::Menu { .. } => bindings::V4L2_CTRL_FLAG_READ_ONLY,
+            DecoderCtrlType::DisplayDelayEnable | DecoderCtrlType::DisplayDelay => 0,
         }
     }
 
@@ -2682,6 +2816,8 @@ impl DecoderControl {
                 1,
                 *default,
             ),
+            DecoderCtrlType::DisplayDelayEnable => (0, 1, 1, 0),
+            DecoderCtrlType::DisplayDelay => (0, MAX_DISPLAY_DELAY, 1, 0),
         }
     }
 
@@ -2733,7 +2869,7 @@ fn menu_from(values: &[i32], names: &[&'static str]) -> Option<DecoderCtrlType> 
 /// VP8 is left without a profile control on purpose: its single profile carries no information a
 /// client could act on, and the fourcc the V4L2 level control pairs with (H.264, HEVC) is the
 /// same pair the kernel gives a stateful decoder.
-fn controls_for(caps: &DecoderCapabilities) -> Vec<DecoderControl> {
+fn controls_for(caps: &DecoderCapabilities, decode_order: bool) -> Vec<DecoderControl> {
     let mut out = vec![
         DecoderControl {
             id: bindings::V4L2_CID_USER_CLASS,
@@ -2816,6 +2952,19 @@ fn controls_for(caps: &DecoderCapabilities) -> Vec<DecoderControl> {
             }
         }
     }
+    if decode_order {
+        out.push(DecoderControl {
+            id: bindings::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY,
+            name: "Display Delay",
+            ty: DecoderCtrlType::DisplayDelay,
+        });
+        out.push(DecoderControl {
+            id: bindings::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE,
+            name: "Display Delay Enable",
+            ty: DecoderCtrlType::DisplayDelayEnable,
+        });
+        has_codec_controls = true;
+    }
     if has_codec_controls {
         out.push(DecoderControl {
             id: bindings::V4L2_CID_CODEC_CLASS,
@@ -2866,6 +3015,14 @@ fn decoder_control_value<GM, S>(
 ) -> IoctlResult<i32> {
     match id {
         bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE => Ok(session.min_capture_buffers.max(1) as i32),
+        bindings::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE
+            if decoder_control(controls, id).is_some() =>
+        {
+            Ok(session.display_delay_enable as i32)
+        }
+        bindings::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY if decoder_control(controls, id).is_some() => {
+            Ok(session.display_delay as i32)
+        }
         _ => match decoder_control(controls, id) {
             Some(def) if def.is_class() => Err(libc::EINVAL),
             Some(def) => Ok(def.bounds().3),
@@ -2962,8 +3119,17 @@ fn check_ext_ctrls<GM, S>(
         if refused {
             return Err((libc::EACCES, fail_idx(i)));
         }
-        // Only a readable, non-class control reaches here (a get of `MIN_BUFFERS_FOR_CAPTURE`, or
-        // of a profile / level menu).
+        // A set or try of a writable control (the display-delay pair): the value asked for, if in
+        // range. Otherwise only a readable, non-class control reaches here (a get of
+        // `MIN_BUFFERS_FOR_CAPTURE`, of a profile / level menu, or of the display-delay pair).
+        if op != ExtCtrlOp::Get {
+            // SAFETY: both writable controls are 32-bit, so `value` is the union member in use.
+            let asked = unsafe { ctrl.__bindgen_anon_1.value };
+            let def = decoder_control(controls, id).ok_or((libc::EINVAL, fail_idx(i)))?;
+            check_writable_value(def, asked).map_err(|e| (e, fail_idx(i)))?;
+            values.push(asked);
+            continue;
+        }
         let value = if defaults {
             decoder_control(controls, id)
                 .map(|def| def.bounds().3)
@@ -2974,6 +3140,40 @@ fn check_ext_ctrls<GM, S>(
         values.push(value);
     }
     Ok(values)
+}
+
+/// `ERANGE` for a value outside a writable control's bounds, as the kernel's `validate_new` answers
+/// for an integer or boolean control.
+fn check_writable_value(def: &DecoderControl, value: i32) -> IoctlResult<()> {
+    let (minimum, maximum, _, _) = def.bounds();
+    if value < minimum || value > maximum {
+        return Err(libc::ERANGE);
+    }
+    Ok(())
+}
+
+/// A display-delay control set: handed to the backend at once (it applies it when the codec
+/// starts), `EBUSY` once the codec has started -- the delay is fixed for the stream, as on the
+/// kernel's decoders. Any other id is not settable and is refused before this.
+fn set_display_delay_control<GM, S: VideoDecoderBackendSession>(
+    session: &mut VideoDecoderSession<GM, S>,
+    id: u32,
+    value: i32,
+) -> IoctlResult<()> {
+    let (enable, delay) = match id {
+        bindings::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE => (value != 0, session.display_delay),
+        bindings::V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY => (session.display_delay_enable, value as u32),
+        _ => return Err(libc::EACCES),
+    };
+    if session.codec_started {
+        return Err(libc::EBUSY);
+    }
+    session
+        .backend
+        .set_display_delay(if enable { Some(delay) } else { None })?;
+    session.display_delay_enable = enable;
+    session.display_delay = delay;
+    Ok(())
 }
 
 /// Write the values back into the array, `error_idx` cleared.

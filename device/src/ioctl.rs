@@ -68,10 +68,12 @@ use crate::protocol::V4l2Ioctl;
 /// Most entries a single SG list may carry.
 ///
 /// The guest chooses the entry count, and every entry it sends is another `read_obj` and, later,
-/// another host mapping. 4096 entries of 4 KiB pages is 16 MiB, more than a 4K frame, and four
-/// times what the guest driver's own shadow buffer can hold at 16 bytes per entry (64 KiB, see
-/// `VPU_DESIGN.md` §5.2), so nothing that is expected to work is refused.
-pub const MAX_SG_ENTRIES: usize = 4096;
+/// another host mapping. 16384 entries of 4 KiB pages is 64 MiB: a 4K 10-bit (P010) frame is
+/// 26.7 MB, 6528 pages when none of them are adjacent (the macOS guest's wired buffers), more than
+/// the 4096 a 4K NV12 frame needed; the Linux guest driver's own shadow buffer (64 KiB at 16 bytes
+/// per entry, see `VPU_DESIGN.md` §5.2) still sends at most 4096, so nothing that is expected to
+/// work is refused.
+pub const MAX_SG_ENTRIES: usize = 16384;
 
 /// Reads a SG list of guest physical addresses passed from the driver and returns it.
 ///

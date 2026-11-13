@@ -492,7 +492,15 @@ pub trait VideoDecoderBackendSession {
     /// keep the promise must fail here, or fail [`Self::start`] rather than decode in display order:
     /// a client that gives the next unit only once the last one's frame is out (the macOS guest's
     /// synchronous `VTDecompressionSessionDecodeFrame`) waits for ever on a frame kept back.
-    fn set_display_delay(&mut self, _delay: Option<u32>) -> IoctlResult<()> {
+    ///
+    /// `coded_format` is the `OUTPUT` queue's format as it stands: a backend whose decode order
+    /// comes from a driver that does not take that format refuses here, so the client learns it
+    /// before streaming and decodes in display order instead.
+    fn set_display_delay(
+        &mut self,
+        _coded_format: PixelFormat,
+        _delay: Option<u32>,
+    ) -> IoctlResult<()> {
         Err(libc::EINVAL)
     }
 
@@ -3170,7 +3178,7 @@ fn set_display_delay_control<GM, S: VideoDecoderBackendSession>(
     }
     session
         .backend
-        .set_display_delay(if enable { Some(delay) } else { None })?;
+        .set_display_delay(session.coded_format, if enable { Some(delay) } else { None })?;
     session.display_delay_enable = enable;
     session.display_delay = delay;
     Ok(())
